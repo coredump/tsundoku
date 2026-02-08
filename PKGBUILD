@@ -1,6 +1,6 @@
 # Maintainer: ripdog <ripdog@users.noreply.github.com>
 pkgname=tsundoku
-pkgver=1.0.4
+pkgver=1.0.5
 pkgrel=1
 pkgdesc="Japanese web novel downloader and translator supporting Syosetu, Kakuyomu, and Pixiv"
 arch=('x86_64' 'aarch64')
