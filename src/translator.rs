@@ -202,6 +202,12 @@ impl Translator {
                             break;
                         }
                         Err(e) => {
+                            if matches!(e, TranslationError::Refused(_)) {
+                                history.truncate(1);
+                                self.console.warning(
+                                    "Model refused translation; cleared conversation history before retry.",
+                                );
+                            }
                             last_error = Some(e);
                             attempt += 1;
                             if attempt < self.translation_config.retries {
@@ -316,44 +322,76 @@ impl Translator {
         let mut last_update = Instant::now();
 
         let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
+        let mut done = false;
 
-        loop {
+        'streaming: loop {
             let chunk_result = stream.next().await;
             let Some(chunk_result) = chunk_result else {
                 break;
             };
             let bytes = chunk_result?;
-            let text = String::from_utf8_lossy(&bytes);
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
 
-            // Parse SSE data lines
-            for line in text.lines() {
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data.trim() == "[DONE]" {
-                        break;
-                    }
+            // Parse SSE data lines (handle partial lines across chunks)
+            while let Some(pos) = buffer.find('\n') {
+                let mut line = buffer[..pos].to_string();
+                buffer = buffer[pos + 1..].to_string();
 
-                    // Try to parse as JSON
-                    if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
-                        for choice in chunk.choices {
-                            if let Some(delta) = choice.delta
-                                && let Some(content) = delta.content
-                            {
-                                full_response.push_str(&content);
+                if line.ends_with('\r') {
+                    line.pop();
+                }
 
-                                // Update progress display every second
-                                if last_update.elapsed() >= Duration::from_secs(1) {
-                                    self.display_progress(
-                                        &full_response,
-                                        start_time.elapsed(),
-                                        progress_info.as_ref(),
-                                    );
-                                    last_update = Instant::now();
-                                }
+                let data = if let Some(data) = line.strip_prefix("data: ") {
+                    Some(data)
+                } else if let Some(data) = line.strip_prefix("data:") {
+                    Some(data.trim_start())
+                } else {
+                    None
+                };
+
+                let Some(data) = data else {
+                    continue;
+                };
+
+                if data.trim() == "[DONE]" {
+                    done = true;
+                    break;
+                }
+
+                // Try to parse as JSON
+                if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
+                    for choice in chunk.choices {
+                        if let Some(delta) = choice.delta
+                            && let Some(content) = delta.content
+                        {
+                            full_response.push_str(&content);
+
+                            // Update progress display every second
+                            if last_update.elapsed() >= Duration::from_secs(1) {
+                                self.display_progress(
+                                    &full_response,
+                                    start_time.elapsed(),
+                                    progress_info.as_ref(),
+                                );
+                                last_update = Instant::now();
                             }
                         }
                     }
                 }
             }
+
+            if done {
+                break 'streaming;
+            }
+        }
+
+        if !full_response.is_empty() {
+            self.display_progress(
+                &full_response,
+                start_time.elapsed(),
+                progress_info.as_ref(),
+            );
         }
 
         // Note: Progress line is NOT cleared here to maintain continuity.

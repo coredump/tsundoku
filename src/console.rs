@@ -97,12 +97,26 @@ impl Console {
 
     /// Prints a warning message with yellow `[WARN]` label.
     pub fn warning(&self, message: &str) {
-        println!("{} {}", self.label("WARN", Style::Yellow), message);
+        if self.colors_enabled {
+            print!("\r\n");
+            let _ = io::stdout().flush();
+            println!("{} {}", self.label("WARN", Style::Yellow), message);
+            println!();
+        } else {
+            println!("{} {}", self.label("WARN", Style::Yellow), message);
+        }
     }
 
     /// Prints an error message with red `[ERROR]` label.
     pub fn error(&self, message: &str) {
-        eprintln!("{} {}", self.label("ERROR", Style::Red), message);
+        if self.colors_enabled {
+            print!("\r\n");
+            let _ = io::stdout().flush();
+            eprintln!("{} {}", self.label("ERROR", Style::Red), message);
+            eprintln!();
+        } else {
+            eprintln!("{} {}", self.label("ERROR", Style::Red), message);
+        }
     }
 
     /// Prints a step message with cyan `[STEP]` label.
