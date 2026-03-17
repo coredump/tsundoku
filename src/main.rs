@@ -437,7 +437,12 @@ async fn process_chapters(
             .translator
             .translate(&mapped_title, true, None)
             .await
-            .unwrap_or_else(|_| format!("{} [TRANSLATION_FAILED]", chapter_data.title));
+            .with_context(|| {
+                format!(
+                    "Failed to translate title for chapter {}",
+                    chapter_data.number
+                )
+            })?;
 
         // Validate translated title for filesystem
         let safe_title = sanitize_filename(&translated_title);
@@ -500,7 +505,10 @@ async fn run_name_scout(
         console.step(&format!("Scouting chapter {}: {}", number, title));
 
         let payload = build_chapter_payload(*number, title, content);
-        let name_chunks = name_scout.collect_names(&payload).await;
+        let name_chunks = name_scout
+            .collect_names(&payload)
+            .await
+            .with_context(|| format!("Failed to scout names for chapter {}", number))?;
 
         let total_names: usize = name_chunks.iter().map(|c| c.len()).sum();
         console.info(&format!(
@@ -643,7 +651,7 @@ async fn find_or_create_folder(
     let translated_title = translator
         .translate(original_title, true, None)
         .await
-        .unwrap_or_else(|_| original_title.to_string());
+        .context("Failed to translate title for folder name")?;
 
     let safe_title = sanitize_filename(&translated_title);
     let folder_name = format!("[{}: {}] {}", module_name, novel_id, safe_title);

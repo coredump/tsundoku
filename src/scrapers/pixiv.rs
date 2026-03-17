@@ -10,8 +10,8 @@ use crate::cookies::load_netscape_cookie_jar;
 use crate::error::ScraperError;
 use async_trait::async_trait;
 use regex::Regex;
-use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::cookie::Jar;
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
@@ -131,10 +131,7 @@ impl PixivScraper {
                 Ok((jar, source)) => {
                     if config.debug {
                         if let Some(path) = source {
-                            eprintln!(
-                                "[Pixiv Debug] Loaded cookie file: {}",
-                                path.display()
-                            );
+                            eprintln!("[Pixiv Debug] Loaded cookie file: {}", path.display());
                         } else {
                             eprintln!("[Pixiv Debug] No cookie file found for pixiv");
                         }
@@ -299,12 +296,7 @@ impl PixivScraper {
             }
 
             for content in &contents {
-                let title = content
-                    .title
-                    .as_deref()
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
+                let title = content.title.as_deref().unwrap_or("").trim().to_string();
                 let title = if title.is_empty() {
                     format!("Chapter {}", content.series.content_order)
                 } else {
@@ -385,11 +377,7 @@ fn dump_json_keys(value: &JsonValue, path: &str) {
             }
         }
         JsonValue::String(s) => {
-            eprintln!(
-                "[Pixiv Debug] {}: string (len={})",
-                path,
-                s.chars().count()
-            );
+            eprintln!("[Pixiv Debug] {}: string (len={})", path, s.chars().count());
         }
         JsonValue::Number(_) => {
             eprintln!("[Pixiv Debug] {}: number", path);

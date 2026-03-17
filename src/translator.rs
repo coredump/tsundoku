@@ -226,10 +226,17 @@ impl Translator {
                 }
 
                 if let Some(e) = last_error {
-                    // All retries exhausted, include failure marker
                     self.console
                         .error(&format!("Translation failed after all retries: {}", e));
-                    results.push(format!("[TRANSLATION FAILED]\n{}", chunk));
+
+                    if matches!(e, TranslationError::Refused(_)) {
+                        results.push(format!("[TRANSLATION FAILED]\n{}", chunk));
+                        continue;
+                    }
+
+                    return Err(TranslationError::RetriesExhausted {
+                        attempts: self.translation_config.retries,
+                    });
                 }
             }
 
@@ -387,11 +394,7 @@ impl Translator {
         }
 
         if !full_response.is_empty() {
-            self.display_progress(
-                &full_response,
-                start_time.elapsed(),
-                progress_info.as_ref(),
-            );
+            self.display_progress(&full_response, start_time.elapsed(), progress_info.as_ref());
         }
 
         // Note: Progress line is NOT cleared here to maintain continuity.

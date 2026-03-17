@@ -2,8 +2,8 @@
 //!
 //! Supports Netscape HTTP cookie files, commonly exported by browser extensions.
 
-use reqwest::cookie::Jar;
 use reqwest::Url;
+use reqwest::cookie::Jar;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -52,10 +52,7 @@ pub fn load_netscape_cookie_jar(
     Ok((jar, cookie_path))
 }
 
-fn find_cookie_file(
-    root: &Path,
-    name_tokens: &[&str],
-) -> Result<Option<PathBuf>, std::io::Error> {
+fn find_cookie_file(root: &Path, name_tokens: &[&str]) -> Result<Option<PathBuf>, std::io::Error> {
     let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
     find_cookie_file_recursive(root, name_tokens, &mut best)?;
     Ok(best.map(|(path, _)| path))
@@ -127,19 +124,29 @@ fn parse_netscape_cookie_file(path: &Path) -> Result<Vec<NetscapeCookie>, Cookie
         };
 
         let mut parts = line.splitn(7, '\t');
-        let domain = parts.next().ok_or_else(|| CookieError::InvalidLine(line.to_string()))?;
+        let domain = parts
+            .next()
+            .ok_or_else(|| CookieError::InvalidLine(line.to_string()))?;
         let include_subdomains = parts
             .next()
             .ok_or_else(|| CookieError::InvalidLine(line.to_string()))?
             .eq_ignore_ascii_case("true");
-        let path = parts.next().ok_or_else(|| CookieError::InvalidLine(line.to_string()))?;
+        let path = parts
+            .next()
+            .ok_or_else(|| CookieError::InvalidLine(line.to_string()))?;
         let secure = parts
             .next()
             .ok_or_else(|| CookieError::InvalidLine(line.to_string()))?
             .eq_ignore_ascii_case("true");
-        let expires_raw = parts.next().ok_or_else(|| CookieError::InvalidLine(line.to_string()))?;
-        let name = parts.next().ok_or_else(|| CookieError::InvalidLine(line.to_string()))?;
-        let value = parts.next().ok_or_else(|| CookieError::InvalidLine(line.to_string()))?;
+        let expires_raw = parts
+            .next()
+            .ok_or_else(|| CookieError::InvalidLine(line.to_string()))?;
+        let name = parts
+            .next()
+            .ok_or_else(|| CookieError::InvalidLine(line.to_string()))?;
+        let value = parts
+            .next()
+            .ok_or_else(|| CookieError::InvalidLine(line.to_string()))?;
 
         let expires_unix = expires_raw
             .parse::<u64>()

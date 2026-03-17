@@ -106,7 +106,7 @@ impl NameScout {
     /// Collect names from text, processing in chunks.
     ///
     /// Returns a vector of name entry vectors, one per successfully processed chunk.
-    pub async fn collect_names(&self, text: &str) -> Vec<Vec<NameEntry>> {
+    pub async fn collect_names(&self, text: &str) -> Result<Vec<Vec<NameEntry>>, TranslationError> {
         let chunks = self.split_into_chunks(text);
         let total_chunks = chunks.len();
         let mut results = Vec::new();
@@ -120,52 +120,70 @@ impl NameScout {
                 chunk.len()
             ));
 
-            // Retry loop for JSON parsing
+            // Refusal/JSON retry loop for this chunk.
             let mut attempt = 0;
             let mut success = false;
 
             while attempt < self.scout_config.json_retries && !success {
-                // Call the model
-                match self.call_model(chunk).await {
-                    Ok(raw_response) => {
-                        // Check for refusal
-                        let lower = raw_response.to_lowercase();
-                        if REFUSAL_PHRASES.iter().any(|p| lower.starts_with(p)) {
+                // API failures use the dedicated retry budget and abort the phase when exhausted.
+                let mut api_attempt = 0;
+                let raw_response = loop {
+                    match self.call_model(chunk).await {
+                        Ok(raw_response) => break raw_response,
+                        Err(e) => {
+                            api_attempt += 1;
+                            if api_attempt >= self.scout_config.retries {
+                                self.console.error(&format!(
+                                    "Name scout API failed for chunk {} after {} attempts",
+                                    chunk_num, self.scout_config.retries
+                                ));
+                                return Err(TranslationError::RetriesExhausted {
+                                    attempts: self.scout_config.retries,
+                                });
+                            }
+
+                            let delay = Duration::from_secs(2u64.pow(api_attempt));
                             self.console.warning(&format!(
-                                "Model refused to process chunk {}, retrying...",
+                                "API error for chunk {}: {}, retrying in {:?} (attempt {}/{})",
+                                chunk_num,
+                                e,
+                                delay,
+                                api_attempt + 1,
+                                self.scout_config.retries
+                            ));
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
+                };
+
+                // Check for refusal
+                let lower = raw_response.to_lowercase();
+                if REFUSAL_PHRASES.iter().any(|p| lower.starts_with(p)) {
+                    self.console.warning(&format!(
+                        "Model refused to process chunk {}, retrying...",
+                        chunk_num
+                    ));
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                    continue;
+                }
+
+                // Parse the response
+                match self.parse_response(&raw_response) {
+                    Ok(entries) => {
+                        if !entries.is_empty() {
+                            self.console.success(&format!(
+                                "Found {} names in chunk {}",
+                                entries.len(),
                                 chunk_num
                             ));
-                            attempt += 1;
-                            tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
-                            continue;
+                            results.push(entries);
                         }
-
-                        // Parse the response
-                        match self.parse_response(&raw_response) {
-                            Ok(entries) => {
-                                if !entries.is_empty() {
-                                    self.console.success(&format!(
-                                        "Found {} names in chunk {}",
-                                        entries.len(),
-                                        chunk_num
-                                    ));
-                                    results.push(entries);
-                                }
-                                success = true;
-                            }
-                            Err(e) => {
-                                self.console.warning(&format!(
-                                    "Failed to parse JSON from chunk {}: {}, retrying...",
-                                    chunk_num, e
-                                ));
-                                attempt += 1;
-                                tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
-                            }
-                        }
+                        success = true;
                     }
                     Err(e) => {
                         self.console.warning(&format!(
-                            "API error for chunk {}: {}, retrying...",
+                            "Failed to parse JSON from chunk {}: {}, retrying...",
                             chunk_num, e
                         ));
                         attempt += 1;
@@ -182,7 +200,7 @@ impl NameScout {
             }
         }
 
-        results
+        Ok(results)
     }
 
     /// Split text into chunks for processing.
