@@ -1,6 +1,6 @@
 # Maintainer: ripdog <ripdog@users.noreply.github.com>
 pkgname=tsundoku
-pkgver="$(sed -n 's/^version = \"\\(.*\\)\"$/\\1/p' Cargo.toml | head -n1)"
+pkgver="$(awk -F'"' '$1 == "version = " { print $2; exit }' Cargo.toml)"
 pkgrel=1
 pkgdesc="Japanese web novel downloader and translator supporting Syosetu, Kakuyomu, and Pixiv"
 arch=('x86_64' 'aarch64')
