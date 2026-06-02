@@ -102,6 +102,9 @@ pub struct TranslationConfig {
 
     /// Number of message pairs to retain in conversation history.
     pub history_length: usize,
+
+    /// Number of chapters to translate concurrently.
+    pub workers: usize,
 }
 
 impl Default for TranslationConfig {
@@ -111,6 +114,7 @@ impl Default for TranslationConfig {
             retries: 3,
             delay_between_requests_sec: 1.0,
             history_length: 5,
+            workers: 1,
         }
     }
 }
@@ -130,6 +134,9 @@ pub struct NameScoutConfig {
 
     /// Number of JSON parsing retry attempts.
     pub json_retries: u32,
+
+    /// Number of chapters to scout concurrently.
+    pub workers: usize,
 }
 
 impl Default for NameScoutConfig {
@@ -139,6 +146,7 @@ impl Default for NameScoutConfig {
             retries: 3,
             delay_between_requests_sec: 1.0,
             json_retries: 3,
+            workers: 1,
         }
     }
 }
@@ -303,6 +311,27 @@ impl Config {
             });
         }
 
+        if self.translation.workers == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "translation.workers".to_string(),
+                message: "must be greater than 0".to_string(),
+            });
+        }
+
+        if self.name_scout.chunk_size_chars == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "name_scout.chunk_size_chars".to_string(),
+                message: "must be greater than 0".to_string(),
+            });
+        }
+
+        if self.name_scout.workers == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "name_scout.workers".to_string(),
+                message: "must be greater than 0".to_string(),
+            });
+        }
+
         Ok(())
     }
 
@@ -340,6 +369,8 @@ mod tests {
         assert!(config.scout_api.is_some());
         assert!(!config.scout_api.as_ref().unwrap().is_configured());
         assert_eq!(config.translation.chunk_size_chars, 4000);
+        assert_eq!(config.translation.workers, 1);
+        assert_eq!(config.name_scout.workers, 1);
         assert_eq!(config.scraping.delay_between_requests_sec, 1.0);
     }
 

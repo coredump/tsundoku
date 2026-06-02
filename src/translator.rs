@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedSender;
 
 /// Refusal phrases that indicate the model declined to translate.
 static REFUSAL_PHRASES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
@@ -35,6 +36,29 @@ pub struct ProgressInfo {
     pub chunk: u32,
     /// Total number of chunks.
     pub total_chunks: u32,
+    /// Optional worker slot currently translating this chapter.
+    pub worker: Option<usize>,
+    /// Optional channel for centralized progress reporting.
+    pub reporter: Option<UnboundedSender<TranslationProgress>>,
+}
+
+/// Progress event emitted while a translation stream is running.
+#[derive(Debug, Clone)]
+pub struct TranslationProgress {
+    /// Worker slot emitting this update.
+    pub worker: usize,
+    /// Chapter currently being translated.
+    pub chapter: u32,
+    /// Current chunk number.
+    pub chunk: u32,
+    /// Total chunk count for the chapter.
+    pub total_chunks: u32,
+    /// Number of translated characters received for the current chunk.
+    pub chars: usize,
+    /// Seconds elapsed since the current chunk started.
+    pub elapsed_secs: f64,
+    /// True when the worker is between chunks.
+    pub preparing: bool,
 }
 
 /// A message in the conversation history.
@@ -179,6 +203,8 @@ impl Translator {
                     chapter: p.chapter,
                     chunk: chunk_num,
                     total_chunks,
+                    worker: p.worker,
+                    reporter: p.reporter.clone(),
                 });
 
                 // Show "Preparing..." status before starting chunk (except first)
@@ -240,9 +266,14 @@ impl Translator {
                 }
             }
 
-            // Clear progress line after all chunks complete
-            print!("\r\x1b[2K");
-            let _ = io::stdout().flush();
+            if progress_info
+                .as_ref()
+                .and_then(|info| info.reporter.as_ref())
+                .is_none()
+            {
+                print!("\r\x1b[2K");
+                let _ = io::stdout().flush();
+            }
 
             Ok(results.join("\n\n"))
         }
@@ -376,7 +407,7 @@ impl Translator {
 
                             // Update progress display every second
                             if last_update.elapsed() >= Duration::from_secs(1) {
-                                self.display_progress(
+                                self.report_progress(
                                     &full_response,
                                     start_time.elapsed(),
                                     progress_info.as_ref(),
@@ -394,7 +425,7 @@ impl Translator {
         }
 
         if !full_response.is_empty() {
-            self.display_progress(&full_response, start_time.elapsed(), progress_info.as_ref());
+            self.report_progress(&full_response, start_time.elapsed(), progress_info.as_ref());
         }
 
         // Note: Progress line is NOT cleared here to maintain continuity.
@@ -448,6 +479,30 @@ impl Translator {
         Ok(trimmed)
     }
 
+    fn report_progress(
+        &self,
+        response: &str,
+        elapsed: Duration,
+        progress_info: Option<&ProgressInfo>,
+    ) {
+        if let Some(info) = progress_info
+            && let (Some(worker), Some(reporter)) = (info.worker, info.reporter.as_ref())
+        {
+            let _ = reporter.send(TranslationProgress {
+                worker,
+                chapter: info.chapter,
+                chunk: info.chunk,
+                total_chunks: info.total_chunks,
+                chars: response.chars().count(),
+                elapsed_secs: elapsed.as_secs_f64(),
+                preparing: false,
+            });
+            return;
+        }
+
+        self.display_progress(response, elapsed, progress_info);
+    }
+
     /// Display progress during streaming.
     fn display_progress(
         &self,
@@ -455,14 +510,13 @@ impl Translator {
         elapsed: Duration,
         progress_info: Option<&ProgressInfo>,
     ) {
-        let char_count = response.len();
+        let char_count = response.chars().count();
         let speed = if elapsed.as_secs_f64() > 0.0 {
             (char_count as f64 / elapsed.as_secs_f64()) as u32
         } else {
             0
         };
 
-        // Get preview (last 50 chars, newlines replaced with spaces)
         let preview: String = response
             .chars()
             .rev()
@@ -473,7 +527,6 @@ impl Translator {
             .map(|c| if c == '\n' { ' ' } else { c })
             .collect();
 
-        // Build progress line
         let progress_prefix = if let Some(info) = progress_info {
             format!(
                 "\x1b[1;36m[Chapter {}, Chunk {}/{}]\x1b[0m ",
@@ -492,6 +545,21 @@ impl Translator {
 
     /// Display "Preparing..." status between chunks.
     fn display_preparing(&self, progress_info: Option<&ProgressInfo>) {
+        if let Some(info) = progress_info
+            && let (Some(worker), Some(reporter)) = (info.worker, info.reporter.as_ref())
+        {
+            let _ = reporter.send(TranslationProgress {
+                worker,
+                chapter: info.chapter,
+                chunk: info.chunk,
+                total_chunks: info.total_chunks,
+                chars: 0,
+                elapsed_secs: 0.0,
+                preparing: true,
+            });
+            return;
+        }
+
         let progress_prefix = if let Some(info) = progress_info {
             format!(
                 "\x1b[1;36m[Chapter {}, Chunk {}/{}]\x1b[0m ",
@@ -619,6 +687,8 @@ mod tests {
             chapter: 1,
             chunk: 2,
             total_chunks: 5,
+            worker: None,
+            reporter: None,
         };
 
         assert_eq!(info.chapter, 1);

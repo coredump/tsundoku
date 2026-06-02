@@ -1,15 +1,21 @@
 //! Tsundoku CLI - Japanese web novel downloader and translator.
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::{Shell, generate};
+use futures::{StreamExt, stream};
+use std::collections::HashMap;
 use std::io::{self, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::{Mutex, mpsc};
 use tsundoku::config::Config;
-use tsundoku::console::Console;
+use tsundoku::console::{Console, Style};
 use tsundoku::name_mapping::NameMappingStore;
 use tsundoku::name_scout::{NameScout, build_chapter_payload};
 use tsundoku::scrapers::{ChapterInfo, ChapterList, ScraperRegistry};
-use tsundoku::translator::{ProgressInfo, Translator};
+use tsundoku::translator::{ProgressInfo, TranslationProgress, Translator};
 
 /// Japanese web novel downloader and translator.
 #[derive(Parser, Debug)]
@@ -17,7 +23,12 @@ use tsundoku::translator::{ProgressInfo, Translator};
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// URL of the novel to download.
-    novel_url: String,
+    #[arg(required_unless_present = "generate_completions")]
+    novel_url: Option<String>,
+
+    /// Generate shell completions to stdout.
+    #[arg(long, value_enum)]
+    generate_completions: Option<Shell>,
 
     /// Start downloading from chapter N (1-based).
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
@@ -34,6 +45,18 @@ struct Args {
     /// Disable name scouting entirely.
     #[arg(long)]
     no_name_scout: bool,
+
+    /// Override number of name scout chapter workers.
+    #[arg(long)]
+    name_scout_workers: Option<NonZeroUsize>,
+
+    /// Only scout names through chapter N.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    name_scout_limit: Option<u32>,
+
+    /// Override number of story translation chapter workers.
+    #[arg(long)]
+    translation_workers: Option<NonZeroUsize>,
 
     /// Enable debug logging for scrapers.
     #[arg(long)]
@@ -60,12 +83,23 @@ struct ProcessParams<'a> {
     name_mapping: &'a mut NameMappingStore,
     no_name_pause: bool,
     no_name_scout: bool,
+    name_scout_limit: Option<u32>,
     config: &'a Config,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(shell) = args.generate_completions {
+        let mut command = Args::command();
+        generate(shell, &mut command, "tsundoku", &mut io::stdout());
+        return Ok(());
+    }
+
+    let novel_url = args
+        .novel_url
+        .as_deref()
+        .context("Novel URL is required unless generating completions")?;
     let console = Console::new();
 
     console.section("Tsundoku - Web Novel Downloader");
@@ -74,6 +108,12 @@ async fn main() -> Result<()> {
     console.step("Loading configuration...");
     let mut config = Config::load().context("Failed to load configuration")?;
     config.scraping.debug = args.debug;
+    if let Some(workers) = args.name_scout_workers {
+        config.name_scout.workers = workers.get();
+    }
+    if let Some(workers) = args.translation_workers {
+        config.translation.workers = workers.get();
+    }
 
     // Check if this is first run (API key not configured)
     if !config.api.is_configured() {
@@ -111,15 +151,15 @@ async fn main() -> Result<()> {
     console.step("Finding scraper for URL...");
     let registry = ScraperRegistry::new(&config.scraping);
     let scraper = registry
-        .find_for_url(&args.novel_url)
-        .ok_or_else(|| anyhow::anyhow!("No scraper found for URL: {}", args.novel_url))?;
+        .find_for_url(novel_url)
+        .ok_or_else(|| anyhow::anyhow!("No scraper found for URL: {}", novel_url))?;
 
     console.success(&format!("Using {} scraper", scraper.name()));
 
     // Fetch novel info
     console.step("Fetching novel information...");
     let novel_info = scraper
-        .get_novel_info(&args.novel_url)
+        .get_novel_info(novel_url)
         .await
         .context("Failed to fetch novel info")?;
 
@@ -194,6 +234,7 @@ async fn main() -> Result<()> {
         name_mapping: &mut name_mapping,
         no_name_pause: args.no_name_pause,
         no_name_scout: args.no_name_scout,
+        name_scout_limit: args.name_scout_limit,
         config: &config,
     };
 
@@ -258,6 +299,8 @@ async fn process_oneshot(params: &mut ProcessParams<'_>) -> Result<()> {
             params.name_scout,
             params.name_mapping,
             &[(1, &params.novel_info.title, &content)],
+            params.config.name_scout.workers,
+            params.name_scout_limit,
         )
         .await?
     };
@@ -283,6 +326,8 @@ async fn process_oneshot(params: &mut ProcessParams<'_>) -> Result<()> {
             chapter: 1,
             chunk: 1,
             total_chunks: 1,
+            worker: None,
+            reporter: None,
         };
 
         let translated = params
@@ -396,6 +441,8 @@ async fn process_chapters(
             params.name_scout,
             params.name_mapping,
             &scout_data,
+            params.config.name_scout.workers,
+            params.name_scout_limit,
         )
         .await?
     };
@@ -408,7 +455,38 @@ async fn process_chapters(
     // Translation phase
     params.console.section("Translation Phase");
 
-    for chapter_data in &downloaded_chapters {
+    translate_chapters(
+        params.console,
+        params.translator,
+        params.name_mapping,
+        &downloaded_chapters,
+        &story_dir,
+        padding,
+        params.config.translation.workers,
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn translate_chapters(
+    console: &Console,
+    translator: &Translator,
+    name_mapping: &NameMappingStore,
+    downloaded_chapters: &[ChapterData],
+    story_dir: &Path,
+    padding: usize,
+    workers: usize,
+) -> Result<()> {
+    console.info(&format!(
+        "Translating with {} chapter worker{}",
+        workers,
+        if workers == 1 { "" } else { "s" }
+    ));
+
+    let mut jobs = Vec::new();
+
+    for chapter_data in downloaded_chapters {
         // Check if translation already exists
         let chapter_num_str = format!("{:0width$}", chapter_data.number, width = padding);
         let pattern = format!("{} - ", chapter_num_str);
@@ -419,61 +497,231 @@ async fn process_chapters(
             .any(|e| e.file_name().to_string_lossy().starts_with(&pattern));
 
         if translation_exists {
-            params.console.info(&format!(
+            console.info(&format!(
                 "Chapter {} already translated, skipping",
                 chapter_data.number
             ));
             continue;
         }
 
-        params.console.step(&format!(
-            "Translating chapter {}: {}",
-            chapter_data.number, chapter_data.title
-        ));
-
-        // Translate title
-        let mapped_title = params.name_mapping.apply_to_text(&chapter_data.title);
-        let translated_title = params
-            .translator
-            .translate(&mapped_title, true, None)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to translate title for chapter {}",
-                    chapter_data.number
-                )
-            })?;
-
-        // Validate translated title for filesystem
-        let safe_title = sanitize_filename(&translated_title);
-
-        // Apply name mapping to content
-        let mapped_content = params.name_mapping.apply_to_text(&chapter_data.content);
-
-        // Translate content
-        let progress = ProgressInfo {
-            chapter: chapter_data.number,
-            chunk: 1,
-            total_chunks: 1, // Will be updated by translator
-        };
-
-        let translated_content = params
-            .translator
-            .translate(&mapped_content, false, Some(progress))
-            .await
-            .context("Failed to translate chapter")?;
-
-        // Save translated chapter
-        let translated_filename = format!("{} - {}.txt", chapter_num_str, safe_title);
-        let translated_path = story_dir.join(&translated_filename);
-        std::fs::write(&translated_path, &translated_content)?;
-
-        params
-            .console
-            .success(&format!("Saved: {}", translated_filename));
+        jobs.push(TranslationJob {
+            number: chapter_data.number,
+            title: chapter_data.title.clone(),
+            chapter_num_str,
+            mapped_title: name_mapping.apply_to_text(&chapter_data.title),
+            mapped_content: name_mapping.apply_to_text(&chapter_data.content),
+        });
     }
 
+    if jobs.is_empty() {
+        return Ok(());
+    }
+
+    let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+    let progress_display = tokio::spawn(display_translation_stats(progress_rx, workers));
+    let worker_ids = Arc::new(Mutex::new((1..=workers).rev().collect::<Vec<_>>()));
+
+    {
+        let translated = stream::iter(jobs)
+            .map(|job| {
+                let worker_ids = Arc::clone(&worker_ids);
+                let progress_tx = progress_tx.clone();
+
+                async move {
+                    let worker = worker_ids
+                        .lock()
+                        .await
+                        .pop()
+                        .expect("worker id pool cannot be empty");
+
+                    let result = translate_chapter_job(
+                        console,
+                        translator,
+                        job,
+                        worker,
+                        progress_tx.clone(),
+                    )
+                    .await;
+
+                    let _ = progress_tx.send(TranslationProgress {
+                        worker,
+                        chapter: 0,
+                        chunk: 0,
+                        total_chunks: 0,
+                        chars: 0,
+                        elapsed_secs: 0.0,
+                        preparing: false,
+                    });
+
+                    worker_ids.lock().await.push(worker);
+                    result
+                }
+            })
+            .buffer_unordered(workers);
+
+        futures::pin_mut!(translated);
+        while let Some(result) = translated.next().await {
+            let chapter = result?;
+            let translated_path = story_dir.join(&chapter.filename);
+            std::fs::write(&translated_path, &chapter.content)?;
+            console.success(&format!("Saved: {}", chapter.filename));
+        }
+    }
+
+    drop(progress_tx);
+    let _ = progress_display.await;
+
     Ok(())
+}
+
+async fn translate_chapter_job(
+    console: &Console,
+    translator: &Translator,
+    job: TranslationJob,
+    worker: usize,
+    progress_tx: mpsc::UnboundedSender<TranslationProgress>,
+) -> Result<TranslatedChapter> {
+    console.step(&format!(
+        "Worker {} translating chapter {}: {}",
+        worker, job.number, job.title
+    ));
+
+    let translated_title = translator
+        .translate(&job.mapped_title, true, None)
+        .await
+        .with_context(|| format!("Failed to translate title for chapter {}", job.number))?;
+
+    let progress = ProgressInfo {
+        chapter: job.number,
+        chunk: 1,
+        total_chunks: 1, // Will be updated by translator
+        worker: Some(worker),
+        reporter: Some(progress_tx),
+    };
+
+    let translated_content = translator
+        .translate(&job.mapped_content, false, Some(progress))
+        .await
+        .with_context(|| format!("Failed to translate chapter {}", job.number))?;
+
+    Ok(TranslatedChapter {
+        filename: format!(
+            "{} - {}.txt",
+            job.chapter_num_str,
+            sanitize_filename(&translated_title)
+        ),
+        content: translated_content,
+    })
+}
+
+struct TranslationJob {
+    number: u32,
+    title: String,
+    chapter_num_str: String,
+    mapped_title: String,
+    mapped_content: String,
+}
+
+struct TranslatedChapter {
+    filename: String,
+    content: String,
+}
+
+#[derive(Debug, Clone)]
+struct WorkerStat {
+    chapter: u32,
+    chunk: u32,
+    total_chunks: u32,
+    chars: usize,
+    elapsed_secs: f64,
+    preparing: bool,
+}
+
+async fn display_translation_stats(
+    mut progress_rx: mpsc::UnboundedReceiver<TranslationProgress>,
+    workers: usize,
+) {
+    let console = Console::new();
+    let mut stats: HashMap<usize, WorkerStat> = HashMap::new();
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+
+    loop {
+        tokio::select! {
+            Some(progress) = progress_rx.recv() => {
+                stats.insert(progress.worker, WorkerStat {
+                    chapter: progress.chapter,
+                    chunk: progress.chunk,
+                    total_chunks: progress.total_chunks,
+                    chars: progress.chars,
+                    elapsed_secs: progress.elapsed_secs,
+                    preparing: progress.preparing,
+                });
+            }
+            _ = ticker.tick() => {
+                render_translation_stats(&console, &stats, workers);
+            }
+            else => break,
+        }
+    }
+
+    render_translation_stats(&console, &stats, workers);
+    print!("\n");
+    let _ = io::stdout().flush();
+}
+
+fn render_translation_stats(console: &Console, stats: &HashMap<usize, WorkerStat>, workers: usize) {
+    let mut aggregate = 0.0;
+    let mut worker_parts = Vec::new();
+
+    for worker in 1..=workers {
+        let label = console.style(&format!("W{}", worker), &[Style::Cyan, Style::Bold]);
+
+        if let Some(stat) = stats.get(&worker) {
+            if stat.chapter == 0 {
+                worker_parts.push(format!("{}: {}", label, console.muted("idle")));
+            } else if stat.preparing {
+                worker_parts.push(format!(
+                    "{}: {}",
+                    label,
+                    console.muted(&format!(
+                        "ch{} preparing {}/{}",
+                        stat.chapter, stat.chunk, stat.total_chunks
+                    ))
+                ));
+            } else {
+                let speed = if stat.elapsed_secs > 0.0 {
+                    stat.chars as f64 / stat.elapsed_secs
+                } else {
+                    0.0
+                };
+                aggregate += speed;
+                worker_parts.push(format!(
+                    "{}: ch{} {}/{} {}",
+                    label,
+                    stat.chapter,
+                    stat.chunk,
+                    stat.total_chunks,
+                    console.style(&format!("{:.0} ch/s", speed), &[Style::Green, Style::Bold])
+                ));
+            }
+        } else {
+            worker_parts.push(format!("{}: {}", label, console.muted("idle")));
+        }
+    }
+
+    let info = console.label("INFO", Style::Blue);
+    let aggregate = console.style(
+        &format!("{:.0} ch/s", aggregate),
+        &[Style::Green, Style::Bold],
+    );
+
+    print!(
+        "\r\x1b[2K{} Translating. All: {}, {}",
+        info,
+        aggregate,
+        worker_parts.join(", ")
+    );
+    let _ = io::stdout().flush();
 }
 
 /// Runs name scout on chapters that haven't been covered.
@@ -483,11 +731,14 @@ async fn run_name_scout(
     name_scout: &NameScout,
     name_mapping: &mut NameMappingStore,
     chapters: &[(u32, &str, &str)], // (number, title, content)
+    workers: usize,
+    limit: Option<u32>,
 ) -> Result<bool> {
     console.section("Name Scout Phase");
 
     let uncovered: Vec<_> = chapters
         .iter()
+        .filter(|(num, _, _)| limit.is_none_or(|limit| *num <= limit))
         .filter(|(num, _, _)| !name_mapping.is_chapter_covered(*num))
         .collect();
 
@@ -497,33 +748,45 @@ async fn run_name_scout(
     }
 
     console.info(&format!(
-        "Scouting {} chapters for character names",
-        uncovered.len()
+        "Scouting {} chapters for character names with {} chapter worker{}",
+        uncovered.len(),
+        workers,
+        if workers == 1 { "" } else { "s" }
     ));
 
-    for (number, title, content) in uncovered {
-        console.step(&format!("Scouting chapter {}: {}", number, title));
+    let scouted = stream::iter(uncovered)
+        .map(|(number, title, content)| async move {
+            console.step(&format!("Scouting chapter {}: {}", number, title));
 
-        let payload = build_chapter_payload(*number, title, content);
-        let name_chunks = name_scout
-            .collect_names(&payload)
-            .await
-            .with_context(|| format!("Failed to scout names for chapter {}", number))?;
+            let payload = build_chapter_payload(*number, title, content);
+            let name_chunks = name_scout
+                .collect_names(&payload)
+                .await
+                .with_context(|| format!("Failed to scout names for chapter {}", number))?;
 
-        let total_names: usize = name_chunks.iter().map(|c| c.len()).sum();
-        console.info(&format!(
-            "Found {} names in chapter {}",
-            total_names, number
-        ));
+            let total_names: usize = name_chunks.iter().map(|c| c.len()).sum();
+            console.info(&format!(
+                "Found {} names in chapter {}",
+                total_names, number
+            ));
 
-        // Record votes and save
-        for entries in name_chunks {
+            Ok::<ScoutedChapter, anyhow::Error>(ScoutedChapter {
+                number: *number,
+                name_chunks,
+            })
+        })
+        .buffer_unordered(workers);
+
+    futures::pin_mut!(scouted);
+    while let Some(result) = scouted.next().await {
+        let chapter = result?;
+        for entries in chapter.name_chunks {
             name_mapping.record_votes(&entries);
             name_mapping.save()?;
         }
 
         // Mark chapter as covered
-        name_mapping.add_coverage(&[*number]);
+        name_mapping.add_coverage(&[chapter.number]);
         name_mapping.save()?;
     }
 
@@ -533,6 +796,11 @@ async fn run_name_scout(
     ));
 
     Ok(true)
+}
+
+struct ScoutedChapter {
+    number: u32,
+    name_chunks: Vec<Vec<tsundoku::name_mapping::NameEntry>>,
 }
 
 /// Prompts user to review and edit name mappings.

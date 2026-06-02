@@ -38,5 +38,7 @@ check() {
 package() {
     cd "$startdir"
     install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+    install -dm755 "$pkgdir/usr/share/fish/vendor_completions.d"
+    "target/release/$pkgname" --generate-completions fish > "$pkgdir/usr/share/fish/vendor_completions.d/$pkgname.fish"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
