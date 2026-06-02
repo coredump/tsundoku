@@ -11,7 +11,8 @@ use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedSender;
 
 /// Regex to extract JSON from markdown code fences.
 static CODE_FENCE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -91,6 +92,71 @@ pub struct NameScout {
     console: Console,
 }
 
+/// Progress information for a name scout worker.
+#[derive(Debug, Clone)]
+pub struct ScoutProgressInfo {
+    /// Current chapter number.
+    pub chapter: u32,
+    /// Worker slot currently scouting this chapter.
+    pub worker: usize,
+    /// Optional channel for centralized progress reporting.
+    pub reporter: Option<UnboundedSender<NameScoutEvent>>,
+}
+
+/// Current state of a name scout worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameScoutStatus {
+    /// The worker is preparing the chunk before sending it.
+    Scouting,
+    /// The worker has sent the prompt and is waiting for model processing.
+    Waiting,
+    /// The worker is retrying after an API, refusal, or JSON parse failure.
+    Retrying,
+    /// The worker is parsing a model response.
+    Parsing,
+}
+
+/// Progress event emitted while name scouting is running.
+#[derive(Debug, Clone)]
+pub struct NameScoutProgress {
+    /// Worker slot emitting this update.
+    pub worker: usize,
+    /// Chapter currently being scouted.
+    pub chapter: u32,
+    /// Current chunk number.
+    pub chunk: u32,
+    /// Total chunk count for the chapter.
+    pub total_chunks: u32,
+    /// Characters in the current chunk.
+    pub chars: usize,
+    /// Seconds elapsed since the current chunk started.
+    pub elapsed_secs: f64,
+    /// Current worker status.
+    pub status: NameScoutStatus,
+}
+
+/// Permanent name scout message to print above the live statusline.
+#[derive(Debug, Clone)]
+pub struct NameScoutNotice {
+    /// Chapter currently being scouted.
+    pub chapter: u32,
+    /// Current chunk number.
+    pub chunk: u32,
+    /// Message text.
+    pub message: String,
+    /// True for fatal errors, false for retryable warnings.
+    pub error: bool,
+}
+
+/// Event emitted while name scouting is running.
+#[derive(Debug, Clone)]
+pub enum NameScoutEvent {
+    /// Live statusline progress.
+    Progress(NameScoutProgress),
+    /// Permanent warning or error output.
+    Notice(NameScoutNotice),
+}
+
 impl NameScout {
     /// Create a new NameScout.
     pub fn new(api_config: ApiConfig, scout_config: NameScoutConfig, prompt: String) -> Self {
@@ -107,18 +173,39 @@ impl NameScout {
     ///
     /// Returns a vector of name entry vectors, one per successfully processed chunk.
     pub async fn collect_names(&self, text: &str) -> Result<Vec<Vec<NameEntry>>, TranslationError> {
+        self.collect_names_with_progress(text, None).await
+    }
+
+    /// Collect names from text, reporting chunk progress when a reporter is provided.
+    pub async fn collect_names_with_progress(
+        &self,
+        text: &str,
+        progress_info: Option<ScoutProgressInfo>,
+    ) -> Result<Vec<Vec<NameEntry>>, TranslationError> {
         let chunks = self.split_into_chunks(text);
         let total_chunks = chunks.len();
         let mut results = Vec::new();
 
         for (i, chunk) in chunks.iter().enumerate() {
             let chunk_num = i + 1;
-            self.console.info(&format!(
-                "Name scout chunk {}/{} ({} chars)",
+            let chunk_started = Instant::now();
+            self.report_progress(
                 chunk_num,
                 total_chunks,
-                chunk.len()
-            ));
+                chunk.len(),
+                chunk_started,
+                NameScoutStatus::Scouting,
+                progress_info.as_ref(),
+            );
+
+            if progress_info.is_none() {
+                self.console.info(&format!(
+                    "Name scout chunk {}/{} ({} chars)",
+                    chunk_num,
+                    total_chunks,
+                    chunk.len()
+                ));
+            }
 
             // Refusal/JSON retry loop for this chunk.
             let mut attempt = 0;
@@ -128,30 +215,84 @@ impl NameScout {
                 // API failures use the dedicated retry budget and abort the phase when exhausted.
                 let mut api_attempt = 0;
                 let raw_response = loop {
+                    self.report_progress(
+                        chunk_num,
+                        total_chunks,
+                        chunk.len(),
+                        chunk_started,
+                        NameScoutStatus::Waiting,
+                        progress_info.as_ref(),
+                    );
+
                     match self.call_model(chunk).await {
                         Ok(raw_response) => break raw_response,
                         Err(e) => {
                             api_attempt += 1;
                             if api_attempt >= self.scout_config.retries {
-                                self.console.error(&format!(
-                                    "Name scout API failed for chunk {} after {} attempts",
-                                    chunk_num, self.scout_config.retries
-                                ));
+                                self.report_notice(
+                                    chunk_num,
+                                    true,
+                                    format!(
+                                        "Name scout API failed for chapter {}, chunk {} after {} attempts",
+                                        progress_info.as_ref().map_or(0, |info| info.chapter),
+                                        chunk_num,
+                                        self.scout_config.retries
+                                    ),
+                                    progress_info.as_ref(),
+                                );
+                                if progress_info.is_none() {
+                                    self.console.error(&format!(
+                                        "Name scout API failed for chunk {} after {} attempts",
+                                        chunk_num, self.scout_config.retries
+                                    ));
+                                }
                                 return Err(TranslationError::RetriesExhausted {
                                     attempts: self.scout_config.retries,
                                 });
                             }
 
                             let delay = Duration::from_secs(2u64.pow(api_attempt));
-                            self.console.warning(&format!(
-                                "API error for chunk {}: {}, retrying in {:?} (attempt {}/{})",
+                            self.report_progress(
                                 chunk_num,
-                                e,
-                                delay,
-                                api_attempt + 1,
-                                self.scout_config.retries
-                            ));
+                                total_chunks,
+                                chunk.len(),
+                                chunk_started,
+                                NameScoutStatus::Retrying,
+                                progress_info.as_ref(),
+                            );
+                            self.report_notice(
+                                chunk_num,
+                                false,
+                                format!(
+                                    "API error for chapter {}, chunk {}: {}, retrying in {:?} (attempt {}/{})",
+                                    progress_info.as_ref().map_or(0, |info| info.chapter),
+                                    chunk_num,
+                                    e,
+                                    delay,
+                                    api_attempt + 1,
+                                    self.scout_config.retries
+                                ),
+                                progress_info.as_ref(),
+                            );
+                            if progress_info.is_none() {
+                                self.console.warning(&format!(
+                                    "API error for chunk {}: {}, retrying in {:?} (attempt {}/{})",
+                                    chunk_num,
+                                    e,
+                                    delay,
+                                    api_attempt + 1,
+                                    self.scout_config.retries
+                                ));
+                            }
                             tokio::time::sleep(delay).await;
+                            self.report_progress(
+                                chunk_num,
+                                total_chunks,
+                                chunk.len(),
+                                chunk_started,
+                                NameScoutStatus::Scouting,
+                                progress_info.as_ref(),
+                            );
                         }
                     }
                 };
@@ -159,33 +300,85 @@ impl NameScout {
                 // Check for refusal
                 let lower = raw_response.to_lowercase();
                 if REFUSAL_PHRASES.iter().any(|p| lower.starts_with(p)) {
-                    self.console.warning(&format!(
-                        "Model refused to process chunk {}, retrying...",
-                        chunk_num
-                    ));
+                    self.report_progress(
+                        chunk_num,
+                        total_chunks,
+                        chunk.len(),
+                        chunk_started,
+                        NameScoutStatus::Retrying,
+                        progress_info.as_ref(),
+                    );
+                    self.report_notice(
+                        chunk_num,
+                        false,
+                        format!(
+                            "Model refused chapter {}, chunk {}; retrying",
+                            progress_info.as_ref().map_or(0, |info| info.chapter),
+                            chunk_num
+                        ),
+                        progress_info.as_ref(),
+                    );
+                    if progress_info.is_none() {
+                        self.console.warning(&format!(
+                            "Model refused to process chunk {}, retrying...",
+                            chunk_num
+                        ));
+                    }
                     attempt += 1;
                     tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
                     continue;
                 }
 
+                self.report_progress(
+                    chunk_num,
+                    total_chunks,
+                    chunk.len(),
+                    chunk_started,
+                    NameScoutStatus::Parsing,
+                    progress_info.as_ref(),
+                );
+
                 // Parse the response
                 match self.parse_response(&raw_response) {
                     Ok(entries) => {
                         if !entries.is_empty() {
-                            self.console.success(&format!(
-                                "Found {} names in chunk {}",
-                                entries.len(),
-                                chunk_num
-                            ));
+                            if progress_info.is_none() {
+                                self.console.success(&format!(
+                                    "Found {} names in chunk {}",
+                                    entries.len(),
+                                    chunk_num
+                                ));
+                            }
                             results.push(entries);
                         }
                         success = true;
                     }
                     Err(e) => {
-                        self.console.warning(&format!(
-                            "Failed to parse JSON from chunk {}: {}, retrying...",
-                            chunk_num, e
-                        ));
+                        self.report_progress(
+                            chunk_num,
+                            total_chunks,
+                            chunk.len(),
+                            chunk_started,
+                            NameScoutStatus::Retrying,
+                            progress_info.as_ref(),
+                        );
+                        self.report_notice(
+                            chunk_num,
+                            false,
+                            format!(
+                                "Failed to parse JSON from chapter {}, chunk {}: {}; retrying",
+                                progress_info.as_ref().map_or(0, |info| info.chapter),
+                                chunk_num,
+                                e
+                            ),
+                            progress_info.as_ref(),
+                        );
+                        if progress_info.is_none() {
+                            self.console.warning(&format!(
+                                "Failed to parse JSON from chunk {}: {}, retrying...",
+                                chunk_num, e
+                            ));
+                        }
                         attempt += 1;
                         tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
                     }
@@ -193,14 +386,70 @@ impl NameScout {
             }
 
             if !success {
-                self.console.error(&format!(
-                    "Failed to process chunk {} after {} attempts",
-                    chunk_num, self.scout_config.json_retries
-                ));
+                self.report_notice(
+                    chunk_num,
+                    true,
+                    format!(
+                        "Failed to process chapter {}, chunk {} after {} attempts",
+                        progress_info.as_ref().map_or(0, |info| info.chapter),
+                        chunk_num,
+                        self.scout_config.json_retries
+                    ),
+                    progress_info.as_ref(),
+                );
+                if progress_info.is_none() {
+                    self.console.error(&format!(
+                        "Failed to process chunk {} after {} attempts",
+                        chunk_num, self.scout_config.json_retries
+                    ));
+                }
             }
         }
 
         Ok(results)
+    }
+
+    fn report_progress(
+        &self,
+        chunk: usize,
+        total_chunks: usize,
+        chars: usize,
+        started: Instant,
+        status: NameScoutStatus,
+        progress_info: Option<&ScoutProgressInfo>,
+    ) {
+        if let Some(info) = progress_info
+            && let Some(reporter) = info.reporter.as_ref()
+        {
+            let _ = reporter.send(NameScoutEvent::Progress(NameScoutProgress {
+                worker: info.worker,
+                chapter: info.chapter,
+                chunk: chunk as u32,
+                total_chunks: total_chunks as u32,
+                chars,
+                elapsed_secs: started.elapsed().as_secs_f64(),
+                status,
+            }));
+        }
+    }
+
+    fn report_notice(
+        &self,
+        chunk: usize,
+        error: bool,
+        message: String,
+        progress_info: Option<&ScoutProgressInfo>,
+    ) {
+        if let Some(info) = progress_info
+            && let Some(reporter) = info.reporter.as_ref()
+        {
+            let _ = reporter.send(NameScoutEvent::Notice(NameScoutNotice {
+                chapter: info.chapter,
+                chunk: chunk as u32,
+                message,
+                error,
+            }));
+        }
     }
 
     /// Split text into chunks for processing.

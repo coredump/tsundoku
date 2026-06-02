@@ -13,7 +13,10 @@ use tokio::sync::{Mutex, mpsc};
 use tsundoku::config::Config;
 use tsundoku::console::{Console, Style};
 use tsundoku::name_mapping::NameMappingStore;
-use tsundoku::name_scout::{NameScout, build_chapter_payload};
+use tsundoku::name_scout::{
+    NameScout, NameScoutEvent, NameScoutProgress, NameScoutStatus, ScoutProgressInfo,
+    build_chapter_payload,
+};
 use tsundoku::scrapers::{ChapterInfo, ChapterList, ScraperRegistry};
 use tsundoku::translator::{ProgressInfo, TranslationProgress, Translator};
 
@@ -754,40 +757,85 @@ async fn run_name_scout(
         if workers == 1 { "" } else { "s" }
     ));
 
-    let scouted = stream::iter(uncovered)
-        .map(|(number, title, content)| async move {
-            console.step(&format!("Scouting chapter {}: {}", number, title));
+    let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+    let progress_display = tokio::spawn(display_name_scout_stats(progress_rx, workers));
+    let worker_ids = Arc::new(Mutex::new((1..=workers).rev().collect::<Vec<_>>()));
 
-            let payload = build_chapter_payload(*number, title, content);
-            let name_chunks = name_scout
-                .collect_names(&payload)
-                .await
-                .with_context(|| format!("Failed to scout names for chapter {}", number))?;
+    let mut scout_error = None;
 
-            let total_names: usize = name_chunks.iter().map(|c| c.len()).sum();
-            console.info(&format!(
-                "Found {} names in chapter {}",
-                total_names, number
-            ));
+    {
+        let scouted = stream::iter(uncovered)
+            .map(|(number, title, content)| {
+                let worker_ids = Arc::clone(&worker_ids);
+                let progress_tx = progress_tx.clone();
 
-            Ok::<ScoutedChapter, anyhow::Error>(ScoutedChapter {
-                number: *number,
-                name_chunks,
+                async move {
+                    let worker = worker_ids
+                        .lock()
+                        .await
+                        .pop()
+                        .expect("worker id pool cannot be empty");
+
+                    let result = scout_chapter_job(
+                        name_scout,
+                        *number,
+                        title,
+                        content,
+                        worker,
+                        progress_tx.clone(),
+                    )
+                    .await;
+
+                    let _ = progress_tx.send(NameScoutEvent::Progress(NameScoutProgress {
+                        worker,
+                        chapter: 0,
+                        chunk: 0,
+                        total_chunks: 0,
+                        chars: 0,
+                        elapsed_secs: 0.0,
+                        status: NameScoutStatus::Scouting,
+                    }));
+
+                    worker_ids.lock().await.push(worker);
+                    result
+                }
             })
-        })
-        .buffer_unordered(workers);
+            .buffer_unordered(workers);
 
-    futures::pin_mut!(scouted);
-    while let Some(result) = scouted.next().await {
-        let chapter = result?;
-        for entries in chapter.name_chunks {
-            name_mapping.record_votes(&entries);
+        futures::pin_mut!(scouted);
+        while let Some(result) = scouted.next().await {
+            let chapter = match result {
+                Ok(chapter) => chapter,
+                Err(error) => {
+                    scout_error = Some(error);
+                    break;
+                }
+            };
+
+            for entries in &chapter.name_chunks {
+                name_mapping.record_votes(entries);
+                name_mapping.save()?;
+            }
+
+            // Mark chapter as covered
+            name_mapping.add_coverage(&[chapter.number]);
             name_mapping.save()?;
-        }
 
-        // Mark chapter as covered
-        name_mapping.add_coverage(&[chapter.number]);
-        name_mapping.save()?;
+            clear_status_line();
+            console.success(&format!(
+                "Scouted chapter {}: found {} names",
+                chapter.number, chapter.total_names
+            ));
+        }
+    }
+
+    drop(progress_tx);
+    let _ = progress_display.await;
+
+    if let Some(error) = scout_error {
+        clear_status_line();
+        console.error(&error.to_string());
+        return Err(error);
     }
 
     console.success(&format!(
@@ -800,7 +848,146 @@ async fn run_name_scout(
 
 struct ScoutedChapter {
     number: u32,
+    total_names: usize,
     name_chunks: Vec<Vec<tsundoku::name_mapping::NameEntry>>,
+}
+
+async fn scout_chapter_job(
+    name_scout: &NameScout,
+    number: u32,
+    title: &str,
+    content: &str,
+    worker: usize,
+    progress_tx: mpsc::UnboundedSender<NameScoutEvent>,
+) -> Result<ScoutedChapter> {
+    let payload = build_chapter_payload(number, title, content);
+    let progress = ScoutProgressInfo {
+        chapter: number,
+        worker,
+        reporter: Some(progress_tx),
+    };
+    let name_chunks = name_scout
+        .collect_names_with_progress(&payload, Some(progress))
+        .await
+        .with_context(|| format!("Failed to scout names for chapter {}", number))?;
+
+    let total_names = name_chunks.iter().map(|c| c.len()).sum();
+
+    Ok(ScoutedChapter {
+        number,
+        total_names,
+        name_chunks,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ScoutWorkerStat {
+    chapter: u32,
+    chunk: u32,
+    total_chunks: u32,
+    elapsed_secs: f64,
+    status: NameScoutStatus,
+}
+
+async fn display_name_scout_stats(
+    mut progress_rx: mpsc::UnboundedReceiver<NameScoutEvent>,
+    workers: usize,
+) {
+    let console = Console::new();
+    let mut stats: HashMap<usize, ScoutWorkerStat> = HashMap::new();
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+
+    loop {
+        tokio::select! {
+            Some(event) = progress_rx.recv() => {
+                match event {
+                    NameScoutEvent::Progress(progress) => {
+                        stats.insert(progress.worker, ScoutWorkerStat {
+                            chapter: progress.chapter,
+                            chunk: progress.chunk,
+                            total_chunks: progress.total_chunks,
+                            elapsed_secs: progress.elapsed_secs,
+                            status: progress.status,
+                        });
+                    }
+                    NameScoutEvent::Notice(notice) => {
+                        clear_status_line();
+                        if notice.error {
+                            console.error(&notice.message);
+                        } else {
+                            console.warning(&notice.message);
+                        }
+                    }
+                }
+                render_name_scout_stats(&console, &stats, workers);
+            }
+            _ = ticker.tick() => {
+                render_name_scout_stats(&console, &stats, workers);
+            }
+            else => break,
+        }
+    }
+
+    clear_status_line();
+}
+
+fn render_name_scout_stats(
+    console: &Console,
+    stats: &HashMap<usize, ScoutWorkerStat>,
+    workers: usize,
+) {
+    let mut worker_parts = Vec::new();
+
+    for worker in 1..=workers {
+        let label = console.style(&format!("W{}", worker), &[Style::Cyan, Style::Bold]);
+
+        if let Some(stat) = stats.get(&worker) {
+            if stat.chapter == 0 {
+                worker_parts.push(format!("{}: {}", label, console.muted("idle")));
+            } else {
+                let status = match stat.status {
+                    NameScoutStatus::Scouting => String::new(),
+                    NameScoutStatus::Waiting => {
+                        format!(" {}", console.muted("waiting"))
+                    }
+                    NameScoutStatus::Retrying => {
+                        format!(" {}", console.style("retry", &[Style::Yellow, Style::Bold]))
+                    }
+                    NameScoutStatus::Parsing => {
+                        format!(
+                            " {}",
+                            console.style("parse", &[Style::Magenta, Style::Bold])
+                        )
+                    }
+                };
+                worker_parts.push(format!(
+                    "{}: c{} {}/{}{} {}",
+                    label,
+                    stat.chapter,
+                    stat.chunk,
+                    stat.total_chunks,
+                    status,
+                    console.muted(&format!("{:.0}s", stat.elapsed_secs))
+                ));
+            }
+        } else {
+            worker_parts.push(format!("{}: {}", label, console.muted("idle")));
+        }
+    }
+
+    let info = console.label("INFO", Style::Blue);
+
+    print!(
+        "\r\x1b[2K{} Name scouting: {}",
+        info,
+        worker_parts.join(", ")
+    );
+    let _ = io::stdout().flush();
+}
+
+fn clear_status_line() {
+    print!("\r\x1b[2K");
+    let _ = io::stdout().flush();
 }
 
 /// Prompts user to review and edit name mappings.
