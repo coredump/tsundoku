@@ -132,6 +132,9 @@ pub struct NameScoutConfig {
     /// Delay between requests in seconds.
     pub delay_between_requests_sec: f64,
 
+    /// Timeout for each API request in seconds.
+    pub request_timeout_sec: u64,
+
     /// Number of JSON parsing retry attempts.
     pub json_retries: u32,
 
@@ -145,6 +148,7 @@ impl Default for NameScoutConfig {
             chunk_size_chars: 2500,
             retries: 3,
             delay_between_requests_sec: 1.0,
+            request_timeout_sec: 300,
             json_retries: 3,
             workers: 1,
         }
@@ -371,6 +375,7 @@ mod tests {
         assert_eq!(config.translation.chunk_size_chars, 4000);
         assert_eq!(config.translation.workers, 1);
         assert_eq!(config.name_scout.workers, 1);
+        assert_eq!(config.name_scout.request_timeout_sec, 300);
         assert_eq!(config.scraping.delay_between_requests_sec, 1.0);
     }
 

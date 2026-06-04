@@ -650,7 +650,10 @@ async fn display_translation_stats(
 
     loop {
         tokio::select! {
-            Some(progress) = progress_rx.recv() => {
+            progress = progress_rx.recv() => {
+                let Some(progress) = progress else {
+                    break;
+                };
                 stats.insert(progress.worker, WorkerStat {
                     chapter: progress.chapter,
                     chunk: progress.chunk,
@@ -663,7 +666,6 @@ async fn display_translation_stats(
             _ = ticker.tick() => {
                 render_translation_stats(&console, &stats, workers);
             }
-            else => break,
         }
     }
 
@@ -899,7 +901,10 @@ async fn display_name_scout_stats(
 
     loop {
         tokio::select! {
-            Some(event) = progress_rx.recv() => {
+            event = progress_rx.recv() => {
+                let Some(event) = event else {
+                    break;
+                };
                 match event {
                     NameScoutEvent::Progress(progress) => {
                         stats.insert(progress.worker, ScoutWorkerStat {
@@ -924,7 +929,6 @@ async fn display_name_scout_stats(
             _ = ticker.tick() => {
                 render_name_scout_stats(&console, &stats, workers);
             }
-            else => break,
         }
     }
 

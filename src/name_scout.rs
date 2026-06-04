@@ -10,6 +10,7 @@ use crate::name_mapping::{NameEntry, NamePart};
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::error::Error;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
@@ -31,6 +32,70 @@ static REFUSAL_PHRASES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         "i do not have the ability",
     ]
 });
+
+fn format_translation_error(error: &TranslationError) -> String {
+    match error {
+        TranslationError::HttpError(error) => describe_request_error(error),
+        _ => error.to_string(),
+    }
+}
+
+fn describe_request_error(error: &reqwest::Error) -> String {
+    let mut details = Vec::new();
+
+    if error.is_timeout() {
+        details.push("timeout".to_string());
+    }
+    if error.is_connect() {
+        details.push("connect".to_string());
+    }
+    if error.is_request() {
+        details.push("request".to_string());
+    }
+    if error.is_body() {
+        details.push("body".to_string());
+    }
+    if let Some(status) = error.status() {
+        details.push(format!("status={}", status));
+    }
+
+    let mut message = if details.is_empty() {
+        error.to_string()
+    } else {
+        format!("{} [{}]", error, details.join(", "))
+    };
+
+    if let Some(url) = error.url() {
+        message.push_str(&format!("; url={}", url));
+    }
+
+    let mut sources = Vec::new();
+    let mut source = error.source();
+    while let Some(current) = source {
+        sources.push(current.to_string());
+        source = current.source();
+    }
+
+    if !sources.is_empty() {
+        message.push_str(&format!("; caused by: {}", sources.join(" -> ")));
+    }
+
+    message
+}
+
+fn preview_text(text: &str, max_chars: usize) -> String {
+    let mut preview = text
+        .chars()
+        .take(max_chars)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>();
+
+    if text.chars().count() > max_chars {
+        preview.push_str("...");
+    }
+
+    preview
+}
 
 /// Request body for the chat completions API.
 #[derive(Debug, Serialize)]
@@ -55,13 +120,15 @@ struct ChatResponse {
 /// A single choice in the response.
 #[derive(Debug, Deserialize)]
 struct Choice {
-    message: ResponseMessage,
+    message: Option<ResponseMessage>,
+    text: Option<String>,
+    finish_reason: Option<String>,
 }
 
 /// Message content in a response.
 #[derive(Debug, Deserialize)]
 struct ResponseMessage {
-    content: String,
+    content: Option<String>,
 }
 
 /// Parsed name entry from LLM response.
@@ -264,10 +331,10 @@ impl NameScout {
                                 chunk_num,
                                 false,
                                 format!(
-                                    "API error for chapter {}, chunk {}: {}, retrying in {:?} (attempt {}/{})",
+                                    "API error for chapter {}, chunk {}: {}; retrying in {:?} (attempt {}/{})",
                                     progress_info.as_ref().map_or(0, |info| info.chapter),
                                     chunk_num,
-                                    e,
+                                    format_translation_error(&e),
                                     delay,
                                     api_attempt + 1,
                                     self.scout_config.retries
@@ -366,10 +433,11 @@ impl NameScout {
                             chunk_num,
                             false,
                             format!(
-                                "Failed to parse JSON from chapter {}, chunk {}: {}; retrying",
+                                "Failed to parse JSON from chapter {}, chunk {}: {}; response preview: {}; retrying",
                                 progress_info.as_ref().map_or(0, |info| info.chapter),
                                 chunk_num,
-                                e
+                                e,
+                                preview_text(&raw_response, 1200)
                             ),
                             progress_info.as_ref(),
                         );
@@ -488,24 +556,53 @@ impl NameScout {
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_config.key))
             .header("Content-Type", "application/json")
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(self.scout_config.request_timeout_sec))
             .json(&request)
             .send()
             .await?;
 
         let response = crate::utils::check_response_status(response).await?;
+        let response_text = response.text().await.map_err(TranslationError::HttpError)?;
 
-        let response_body: ChatResponse = response.json().await.map_err(|e| {
-            TranslationError::ParseError(format!("Failed to parse API response: {}", e))
+        let response_body: ChatResponse = serde_json::from_str(&response_text).map_err(|e| {
+            TranslationError::ParseError(format!(
+                "Failed to parse API response JSON: {}; response preview: {}",
+                e,
+                preview_text(&response_text, 1200)
+            ))
         })?;
 
         if response_body.choices.is_empty() {
-            return Err(TranslationError::ParseError(
-                "No choices in API response".to_string(),
-            ));
+            return Err(TranslationError::ParseError(format!(
+                "No choices in API response; response preview: {}",
+                preview_text(&response_text, 1200)
+            )));
         }
 
-        Ok(response_body.choices[0].message.content.trim().to_string())
+        let choice = &response_body.choices[0];
+        let content = choice
+            .message
+            .as_ref()
+            .and_then(|message| message.content.as_deref())
+            .or(choice.text.as_deref())
+            .ok_or_else(|| {
+                TranslationError::ParseError(format!(
+                    "No message.content or text in first API choice; finish_reason={:?}; response preview: {}",
+                    choice.finish_reason,
+                    preview_text(&response_text, 1200)
+                ))
+            })?;
+
+        let content = content.trim();
+        if content.is_empty() {
+            return Err(TranslationError::ParseError(format!(
+                "API choice content was empty; finish_reason={:?}; response preview: {}",
+                choice.finish_reason,
+                preview_text(&response_text, 1200)
+            )));
+        }
+
+        Ok(content.to_string())
     }
 
     /// Parse the LLM response into name entries.
