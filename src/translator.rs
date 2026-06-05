@@ -42,6 +42,19 @@ pub struct ProgressInfo {
     pub reporter: Option<UnboundedSender<TranslationProgress>>,
 }
 
+/// Stage currently being reported for a translation worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranslationStage {
+    /// Worker is not currently processing a chapter.
+    Idle,
+    /// Worker is translating a chapter title.
+    Title,
+    /// Worker is between content chunks.
+    Preparing,
+    /// Worker is translating chapter content.
+    Content,
+}
+
 /// Progress event emitted while a translation stream is running.
 #[derive(Debug, Clone)]
 pub struct TranslationProgress {
@@ -57,8 +70,8 @@ pub struct TranslationProgress {
     pub chars: usize,
     /// Seconds elapsed since the current chunk started.
     pub elapsed_secs: f64,
-    /// True when the worker is between chunks.
-    pub preparing: bool,
+    /// Current translation stage.
+    pub stage: TranslationStage,
 }
 
 /// A message in the conversation history.
@@ -178,15 +191,23 @@ impl Translator {
             } else {
                 text.to_string()
             };
-            self.console
-                .info(&format!("Translating title 「{}」", snippet));
+            self.report_title_progress(progress_info.as_ref());
+            if progress_info
+                .as_ref()
+                .and_then(|info| info.reporter.as_ref())
+                .is_none()
+            {
+                self.console
+                    .info(&format!("Translating title 「{}」", snippet));
+            }
 
             let mut history = vec![Message {
                 role: "system".to_string(),
                 content: self.title_prompt.clone(),
             }];
 
-            self.translate_single_chunk(text, &mut history, None).await
+            self.translate_single_chunk(text, &mut history, progress_info)
+                .await
         } else {
             // Content translation: chunk and translate with history
             let chunks = self.split_text_into_chunks(text);
@@ -495,12 +516,32 @@ impl Translator {
                 total_chunks: info.total_chunks,
                 chars: response.chars().count(),
                 elapsed_secs: elapsed.as_secs_f64(),
-                preparing: false,
+                stage: if info.total_chunks == 0 {
+                    TranslationStage::Title
+                } else {
+                    TranslationStage::Content
+                },
             });
             return;
         }
 
         self.display_progress(response, elapsed, progress_info);
+    }
+
+    fn report_title_progress(&self, progress_info: Option<&ProgressInfo>) {
+        if let Some(info) = progress_info
+            && let (Some(worker), Some(reporter)) = (info.worker, info.reporter.as_ref())
+        {
+            let _ = reporter.send(TranslationProgress {
+                worker,
+                chapter: info.chapter,
+                chunk: 0,
+                total_chunks: 0,
+                chars: 0,
+                elapsed_secs: 0.0,
+                stage: TranslationStage::Title,
+            });
+        }
     }
 
     /// Display progress during streaming.
@@ -555,7 +596,7 @@ impl Translator {
                 total_chunks: info.total_chunks,
                 chars: 0,
                 elapsed_secs: 0.0,
-                preparing: true,
+                stage: TranslationStage::Preparing,
             });
             return;
         }

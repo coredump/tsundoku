@@ -18,7 +18,7 @@ use tsundoku::name_scout::{
     build_chapter_payload,
 };
 use tsundoku::scrapers::{ChapterInfo, ChapterList, ScraperRegistry};
-use tsundoku::translator::{ProgressInfo, TranslationProgress, Translator};
+use tsundoku::translator::{ProgressInfo, TranslationProgress, TranslationStage, Translator};
 
 const MAX_FILENAME_COMPONENT_BYTES: usize = 255;
 
@@ -565,7 +565,7 @@ async fn translate_chapters(
                         total_chunks: 0,
                         chars: 0,
                         elapsed_secs: 0.0,
-                        preparing: false,
+                        stage: TranslationStage::Idle,
                     });
 
                     worker_ids.lock().await.push(worker);
@@ -579,6 +579,7 @@ async fn translate_chapters(
             let chapter = result?;
             let translated_path = story_dir.join(&chapter.filename);
             std::fs::write(&translated_path, &chapter.content)?;
+            console.clear_line();
             console.success(&format!("Saved: {}", chapter.filename));
         }
     }
@@ -649,8 +650,16 @@ async fn translate_chapter_job(
         worker, job.number, job.title
     ));
 
+    let title_progress = ProgressInfo {
+        chapter: job.number,
+        chunk: 0,
+        total_chunks: 0,
+        worker: Some(worker),
+        reporter: Some(progress_tx.clone()),
+    };
+
     let translated_title = translator
-        .translate(&job.mapped_title, true, None)
+        .translate(&job.mapped_title, true, Some(title_progress))
         .await
         .with_context(|| format!("Failed to translate title for chapter {}", job.number))?;
 
@@ -693,7 +702,7 @@ struct WorkerStat {
     total_chunks: u32,
     chars: usize,
     elapsed_secs: f64,
-    preparing: bool,
+    stage: TranslationStage,
 }
 
 async fn display_translation_stats(
@@ -716,7 +725,7 @@ async fn display_translation_stats(
                     total_chunks: progress.total_chunks,
                     chars: progress.chars,
                     elapsed_secs: progress.elapsed_secs,
-                    preparing: progress.preparing,
+                    stage: progress.stage,
                 });
             }
             _ = ticker.tick() => {
@@ -738,32 +747,43 @@ fn render_translation_stats(console: &Console, stats: &HashMap<usize, WorkerStat
         let label = console.style(&format!("W{}", worker), &[Style::Cyan, Style::Bold]);
 
         if let Some(stat) = stats.get(&worker) {
-            if stat.chapter == 0 {
-                worker_parts.push(format!("{}: {}", label, console.muted("idle")));
-            } else if stat.preparing {
-                worker_parts.push(format!(
-                    "{}: {}",
-                    label,
-                    console.muted(&format!(
-                        "ch{} preparing {}/{}",
-                        stat.chapter, stat.chunk, stat.total_chunks
-                    ))
-                ));
-            } else {
-                let speed = if stat.elapsed_secs > 0.0 {
-                    stat.chars as f64 / stat.elapsed_secs
-                } else {
-                    0.0
-                };
-                aggregate += speed;
-                worker_parts.push(format!(
-                    "{}: ch{} {}/{} {}",
-                    label,
-                    stat.chapter,
-                    stat.chunk,
-                    stat.total_chunks,
-                    console.style(&format!("{:.0} ch/s", speed), &[Style::Green, Style::Bold])
-                ));
+            match stat.stage {
+                TranslationStage::Idle => {
+                    worker_parts.push(format!("{}: {}", label, console.muted("idle")));
+                }
+                TranslationStage::Title => {
+                    worker_parts.push(format!(
+                        "{}: {}",
+                        label,
+                        console.muted(&format!("ch{} title", stat.chapter))
+                    ));
+                }
+                TranslationStage::Preparing => {
+                    worker_parts.push(format!(
+                        "{}: {}",
+                        label,
+                        console.muted(&format!(
+                            "ch{} preparing {}/{}",
+                            stat.chapter, stat.chunk, stat.total_chunks
+                        ))
+                    ));
+                }
+                TranslationStage::Content => {
+                    let speed = if stat.elapsed_secs > 0.0 {
+                        stat.chars as f64 / stat.elapsed_secs
+                    } else {
+                        0.0
+                    };
+                    aggregate += speed;
+                    worker_parts.push(format!(
+                        "{}: ch{} {}/{} {}",
+                        label,
+                        stat.chapter,
+                        stat.chunk,
+                        stat.total_chunks,
+                        console.style(&format!("{:.0} ch/s", speed), &[Style::Green, Style::Bold])
+                    ));
+                }
             }
         } else {
             worker_parts.push(format!("{}: {}", label, console.muted("idle")));
