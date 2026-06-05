@@ -20,6 +20,8 @@ use tsundoku::name_scout::{
 use tsundoku::scrapers::{ChapterInfo, ChapterList, ScraperRegistry};
 use tsundoku::translator::{ProgressInfo, TranslationProgress, Translator};
 
+const MAX_FILENAME_COMPONENT_BYTES: usize = 255;
+
 /// Japanese web novel downloader and translator.
 #[derive(Parser, Debug)]
 #[command(name = "tsundoku")]
@@ -385,11 +387,7 @@ async fn process_chapters(
         }
 
         let chapter_num_str = format!("{:0width$}", chapter.number, width = padding);
-        let filename = format!(
-            "{} - {}.txt",
-            chapter_num_str,
-            sanitize_filename(&chapter.title)
-        );
+        let filename = chapter_filename(&chapter_num_str, &chapter.title);
         let original_path = original_dir.join(&filename);
 
         let content = if original_path.exists() {
@@ -608,11 +606,7 @@ async fn translate_chapter_job(
         .with_context(|| format!("Failed to translate chapter {}", job.number))?;
 
     Ok(TranslatedChapter {
-        filename: format!(
-            "{} - {}.txt",
-            job.chapter_num_str,
-            sanitize_filename(&translated_title)
-        ),
+        filename: chapter_filename(&job.chapter_num_str, &translated_title),
         content: translated_content,
     })
 }
@@ -1112,8 +1106,12 @@ async fn find_or_create_folder(
         .await
         .context("Failed to translate title for folder name")?;
 
-    let safe_title = sanitize_filename(&translated_title);
-    let folder_name = format!("[{}: {}] {}", module_name, novel_id, safe_title);
+    let folder_prefix = format!("[{}: {}] ", module_name, novel_id);
+    let safe_title = sanitize_filename_with_max_bytes(
+        &translated_title,
+        MAX_FILENAME_COMPONENT_BYTES.saturating_sub(folder_prefix.len()),
+    );
+    let folder_name = format!("{}{}", folder_prefix, safe_title);
 
     console.success(&format!("Creating folder: {}", folder_name));
 
@@ -1165,6 +1163,17 @@ fn validate_chapter_range(
     Ok((start_chapter, end_chapter))
 }
 
+fn chapter_filename(chapter_num_str: &str, title: &str) -> String {
+    let prefix = format!("{} - ", chapter_num_str);
+    let extension = ".txt";
+    let max_title_bytes = MAX_FILENAME_COMPONENT_BYTES
+        .saturating_sub(prefix.len())
+        .saturating_sub(extension.len());
+    let safe_title = sanitize_filename_with_max_bytes(title, max_title_bytes);
+
+    format!("{}{}{}", prefix, safe_title, extension)
+}
+
 /// Sanitizes a string for use as a filename.
 fn sanitize_filename(name: &str) -> String {
     // Replace invalid characters with underscore
@@ -1180,6 +1189,26 @@ fn sanitize_filename(name: &str) -> String {
     sanitized.trim_end_matches(['.', ' ']).to_string()
 }
 
+fn sanitize_filename_with_max_bytes(name: &str, max_bytes: usize) -> String {
+    truncate_to_byte_boundary(&sanitize_filename(name), max_bytes)
+}
+
+fn truncate_to_byte_boundary(name: &str, max_bytes: usize) -> String {
+    if name.len() <= max_bytes {
+        return name.to_string();
+    }
+
+    let mut truncated = String::new();
+    for ch in name.chars() {
+        if truncated.len() + ch.len_utf8() > max_bytes {
+            break;
+        }
+        truncated.push(ch);
+    }
+
+    truncated.trim_end_matches(['.', ' ']).to_string()
+}
+
 /// Expands ~ in paths to the home directory.
 fn expand_path(path: &Path) -> PathBuf {
     let path_str = path.to_string_lossy();
@@ -1189,4 +1218,30 @@ fn expand_path(path: &Path) -> PathBuf {
         return home.join(stripped);
     }
     path.to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chapter_filename_respects_component_byte_limit() {
+        let title = "第".repeat(200);
+
+        let filename = chapter_filename("001", &title);
+
+        assert!(filename.len() <= MAX_FILENAME_COMPONENT_BYTES);
+        assert!(filename.ends_with(".txt"));
+        assert!(filename.is_char_boundary(filename.len() - ".txt".len()));
+    }
+
+    #[test]
+    fn filename_truncation_keeps_utf8_boundary_without_hash() {
+        let title = "あいうえお";
+
+        let filename = sanitize_filename_with_max_bytes(title, 7);
+
+        assert_eq!(filename, "あい");
+        assert!(filename.is_char_boundary(filename.len()));
+    }
 }
