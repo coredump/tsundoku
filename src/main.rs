@@ -380,6 +380,7 @@ async fn process_chapters(
     params.console.section("Download Phase");
 
     let mut downloaded_chapters: Vec<ChapterData> = Vec::new();
+    let mut already_downloaded = Vec::new();
 
     for chapter in chapters.iter() {
         if chapter.number < start_chapter || chapter.number > end_chapter {
@@ -391,11 +392,14 @@ async fn process_chapters(
         let original_path = original_dir.join(&filename);
 
         let content = if original_path.exists() {
-            params
-                .console
-                .info(&format!("Chapter {} already downloaded", chapter.number));
+            already_downloaded.push(chapter.number);
             std::fs::read_to_string(&original_path)?
         } else {
+            report_chapter_ranges(
+                params.console,
+                &mut already_downloaded,
+                "already downloaded",
+            );
             params.console.step(&format!(
                 "Downloading chapter {}: {}",
                 chapter.number, chapter.title
@@ -421,6 +425,12 @@ async fn process_chapters(
             filename,
         });
     }
+
+    report_chapter_ranges(
+        params.console,
+        &mut already_downloaded,
+        "already downloaded",
+    );
 
     if downloaded_chapters.is_empty() {
         params.console.warning("No chapters downloaded");
@@ -486,6 +496,7 @@ async fn translate_chapters(
     ));
 
     let mut jobs = Vec::new();
+    let mut already_translated = Vec::new();
 
     for chapter_data in downloaded_chapters {
         // Check if translation already exists
@@ -498,10 +509,7 @@ async fn translate_chapters(
             .any(|e| e.file_name().to_string_lossy().starts_with(&pattern));
 
         if translation_exists {
-            console.info(&format!(
-                "Chapter {} already translated, skipping",
-                chapter_data.number
-            ));
+            already_translated.push(chapter_data.number);
             continue;
         }
 
@@ -513,6 +521,12 @@ async fn translate_chapters(
             mapped_content: name_mapping.apply_to_text(&chapter_data.content),
         });
     }
+
+    report_chapter_ranges(
+        console,
+        &mut already_translated,
+        "already translated, skipping",
+    );
 
     if jobs.is_empty() {
         return Ok(());
@@ -573,6 +587,54 @@ async fn translate_chapters(
     let _ = progress_display.await;
 
     Ok(())
+}
+
+fn report_chapter_ranges(console: &Console, chapters: &mut Vec<u32>, suffix: &str) {
+    if chapters.is_empty() {
+        return;
+    }
+
+    console.info(&format!(
+        "Chapters {} {}",
+        format_chapter_ranges(chapters),
+        suffix
+    ));
+    chapters.clear();
+}
+
+fn format_chapter_ranges(chapters: &[u32]) -> String {
+    let mut chapters = chapters.to_vec();
+    chapters.sort_unstable();
+    chapters.dedup();
+
+    let mut ranges = Vec::new();
+    let mut iter = chapters.into_iter();
+
+    let Some(mut start) = iter.next() else {
+        return String::new();
+    };
+    let mut end = start;
+
+    for chapter in iter {
+        if chapter == end + 1 {
+            end = chapter;
+        } else {
+            ranges.push(format_chapter_range(start, end));
+            start = chapter;
+            end = chapter;
+        }
+    }
+
+    ranges.push(format_chapter_range(start, end));
+    ranges.join(", ")
+}
+
+fn format_chapter_range(start: u32, end: u32) -> String {
+    if start == end {
+        start.to_string()
+    } else {
+        format!("{start}-{end}")
+    }
 }
 
 async fn translate_chapter_job(
@@ -1243,5 +1305,15 @@ mod tests {
 
         assert_eq!(filename, "あい");
         assert!(filename.is_char_boundary(filename.len()));
+    }
+
+    #[test]
+    fn chapter_ranges_group_contiguous_numbers() {
+        assert_eq!(format_chapter_ranges(&[1, 2, 3, 4]), "1-4");
+    }
+
+    #[test]
+    fn chapter_ranges_preserve_gaps() {
+        assert_eq!(format_chapter_ranges(&[1, 2, 4, 6, 7, 8]), "1-2, 4, 6-8");
     }
 }
