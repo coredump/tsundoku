@@ -13,6 +13,7 @@ A Japanese web novel downloader and translator supporting Syosetu, Kakuyomu, and
 - Persistent name mapping with vote-based consensus
 - Incremental progress saving and resume capability
 - Streaming translation with real-time progress display
+- `tsundoku-epub`: builds EPUB volumes from the translated chapters
 
 ## Installation
 
@@ -180,15 +181,50 @@ One-shot stories:
 └── oneshot.txt
 ```
 
-## Name Mapping System
+## Building EPUBs
 
-Tsundoku automatically extracts character names and builds a persistent mapping database. The system uses a voting mechanism to determine the best English rendering of each Japanese name, with mappings stored in:
+`tsundoku-epub` turns a novel folder's translated chapters into EPUB 3 books, 100 chapters per volume by default:
+
+```bash
+tsundoku-epub "[syosetu: n1234ab] Novel Title"
+```
+
+Volumes are written to `<novel folder>/EPUB/` as `Novel Title - Vol. 01 (0001-0100).epub`, `Vol. 02 (0101-0200)`, and so on. Volume ranges follow chapter numbers, so rerunning after more chapters are translated rebuilds the same files with the new chapters added. Chapters missing from the middle of a volume are reported as warnings; chapters after the last translated one are not.
+
+Each non-empty line becomes a paragraph, consecutive lines starting with `- ` or a single `・` become a list, and lines made only of break glyphs (`◆　◆　◆`, `* * *`, `---`) become scene breaks. Authors also mark scene changes with three or more blank lines, which models collapse; `tsundoku` therefore replaces each such gap with a `* * *` line before translating, so the break survives into the book. Dialogue made of punctuation, such as `「……」`, stays as text. Straight quotes and apostrophes are converted to curly ones (`"It's"` → `“It’s”`) and every three periods to an ellipsis (`...` → `…`), so every book uses one style even when the model mixed both. Japanese punctuation the model left in is converted too: `「」`/`『』` to curly quotes, `・・・` to `…`, a single `・` to a space between names or `·` elsewhere, `――` and `--` to `—`, and full-width `！？～` and digits to ASCII. The `.txt` files are left untouched. Each book has a title page, a table of contents (EPUB 3 nav plus NCX for older readers), and series metadata that Calibre and KOReader use to order volumes.
+
+`tsundoku` keeps a `book.json` in the novel folder with the book title, original title, source URL, and each translated chapter's exact title and original title. `tsundoku-epub` uses it for headings (file names lose characters such as `?`) and for the EPUB's title, author, and source. `author` is never filled automatically; set it by hand (or later in Calibre). Edits to `title` and `author` are preserved; chapters translated before `book.json` existed fall back to their file names.
+
+```json
+{
+  "title": "Novel Title",
+  "original_title": "原題",
+  "author": null,
+  "source_url": "https://ncode.syosetu.com/n1234ab/",
+  "chapters": {
+    "12": { "title": "Chapter 12: Peaceful? Days...", "original_title": "第十二話　平穏な？日々" }
+  }
+}
+```
+
+Options:
+
+- `--chapters-per-volume N`: chapters per EPUB (default 100)
+- `--title TEXT`: book title (defaults to `title` in `book.json`, then the folder name without its `[site: id]` prefix)
+- `--author TEXT`: author name for the metadata (defaults to `author` in `book.json`)
+- `-o, --output DIR`: output folder (default `<novel folder>/EPUB`)
+
+## Name and Terminology Mapping
+
+Tsundoku automatically extracts character names and story-specific terminology into a persistent mapping database. Scout votes choose canonical English renderings unless a manual override is present. Before each chapter is translated, matching canonical glossary terms are included in every translation request, keeping recurring items, skills, ranks, organizations, and fictional concepts consistent across the novel.
+
+Mappings are stored in:
 
 - Linux: `~/.local/share/Tsundoku/names/`
 - macOS: `~/Library/Application Support/Tsundoku/names/`
 - Windows: `%APPDATA%\Tsundoku\names\`
 
-You can manually edit the JSON files to correct name mappings. The format is:
+The default mapping file format is:
 
 ```json
 {
@@ -199,13 +235,37 @@ You can manually edit the JSON files to correct name mappings. The format is:
         "Taro": 5,
         "Tarou": 2
       },
-      "english": "Taro",
-      "count": 5
+      "override": "Tarou",
+      "english": "Tarou",
+      "count": 2
     }
   },
-  "coverage": [1, 2, 3]
+  "terms": {
+    "魔石": {
+      "votes": {
+        "Magic Stone": 3,
+        "Mana Stone": 1
+      },
+      "english": "Magic Stone",
+      "count": 3
+    }
+  },
+  "coverage": [1, 2, 3],
+  "term_coverage": [1, 2, 3]
 }
 ```
+
+`override` is optional for both names and terms and wins over all vote totals. It may name a valid rendering absent from `votes`; in that case the recalculated `count` is omitted. `english` and `count` are recalculated fields, not manual controls. Delete `override` or set it to `null` to resume vote-based selection. Scouting continues to tally every valid vote while an override is active, so removing it immediately uses all accumulated votes.
+
+Terms are automatically collected by the scout and vote-consolidated across chapters. Only canonical terms present in the chapter being translated, after name substitution, are added to its translation prompt; overridden terms come first, then the most-voted. By default, at most 100 terms are included; set `translation.glossary_max_entries` to `0` to disable glossary injection. Existing mapping files without `terms` or `term_coverage` remain valid; Tsundoku scouts terminology for their covered chapters without recording duplicate name votes.
+
+Names take precedence over terms. Any term whose Japanese contains a mapped name (for example `ジュカ` or `ジュカ王国` when `ジュカ` is a name) is dropped from the mapping, because name substitution already rewrites it before translation. Single-character terms (`市` would match inside `都市`), terms rendered as themselves (`HP → HP`), and renderings that still contain Japanese or Chinese script are rejected. Orthographic variants of a name keep separate entries but share one rendering, chosen from their pooled votes: small vs. full-size vowels (`ヴィヴァル`/`ヴィヴアル`), hiragana written for katakana (`ぺーリス`/`ペーリス`), and dashes used as long-vowel marks (`ヒ―データ`/`ヒーデータ`). An override on any variant applies to all of them. Long-vowel differences are not merged, since `ヒーラ` and `ヒーラー` ("healer") are different words.
+
+All-katakana names are substituted only as whole katakana words, so a name `ロー` does not rewrite `スローダ`; `・` counts as a separator. Single-character names (`女` would rewrite every `彼女`), titles, ranks, kinship words, archaic pronouns, and interjections (`宰相`, `将軍`, `父上`, `そこもと`, `ひー`, …) are never kept as names, nor are suffixed forms such as `バーサーム家`, `田中一家`, `メインティア王`, `ミーク姫`, or any name ending in a royal title (`…王`, `…王子`, `…殿下`): the bare name inside them is substituted on its own, so the suffix's meaning reaches the translator. All of this cleanup runs whenever a mapping file is loaded, so existing files are fixed in place on the next run.
+
+The scout also sees the renderings already chosen for any names and terms that appear in the chunk it is reading, and is told to reuse them. That keeps it from romanizing the same name differently in every chapter. Changing an `override` therefore also steers later scouting toward that rendering.
+
+To apply changed mappings to an already translated chapter, delete that chapter's translated output file before rerunning Tsundoku.
 
 ## Development
 
@@ -226,6 +286,16 @@ cargo test
 ```bash
 cargo run -- https://ncode.syosetu.com/n1234ab/
 ```
+
+### Scouting Without Translation
+
+To download or reuse original chapters, build the name and terminology mapping, review it, and exit before any translation request:
+
+```bash
+cargo run -- --scout-only https://ncode.syosetu.com/n1234ab/
+```
+
+This mode reuses existing originals from the story folder and downloads only missing chapters, including when a novel’s chapter count changes its filename padding. If no story folder exists, it creates one using the original title without calling the translation API. Use `--no-name-pause` only for unattended scouting; otherwise Tsundoku pauses after scouting so you can correct the mapping before a later translation run. `--scout-only` cannot be combined with `--no-name-scout`.
 
 ### Creating a Release
 

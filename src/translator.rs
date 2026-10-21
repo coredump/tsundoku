@@ -6,6 +6,7 @@
 use crate::config::{ApiConfig, TranslationConfig};
 use crate::console::Console;
 use crate::error::TranslationError;
+use crate::name_mapping::TermEntry;
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,9 @@ use std::io::{self, Write};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
+
+/// Rule appended to every content translation prompt.
+const ENGLISH_ONLY_RULE: &str = "Write the translation entirely in English. Never output Chinese or Japanese characters; translate every word, including terms you would otherwise gloss in parentheses.";
 
 /// Refusal phrases that indicate the model declined to translate.
 static REFUSAL_PHRASES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
@@ -168,6 +172,7 @@ impl Translator {
     /// # Arguments
     /// * `text` - The Japanese text to translate.
     /// * `is_title` - Whether this is a title (uses different prompt, no chunking).
+    /// * `glossary` - Canonical terminology entries to include for content translation.
     /// * `progress_info` - Optional progress information for display.
     ///
     /// # Returns
@@ -176,6 +181,7 @@ impl Translator {
         &self,
         text: &str,
         is_title: bool,
+        glossary: &[TermEntry],
         progress_info: Option<ProgressInfo>,
     ) -> Result<String, TranslationError> {
         // Handle empty text
@@ -206,7 +212,11 @@ impl Translator {
                 content: self.title_prompt.clone(),
             }];
 
-            self.translate_single_chunk(text, &mut history, progress_info)
+            let label = format!(
+                "Chapter {} title",
+                progress_info.as_ref().map_or(0, |p| p.chapter)
+            );
+            self.translate_with_retries(text, &mut history, progress_info, &label)
                 .await
         } else {
             // Content translation: chunk and translate with history
@@ -215,7 +225,7 @@ impl Translator {
             let mut results = Vec::new();
             let mut history = vec![Message {
                 role: "system".to_string(),
-                content: self.content_prompt.clone(),
+                content: self.content_prompt_with_glossary(glossary),
             }];
 
             for (i, chunk) in chunks.iter().enumerate() {
@@ -233,57 +243,21 @@ impl Translator {
                     self.display_preparing(progress.as_ref());
                 }
 
-                // Retry loop for this chunk
-                let mut attempt = 0;
-                let mut last_error: Option<TranslationError> = None;
-
-                while attempt < self.translation_config.retries {
-                    let translation_result = self
-                        .translate_single_chunk(chunk, &mut history, progress.clone())
-                        .await;
-
-                    match translation_result {
-                        Ok(translated) => {
-                            results.push(translated);
-                            last_error = None;
-                            break;
-                        }
-                        Err(e) => {
-                            if matches!(e, TranslationError::Refused(_)) {
-                                history.truncate(1);
-                                self.console.warning(
-                                    "Model refused translation; cleared conversation history before retry.",
-                                );
-                            }
-                            last_error = Some(e);
-                            attempt += 1;
-                            if attempt < self.translation_config.retries {
-                                // Exponential backoff
-                                let delay = Duration::from_secs(2u64.pow(attempt));
-                                self.console.warning(&format!(
-                                    "Translation failed, retrying in {:?} (attempt {}/{})",
-                                    delay,
-                                    attempt + 1,
-                                    self.translation_config.retries
-                                ));
-                                tokio::time::sleep(delay).await;
-                            }
-                        }
-                    }
-                }
-
-                if let Some(e) = last_error {
-                    self.console
-                        .error(&format!("Translation failed after all retries: {}", e));
-
-                    if matches!(e, TranslationError::Refused(_)) {
+                let label = format!(
+                    "Chapter {}, chunk {}",
+                    progress.as_ref().map_or(0, |p| p.chapter),
+                    chunk_num
+                );
+                match self
+                    .translate_with_retries(chunk, &mut history, progress, &label)
+                    .await
+                {
+                    Ok(translated) => results.push(translated),
+                    // Keep the source of a refused chunk so the rest of the chapter survives.
+                    Err(TranslationError::Refused(_)) => {
                         results.push(format!("[TRANSLATION FAILED]\n{}", chunk));
-                        continue;
                     }
-
-                    return Err(TranslationError::RetriesExhausted {
-                        attempts: self.translation_config.retries,
-                    });
+                    Err(e) => return Err(e),
                 }
             }
 
@@ -298,6 +272,36 @@ impl Translator {
 
             Ok(results.join("\n\n"))
         }
+    }
+
+    /// Build the content translation system prompt: the configured prompt, an
+    /// English-only rule, and canonical glossary entries.
+    fn content_prompt_with_glossary(&self, glossary: &[TermEntry]) -> String {
+        let glossary_size: usize = glossary
+            .iter()
+            .map(|entry| entry.original.len() + entry.english.len() + 5)
+            .sum();
+        let mut prompt = String::with_capacity(
+            self.content_prompt.len() + ENGLISH_ONLY_RULE.len() + glossary_size + 134,
+        );
+        prompt.push_str(&self.content_prompt);
+        prompt.push_str("\n\n");
+        prompt.push_str(ENGLISH_ONLY_RULE);
+        if glossary.is_empty() {
+            return prompt;
+        }
+
+        prompt.push_str(
+            "\n\nUse these canonical terminology renderings exactly when the Japanese term appears:\n",
+        );
+        for entry in glossary {
+            prompt.push_str("- ");
+            prompt.push_str(&entry.original);
+            prompt.push_str(" → ");
+            prompt.push_str(&entry.english);
+            prompt.push('\n');
+        }
+        prompt
     }
 
     /// Split text into chunks that fit within the configured size limit.
@@ -339,6 +343,85 @@ impl Translator {
         }
 
         final_chunks
+    }
+
+    /// Translate one request, retrying up to the configured number of attempts.
+    ///
+    /// A reply that still contains Chinese/Japanese characters on the last attempt is
+    /// kept with a warning. A refusal (including an empty reply) clears the conversation
+    /// history before the next attempt and is returned as-is once attempts run out; any
+    /// other failure becomes [`TranslationError::RetriesExhausted`].
+    async fn translate_with_retries(
+        &self,
+        text: &str,
+        history: &mut Vec<Message>,
+        progress: Option<ProgressInfo>,
+        label: &str,
+    ) -> Result<String, TranslationError> {
+        let attempts = self.translation_config.retries.max(1);
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let error = match self
+                .translate_single_chunk(text, history, progress.clone())
+                .await
+            {
+                Ok(translated) => return Ok(translated),
+                Err(TranslationError::ForeignScript {
+                    text: translated,
+                    count,
+                }) => {
+                    if attempt < attempts {
+                        self.console.warning(&format!(
+                            "{}: translation contains {} Chinese/Japanese characters; retrying (attempt {}/{})",
+                            label,
+                            count,
+                            attempt + 1,
+                            attempts
+                        ));
+                        continue;
+                    }
+                    // Keep the last attempt rather than abort the chapter over a
+                    // stray word; the warning lets the reader find it.
+                    self.console.warning(&format!(
+                        "{}: kept translation with {} Chinese/Japanese characters after {} attempts",
+                        label, count, attempt
+                    ));
+                    self.record_exchange(history, text, &translated);
+                    return Ok(translated);
+                }
+                Err(e) => e,
+            };
+
+            let refused = matches!(error, TranslationError::Refused(_));
+            if refused {
+                history.truncate(1);
+            }
+
+            if attempt >= attempts {
+                self.console.error(&format!(
+                    "{}: translation failed after all retries: {}",
+                    label, error
+                ));
+                return Err(if refused {
+                    error
+                } else {
+                    TranslationError::RetriesExhausted { attempts }
+                });
+            }
+
+            // Exponential backoff
+            let delay = Duration::from_secs(2u64.pow(attempt));
+            self.console.warning(&format!(
+                "{}: {}; retrying in {:?} (attempt {}/{})",
+                label,
+                error,
+                delay,
+                attempt + 1,
+                attempts
+            ));
+            tokio::time::sleep(delay).await;
+        }
     }
 
     /// Translate a single chunk of text.
@@ -471,23 +554,15 @@ impl Translator {
             }
         }
 
-        // Update history
-        history.push(Message {
-            role: "user".to_string(),
-            content: chunk.to_string(),
-        });
-        history.push(Message {
-            role: "assistant".to_string(),
-            content: trimmed.clone(),
-        });
-
-        // Trim history to configured length (keep system message + last N pairs)
-        let max_messages = 1 + (self.translation_config.history_length * 2);
-        if history.len() > max_messages {
-            // Keep system message (index 0) and last N pairs
-            let remove_count = history.len() - max_messages;
-            history.drain(1..1 + remove_count);
+        let count = crate::utils::count_cjk_chars(&trimmed);
+        if count > 0 {
+            return Err(TranslationError::ForeignScript {
+                text: trimmed,
+                count,
+            });
         }
+
+        self.record_exchange(history, chunk, &trimmed);
 
         // Delay before next request
         if self.translation_config.delay_between_requests_sec > 0.0 {
@@ -498,6 +573,25 @@ impl Translator {
         }
 
         Ok(trimmed)
+    }
+
+    /// Append a translated chunk to the history, keeping the system message and
+    /// the last `history_length` exchanges.
+    fn record_exchange(&self, history: &mut Vec<Message>, chunk: &str, translated: &str) {
+        history.push(Message {
+            role: "user".to_string(),
+            content: chunk.to_string(),
+        });
+        history.push(Message {
+            role: "assistant".to_string(),
+            content: translated.to_string(),
+        });
+
+        let max_messages = 1 + (self.translation_config.history_length * 2);
+        if history.len() > max_messages {
+            let remove_count = history.len() - max_messages;
+            history.drain(1..1 + remove_count);
+        }
     }
 
     fn report_progress(
@@ -624,6 +718,7 @@ impl Translator {
 pub async fn translate_text(
     text: &str,
     is_title: bool,
+    glossary: &[TermEntry],
     api_config: &ApiConfig,
     translation_config: &TranslationConfig,
     title_prompt: &str,
@@ -636,7 +731,9 @@ pub async fn translate_text(
         title_prompt.to_string(),
         content_prompt.to_string(),
     );
-    translator.translate(text, is_title, progress_info).await
+    translator
+        .translate(text, is_title, glossary, progress_info)
+        .await
 }
 
 #[cfg(test)]
@@ -659,6 +756,20 @@ mod tests {
         let chunks = translator.split_text_into_chunks(text);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0], text);
+    }
+
+    #[test]
+    fn test_content_prompt_includes_canonical_glossary() {
+        let translator = make_translator();
+        let glossary = [TermEntry {
+            original: "魔石".to_string(),
+            english: "Magic Stone".to_string(),
+        }];
+
+        let prompt = translator.content_prompt_with_glossary(&glossary);
+
+        assert!(prompt.contains("Use these canonical terminology renderings exactly"));
+        assert!(prompt.contains("- 魔石 → Magic Stone"));
     }
 
     #[test]
@@ -787,5 +898,104 @@ mod tests {
 
         assert!(snippet_long.ends_with("..."));
         assert_eq!(snippet_long.chars().count(), 33); // 30 chars + "..."
+    }
+
+    /// Serve one streamed completion per connection, returning the request bodies.
+    fn serve_streamed_replies(
+        replies: &'static [&'static str],
+    ) -> (String, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for reply in replies {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut content_length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).unwrap();
+                bodies.push(serde_json::from_slice(&body).unwrap());
+
+                let event = serde_json::json!({ "choices": [{ "index": 0, "delta": { "content": reply } }] });
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {event}\n\ndata: [DONE]\n\n"
+                )
+                .unwrap();
+            }
+            bodies
+        });
+        (base_url, server)
+    }
+
+    fn translator_for(base_url: String, retries: u32) -> Translator {
+        Translator::new(
+            ApiConfig {
+                base_url,
+                ..ApiConfig::default()
+            },
+            TranslationConfig {
+                retries,
+                delay_between_requests_sec: 0.0,
+                ..TranslationConfig::default()
+            },
+            "Translate this title".to_string(),
+            "Translate this content".to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_chinese_leak_is_retried_without_polluting_history() {
+        let (base_url, server) =
+            serve_streamed_replies(&["He was a 杀人狂 (murderer).", "He was a murderer."]);
+        let translator = translator_for(base_url, 3);
+
+        let translated = translator.translate("彼は殺人鬼だった。", false, &[], None).await.unwrap();
+        let bodies = server.join().unwrap();
+
+        assert_eq!(translated, "He was a murderer.");
+        assert_eq!(bodies.len(), 2);
+        let retry_roles: Vec<_> = bodies[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(retry_roles, ["system", "user"]);
+    }
+
+    #[tokio::test]
+    async fn test_persistent_chinese_leak_keeps_last_attempt() {
+        let (base_url, server) = serve_streamed_replies(&["A 杀人狂.", "Another 杀人狂."]);
+        let translator = translator_for(base_url, 2);
+
+        let translated = translator.translate("殺人鬼。", false, &[], None).await.unwrap();
+        server.join().unwrap();
+
+        assert_eq!(translated, "Another 杀人狂.");
+    }
+
+    #[tokio::test]
+    async fn test_empty_title_reply_is_retried() {
+        let (base_url, server) = serve_streamed_replies(&["", "Starting to Move"]);
+        let translator = translator_for(base_url, 3);
+
+        let translated = translator.translate("動き出す", true, &[], None).await.unwrap();
+        let bodies = server.join().unwrap();
+
+        assert_eq!(translated, "Starting to Move");
+        assert_eq!(bodies.len(), 2);
     }
 }

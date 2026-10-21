@@ -103,6 +103,11 @@ pub struct TranslationConfig {
     /// Number of message pairs to retain in conversation history.
     pub history_length: usize,
 
+    /// Maximum number of glossary entries included in one chapter translation prompt.
+    ///
+    /// Set to zero to disable glossary injection.
+    pub glossary_max_entries: usize,
+
     /// Number of chapters to translate concurrently.
     pub workers: usize,
 }
@@ -114,6 +119,7 @@ impl Default for TranslationConfig {
             retries: 3,
             delay_between_requests_sec: 1.0,
             history_length: 5,
+            glossary_max_entries: 100,
             workers: 1,
         }
     }
@@ -184,7 +190,7 @@ pub struct PromptsConfig {
     /// Prompt for content translation.
     pub content_translation: String,
 
-    /// Prompt for name extraction.
+    /// Prompt for name and terminology extraction.
     pub name_scout: String,
 }
 
@@ -193,10 +199,10 @@ impl Default for PromptsConfig {
         Self {
             title_translation: "You are a Japanese to English translator. Translate the following Japanese novel title to English. Provide only the translated title, nothing else.".to_string(),
             content_translation: "You are a Japanese to English translator specializing in web novels. Translate the following Japanese text to natural English, preserving the author's style and tone. Character names have already been converted to English - do not change them.".to_string(),
-            name_scout: r#"You read Japanese fiction text and extract character name parts.
+            name_scout: r#"You read Japanese fiction text and extract character name parts and recurring story-specific terminology.
 Return ONLY JSON with this shape:
-{"names":[{"original":"<exact name characters>","part":"family|given|unknown","english":"<best English rendering>"}]}
-Treat given and family names separately. Use romaji or common English equivalents. No explanations."#.to_string(),
+{"names":[{"original":"<exact name characters>","part":"family|given|unknown","english":"<best English rendering>"}],"terms":[{"original":"<exact Japanese term>","english":"<canonical English rendering>"}]}
+Treat given and family names separately and report bare names without suffixes such as 家, 王, or 国. Names are personal names only; never list titles, ranks, kinship terms, or common nouns (such as 父, 帝, 将軍, 公爵) as names. For terms, include distinctive items, skills, magic systems, ranks, organizations, places, and fictional concepts; exclude person names, ordinary vocabulary, and prose. Preserve each original exactly and use concise canonical English renderings. No explanations."#.to_string(),
         }
     }
 }
@@ -286,12 +292,21 @@ impl Config {
 
     /// Validates the configuration.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.validate_with_options(true)
+        self.validate_for_workflow(true, true)
     }
 
     /// Validates the configuration with optional name scout requirements.
     pub fn validate_with_options(&self, require_scout_api: bool) -> Result<(), ConfigError> {
-        if !self.api.is_configured() {
+        self.validate_for_workflow(true, require_scout_api)
+    }
+
+    /// Validates the configuration for a workflow's required APIs.
+    pub fn validate_for_workflow(
+        &self,
+        require_translation_api: bool,
+        require_scout_api: bool,
+    ) -> Result<(), ConfigError> {
+        if require_translation_api && !self.api.is_configured() {
             return Err(ConfigError::MissingValue(
                 "api.key (set your API key in config file)".to_string(),
             ));
@@ -419,6 +434,14 @@ mod tests {
         let mut config = Config::default();
         config.api.key = "real-key".to_string();
         assert!(config.validate_with_options(false).is_ok());
+    }
+
+    #[test]
+    fn test_scout_only_validation_does_not_require_translation_api() {
+        let mut config = Config::default();
+        config.scout_api.as_mut().unwrap().key = "scout-key".to_string();
+
+        assert!(config.validate_for_workflow(false, true).is_ok());
     }
 
     #[test]

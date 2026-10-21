@@ -1,12 +1,12 @@
-//! Name Scout - Extract character names from Japanese text using LLM.
+//! Mapping scout - Extract character names and terminology from Japanese text using an LLM.
 //!
-//! Uses a secondary LLM pass to identify character names in Japanese text
-//! and extract them with English translations.
+//! Uses a secondary LLM pass to identify character names and recurring
+//! story-specific terms with canonical English renderings.
 
 use crate::config::{ApiConfig, NameScoutConfig};
 use crate::console::Console;
 use crate::error::TranslationError;
-use crate::name_mapping::{NameEntry, NamePart};
+use crate::name_mapping::{KnownMappings, NameEntry, NamePart, TermEntry};
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,11 @@ static REFUSAL_PHRASES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         "i do not have the ability",
     ]
 });
+
+/// Response shape appended to every custom mapping scout prompt.
+const MAPPING_RESPONSE_CONTRACT: &str = r#"Return ONLY JSON with both arrays:
+{"names":[{"original":"<exact name characters>","part":"family|given|unknown","english":"<best English rendering>"}],"terms":[{"original":"<exact Japanese term>","english":"<canonical English rendering>"}]}
+Use empty arrays when no names or terms are found. Do not omit either key or add explanations."#;
 
 fn format_translation_error(error: &TranslationError) -> String {
     match error {
@@ -131,7 +136,7 @@ struct ResponseMessage {
     content: Option<String>,
 }
 
-/// Parsed name entry from LLM response.
+/// Parsed name entry from an LLM response.
 #[derive(Debug, Deserialize)]
 struct ParsedNameEntry {
     original: Option<String>,
@@ -139,13 +144,30 @@ struct ParsedNameEntry {
     part: Option<String>,
 }
 
-/// Parsed names response from LLM.
+/// Parsed terminology entry from an LLM response.
 #[derive(Debug, Deserialize)]
-struct ParsedNamesResponse {
-    names: Vec<ParsedNameEntry>,
+struct ParsedTermEntry {
+    original: Option<String>,
+    english: Option<String>,
 }
 
-/// Name Scout for extracting character names from Japanese text.
+/// Parsed name and terminology response from an LLM.
+#[derive(Debug, Deserialize)]
+struct ParsedMappingsResponse {
+    names: Vec<ParsedNameEntry>,
+    terms: Vec<ParsedTermEntry>,
+}
+
+/// Names and terminology identified in one successfully processed text chunk.
+#[derive(Debug, Default)]
+pub struct ScoutChunk {
+    /// Character name entries.
+    pub names: Vec<NameEntry>,
+    /// Terminology entries.
+    pub terms: Vec<TermEntry>,
+}
+
+/// Mapping scout for extracting character names and terminology from Japanese text.
 pub struct NameScout {
     /// HTTP client for API requests.
     client: Client,
@@ -153,7 +175,7 @@ pub struct NameScout {
     api_config: ApiConfig,
     /// Name scout behavior configuration.
     scout_config: NameScoutConfig,
-    /// System prompt for name extraction.
+    /// System prompt for name and terminology extraction.
     prompt: String,
     /// Console for output.
     console: Console,
@@ -231,29 +253,35 @@ impl NameScout {
             client: Client::new(),
             api_config,
             scout_config,
-            prompt,
+            prompt: format!("{prompt}\n\n{MAPPING_RESPONSE_CONTRACT}"),
             console: Console::new(),
         }
     }
 
-    /// Collect names from text, processing in chunks.
+    /// Collect names and terminology from text, processing in chunks.
     ///
-    /// Returns a vector of name entry vectors, one per successfully processed chunk.
-    pub async fn collect_names(&self, text: &str) -> Result<Vec<Vec<NameEntry>>, TranslationError> {
-        self.collect_names_with_progress(text, None).await
+    /// Returns mapping entries for each successfully processed chunk.
+    pub async fn collect_mappings(&self, text: &str) -> Result<Vec<ScoutChunk>, TranslationError> {
+        self.collect_mappings_with_progress(text, &KnownMappings::default(), None)
+            .await
     }
 
-    /// Collect names from text, reporting chunk progress when a reporter is provided.
-    pub async fn collect_names_with_progress(
+    /// Collect names and terminology from text, reporting chunk progress when a reporter is provided.
+    ///
+    /// Known renderings that occur in a chunk are sent with it so the model reuses them
+    /// instead of romanizing the same original differently in every chapter.
+    pub async fn collect_mappings_with_progress(
         &self,
         text: &str,
+        known: &KnownMappings,
         progress_info: Option<ScoutProgressInfo>,
-    ) -> Result<Vec<Vec<NameEntry>>, TranslationError> {
+    ) -> Result<Vec<ScoutChunk>, TranslationError> {
         let chunks = self.split_into_chunks(text);
         let total_chunks = chunks.len();
         let mut results = Vec::new();
 
         for (i, chunk) in chunks.iter().enumerate() {
+            let request_text = build_scout_user_message(chunk, &known.present_in(chunk));
             let chunk_num = i + 1;
             let chunk_started = Instant::now();
             self.report_progress(
@@ -291,7 +319,7 @@ impl NameScout {
                         progress_info.as_ref(),
                     );
 
-                    match self.call_model(chunk).await {
+                    match self.call_model(&request_text).await {
                         Ok(raw_response) => break raw_response,
                         Err(e) => {
                             api_attempt += 1;
@@ -392,7 +420,9 @@ impl NameScout {
                         ));
                     }
                     attempt += 1;
-                    tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                    if attempt < self.scout_config.json_retries {
+                        tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                    }
                     continue;
                 }
 
@@ -408,11 +438,12 @@ impl NameScout {
                 // Parse the response
                 match self.parse_response(&raw_response) {
                     Ok(entries) => {
-                        if !entries.is_empty() {
+                        if !entries.names.is_empty() || !entries.terms.is_empty() {
                             if progress_info.is_none() {
                                 self.console.success(&format!(
-                                    "Found {} names in chunk {}",
-                                    entries.len(),
+                                    "Found {} names and {} terms in chunk {}",
+                                    entries.names.len(),
+                                    entries.terms.len(),
                                     chunk_num
                                 ));
                             }
@@ -448,7 +479,9 @@ impl NameScout {
                             ));
                         }
                         attempt += 1;
-                        tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                        if attempt < self.scout_config.json_retries {
+                            tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                        }
                     }
                 }
             }
@@ -471,6 +504,9 @@ impl NameScout {
                         chunk_num, self.scout_config.json_retries
                     ));
                 }
+                return Err(TranslationError::RetriesExhausted {
+                    attempts: self.scout_config.json_retries,
+                });
             }
         }
 
@@ -527,7 +563,7 @@ impl NameScout {
     }
 
     /// Call the LLM model to extract names.
-    async fn call_model(&self, chunk: &str) -> Result<String, TranslationError> {
+    async fn call_model(&self, user_message: &str) -> Result<String, TranslationError> {
         let request = ChatRequest {
             model: self.api_config.model.clone(),
             messages: vec![
@@ -537,7 +573,7 @@ impl NameScout {
                 },
                 Message {
                     role: "user".to_string(),
-                    content: chunk.to_string(),
+                    content: user_message.to_string(),
                 },
             ],
         };
@@ -605,8 +641,8 @@ impl NameScout {
         Ok(content.to_string())
     }
 
-    /// Parse the LLM response into name entries.
-    fn parse_response(&self, raw: &str) -> Result<Vec<NameEntry>, TranslationError> {
+    /// Parse the LLM response into name and terminology entries.
+    fn parse_response(&self, raw: &str) -> Result<ScoutChunk, TranslationError> {
         let trimmed = raw.trim();
 
         // Remove markdown code fence if present
@@ -624,25 +660,26 @@ impl NameScout {
             trimmed
         };
 
-        // Find JSON object boundaries
-        let start = json_str.find('{');
-        let end = json_str.rfind('}');
-
-        let json_content = match (start, end) {
-            (Some(s), Some(e)) if s < e => &json_str[s..=e],
-            _ => {
-                return Err(TranslationError::ParseError(
-                    "No valid JSON object found".to_string(),
-                ));
-            }
-        };
-
-        // Parse JSON
-        let parsed: ParsedNamesResponse = serde_json::from_str(json_content)
+        // Parse the first complete JSON object; models sometimes append prose or a stray `}`.
+        let start = json_str.find('{').ok_or_else(|| {
+            TranslationError::ParseError("No valid JSON object found".to_string())
+        })?;
+        let value: serde_json::Value = serde_json::Deserializer::from_str(&json_str[start..])
+            .into_iter()
+            .next()
+            .ok_or_else(|| TranslationError::ParseError("No valid JSON object found".to_string()))?
             .map_err(|e| TranslationError::ParseError(format!("JSON parse error: {}", e)))?;
 
-        // Convert to NameEntry
-        let entries: Vec<NameEntry> = parsed
+        // When every name and term in a chunk is already known, models answer `{}`.
+        // A response with only one of the two keys is still rejected as incomplete.
+        if value.as_object().is_some_and(serde_json::Map::is_empty) {
+            return Ok(ScoutChunk::default());
+        }
+
+        let parsed: ParsedMappingsResponse = serde_json::from_value(value)
+            .map_err(|e| TranslationError::ParseError(format!("JSON parse error: {}", e)))?;
+
+        let names = parsed
             .names
             .into_iter()
             .filter_map(|entry| {
@@ -656,7 +693,7 @@ impl NameScout {
                 let part = entry
                     .part
                     .as_deref()
-                    .and_then(|p| p.parse().ok())
+                    .and_then(|part| part.parse().ok())
                     .unwrap_or(NamePart::Unknown);
 
                 Some(NameEntry {
@@ -667,8 +704,51 @@ impl NameScout {
             })
             .collect();
 
-        Ok(entries)
+        let terms = parsed
+            .terms
+            .into_iter()
+            .filter_map(|entry| {
+                let original = entry.original?.trim().to_string();
+                let english = entry.english?.trim().to_string();
+
+                if original.is_empty() || english.is_empty() {
+                    return None;
+                }
+
+                Some(TermEntry { original, english })
+            })
+            .collect();
+
+        Ok(ScoutChunk { names, terms })
     }
+}
+
+/// Build the scout user message: known renderings for this chunk, then the text.
+fn build_scout_user_message(chunk: &str, known: &KnownMappings) -> String {
+    if known.is_empty() {
+        return chunk.to_string();
+    }
+
+    let mut message = String::from(
+        "Renderings already chosen in earlier chapters. Whenever you report one of these originals, use exactly the listed English. Still report new names and terms; if there are none, return both keys with empty arrays.\n",
+    );
+    for (heading, entries) in [("Names", &known.names), ("Terms", &known.terms)] {
+        if entries.is_empty() {
+            continue;
+        }
+        message.push_str(heading);
+        message.push_str(":\n");
+        for entry in entries {
+            message.push_str("- ");
+            message.push_str(&entry.original);
+            message.push_str(" → ");
+            message.push_str(&entry.english);
+            message.push('\n');
+        }
+    }
+    message.push_str("\nText:\n");
+    message.push_str(chunk);
+    message
 }
 
 /// Build a chapter payload for name scouting.
@@ -685,6 +765,9 @@ pub fn build_chapter_payload(chapter_number: u32, title: &str, content: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     fn make_scout() -> NameScout {
         NameScout::new(
@@ -697,57 +780,155 @@ mod tests {
     #[test]
     fn test_parse_valid_json() {
         let scout = make_scout();
-        let json = r#"{"names":[{"original":"田中","english":"Tanaka","part":"family"}]}"#;
+        let json =
+            r#"{"names":[{"original":"田中","english":"Tanaka","part":"family"}],"terms":[]}"#;
 
         let result = scout.parse_response(json).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].original, "田中");
-        assert_eq!(result[0].english, "Tanaka");
-        assert_eq!(result[0].part, NamePart::Family);
+        assert_eq!(result.names.len(), 1);
+        assert!(result.terms.is_empty());
+        assert_eq!(result.names[0].original, "田中");
+        assert_eq!(result.names[0].english, "Tanaka");
+        assert_eq!(result.names[0].part, NamePart::Family);
+    }
+
+    #[test]
+    fn test_parse_names_only_response_fails() {
+        let scout = make_scout();
+        let result = scout.parse_response(
+            r#"{"names":[{"original":"田中","english":"Tanaka","part":"family"}]}"#,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_empty_object_means_nothing_new() {
+        let scout = make_scout();
+        let result = scout.parse_response("{}").unwrap();
+
+        assert!(result.names.is_empty());
+        assert!(result.terms.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_names_only_response_cannot_complete_mapping_scout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+
+            let response_body = r#"{"choices":[{"message":{"content":"{\"names\":[{\"original\":\"田中\",\"english\":\"Tanaka\",\"part\":\"family\"}]}"}}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )
+            .unwrap();
+        });
+
+        let scout = NameScout::new(
+            ApiConfig {
+                key: "test-key".to_string(),
+                base_url: format!("http://{address}/v1"),
+                model: "test-model".to_string(),
+            },
+            NameScoutConfig {
+                retries: 1,
+                json_retries: 1,
+                delay_between_requests_sec: 0.0,
+                ..Default::default()
+            },
+            "Extract mappings".to_string(),
+        );
+
+        let result = scout.collect_mappings("田中は魔石を持っていた。").await;
+        server.join().unwrap();
+
+        assert!(matches!(
+            result,
+            Err(TranslationError::RetriesExhausted { attempts: 1 })
+        ));
+    }
+
+    #[test]
+    fn test_parse_terminology() {
+        let scout = make_scout();
+        let json = r#"{
+            "names": [],
+            "terms": [{"original":"魔石","english":"Magic Stone"}]
+        }"#;
+
+        let result = scout.parse_response(json).unwrap();
+        assert!(result.names.is_empty());
+        assert_eq!(result.terms.len(), 1);
+        assert_eq!(result.terms[0].original, "魔石");
+        assert_eq!(result.terms[0].english, "Magic Stone");
     }
 
     #[test]
     fn test_parse_json_with_code_fence() {
         let scout = make_scout();
         let json = r#"```json
-{"names":[{"original":"太郎","english":"Taro","part":"given"}]}
+{"names":[{"original":"太郎","english":"Taro","part":"given"}],"terms":[]}
 ```"#;
 
         let result = scout.parse_response(json).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].original, "太郎");
-        assert_eq!(result[0].english, "Taro");
+        assert_eq!(result.names.len(), 1);
+        assert_eq!(result.names[0].original, "太郎");
+        assert_eq!(result.names[0].english, "Taro");
     }
 
     #[test]
     fn test_parse_json_with_surrounding_text() {
         let scout = make_scout();
-        let json = r#"Here are the names I found:
-{"names":[{"original":"花子","english":"Hanako","part":"given"}]}
+        let json = r#"Here are the mappings I found:
+{"names":[{"original":"花子","english":"Hanako","part":"given"}],"terms":[]}
 I hope this helps!"#;
 
         let result = scout.parse_response(json).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].original, "花子");
+        assert_eq!(result.names.len(), 1);
+        assert_eq!(result.names[0].original, "花子");
     }
 
     #[test]
-    fn test_parse_empty_names() {
+    fn test_parse_json_with_stray_trailing_brace() {
         let scout = make_scout();
-        let json = r#"{"names":[]}"#;
+        let json = r#"{"names":[{"original":"ペーリス","part":"given","english":"Peris"}],"terms":[]}}"#;
 
         let result = scout.parse_response(json).unwrap();
-        assert!(result.is_empty());
+        assert_eq!(result.names.len(), 1);
+        assert_eq!(result.names[0].english, "Peris");
+    }
+
+    #[test]
+    fn test_parse_empty_mappings() {
+        let scout = make_scout();
+        let json = r#"{"names":[],"terms":[]}"#;
+
+        let result = scout.parse_response(json).unwrap();
+        assert!(result.names.is_empty());
+        assert!(result.terms.is_empty());
     }
 
     #[test]
     fn test_parse_missing_fields() {
         let scout = make_scout();
-        let json = r#"{"names":[{"original":"田中"},{"english":"Smith"}]}"#;
+        let json =
+            r#"{"names":[{"original":"田中"},{"english":"Smith"}],"terms":[{"original":"魔石"}]}"#;
 
         let result = scout.parse_response(json).unwrap();
-        // Both entries should be filtered out due to missing required fields
-        assert!(result.is_empty());
+        assert!(result.names.is_empty());
+        assert!(result.terms.is_empty());
     }
 
     #[test]

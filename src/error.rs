@@ -84,6 +84,15 @@ pub enum TranslationError {
     #[error("All retries exhausted after {attempts} attempts")]
     RetriesExhausted { attempts: u32 },
 
+    /// The translation still contains Chinese or Japanese characters.
+    #[error("Translation contains {count} Chinese or Japanese characters")]
+    ForeignScript {
+        /// The translated text as returned by the model.
+        text: String,
+        /// Number of kana and CJK ideographs found.
+        count: usize,
+    },
+
     /// Invalid API configuration
     #[error("Invalid API configuration: {0}")]
     InvalidConfig(String),
@@ -107,6 +116,58 @@ pub enum NameMappingError {
     /// Failed to write mapping file
     #[error("Failed to save name mapping: {0}")]
     WriteError(String),
+}
+
+/// Error type for `book.json` metadata.
+#[derive(Error, Debug)]
+pub enum BookMetadataError {
+    /// The metadata file exists but could not be read.
+    #[error("Failed to read {}: {source}", path.display())]
+    Read {
+        /// Path of `book.json`.
+        path: std::path::PathBuf,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+
+    /// The metadata file is not valid JSON for this format.
+    #[error("Invalid {}: {source}", path.display())]
+    Parse {
+        /// Path of `book.json`.
+        path: std::path::PathBuf,
+        /// Underlying JSON error.
+        source: serde_json::Error,
+    },
+
+    /// The metadata file could not be written.
+    #[error("Failed to write {}: {source}", path.display())]
+    Write {
+        /// Path of `book.json`.
+        path: std::path::PathBuf,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+}
+
+/// Error type for EPUB generation.
+#[derive(Error, Debug)]
+pub enum EpubError {
+    /// Reading the novel folder or writing the output failed.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// A chapter file could not be read.
+    #[error("Failed to read chapter {}: {source}", path.display())]
+    ReadChapter {
+        /// Path of the chapter file.
+        path: std::path::PathBuf,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+
+    /// The EPUB archive could not be written.
+    #[error("Failed to write EPUB archive: {0}")]
+    Zip(#[from] zip::result::ZipError),
 }
 
 /// Result type alias using anyhow for application-level error handling.

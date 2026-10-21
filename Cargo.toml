@@ -20,6 +20,7 @@ tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "time", "
 toml = "0.9.10"
 url = "2.5.7"
 which = "8.0.0"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3.24.0"

@@ -84,14 +84,15 @@ Optional separate API for name scouting (falls back to [API] if not set):
 
 #### [Translation] Section
 Translation behavior configuration:
-- `chunk_size_chars`: Maximum characters per chunk (default: "4000", integer)
+- `chunk_size_chars`: Maximum UTF-8 bytes per source chunk (default: "4000", integer)
 - `retries`: Number of retry attempts for failed translations (default: "3", integer)
-- `delay_between_requests_sec`: Delay between API requests in seconds (default: "1", float)
+- `delay_between_requests_sec`: Delay between API requests (default: "1", float)
 - `history_length`: Number of message pairs to retain in conversation history (default: "5", integer)
+- `glossary_max_entries`: Maximum canonical glossary entries injected into a chapter translation prompt; `0` disables injection (default: "100", integer)
 
 #### [NameScout] Section
-Name extraction configuration:
-- `chunk_size_chars`: Maximum characters per name scout chunk (default: "2500", integer)
+Name and terminology extraction configuration:
+- `chunk_size_chars`: Maximum UTF-8 bytes per mapping scout chunk (default: "2500", integer)
 - `retries`: Number of retry attempts (default: "3", integer)
 - `delay_between_requests_sec`: Delay between requests (default: "1", float)
 - `json_retries`: Number of JSON parsing retry attempts (default: "3", integer)
@@ -104,7 +105,7 @@ Web scraping behavior:
 LLM system prompts (strings):
 - `title_translation_prompt`: Prompt for title translation
 - `content_translation_prompt`: Prompt for content translation
-- `name_scout_prompt`: Prompt for name extraction (JSON format expected)
+- `name_scout_prompt`: Prompt for name and terminology extraction (JSON format expected)
 
 #### [Paths] Section
 File system paths:
@@ -426,7 +427,7 @@ const REFUSAL_PHRASES: &[&str] = &[
 ];
 ```
 
-**Translation Method** (`translate(text: &str, is_title: bool, progress_info: Option<ProgressInfo>) -> Result<String>`):
+**Translation Method** (`translate(text: &str, is_title: bool, glossary: &[TermEntry], progress_info: Option<ProgressInfo>) -> Result<String>`):
 
 1. **Empty Text Handling**:
    - If text is empty → return empty string immediately
@@ -434,18 +435,20 @@ const REFUSAL_PHRASES: &[&str] = &[
 2. **Title Translation** (is_title=True):
    - Initialize message history with title_translation_prompt as system message
    - Display: "Translating title 「{snippet}...」"
-   - Call `_translate_single_chunk` once (no chunking)
-   - Return result
+   - Translate once with the shared retry logic below (no chunking); empty replies and refusals are retried
+   - Return result, or `Err` once retries are exhausted
 
 3. **Content Translation** (is_title=False):
-   - Initialize message history with content_translation_prompt as system message
+   - Add canonical glossary entries present in the name-substituted text to content_translation_prompt, overrides first, then by vote count
+   - Initialize message history with that system message
    - Split text into chunks using `_split_text_into_chunks`
-   - For each chunk with retry logic:
+   - For each chunk, with the shared retry logic:
      - Display preparing status before API call
      - Call `_translate_single_chunk` with progress info
      - On success: append to results
-     - On failure: retry up to `retries` times with exponential backoff
-     - On all retries failed: append "[TRANSLATION FAILED]\n{original_chunk}"
+     - On failure: retry up to `retries` times with exponential backoff; a refusal or empty reply clears history first
+     - Reply still containing Chinese/Japanese characters on the last attempt: keep it with a warning
+     - Refused on every attempt: append "[TRANSLATION FAILED]\n{original_chunk}"; other errors fail the chapter
    - Join translated chunks with "\n\n"
    - Return result
 
@@ -530,7 +533,7 @@ Phase 2 - Word-based splitting for oversized chunks:
 
 ### Name Mapping Store
 
-**Purpose**: Persistent storage of character name mappings with vote-based consensus and coverage tracking.
+**Purpose**: Persistent storage of character names and story-specific terminology with vote-based consensus, manual overrides, and independent coverage tracking.
 
 **File Location**:
 - Platform-specific names directory (see Configuration)
@@ -543,16 +546,22 @@ Phase 2 - Word-based splitting for oversized chunks:
   "names": {
     "{original_japanese}": {
       "part": "family|given|unknown",
-      "votes": {
-        "{english_name}": count_int,
-        ...
-      },
-      "english": "winning_english_name",
-      "count": winning_vote_count_int
-    },
-    ...
+      "votes": {"{english_name}": "count_int"},
+      "override": "optional_manual_rendering",
+      "english": "selected_english_name",
+      "count": "selected_vote_count_int"
+    }
   },
-  "coverage": [chapter_number_int, ...]
+  "terms": {
+    "{original_japanese_term}": {
+      "votes": {"{english_term}": "count_int"},
+      "override": "optional_manual_rendering",
+      "english": "selected_english_term",
+      "count": "selected_vote_count_int"
+    }
+  },
+  "coverage": ["name_coverage_chapter_number_int"],
+  "term_coverage": ["term_coverage_chapter_number_int"]
 }
 ```
 
@@ -691,9 +700,9 @@ pub struct NameInfo {
    - Return `Ok(())`
 5. If error: log error message, return `Err`
 
-### Name Scout
+### Mapping Scout
 
-**Purpose**: Extract character names from Japanese text using a secondary LLM pass.
+**Purpose**: Extract character names and story-specific terminology from Japanese text using a secondary LLM pass.
 
 **Initialization**:
 - Load ScoutAPI configuration (falls back to main API config)
@@ -702,13 +711,11 @@ pub struct NameInfo {
 - Configure chunk size (typically smaller than translation chunks)
 
 **Prompt Format**:
-System prompt should request JSON response:
+System prompt requests a JSON response:
 ```
-You read Japanese fiction text and extract character name parts.
-Return ONLY JSON with this shape:
-{"names":[{"original":"<exact name characters>","part":"family|given|unknown","english":"<best English rendering>"}]}
-Treat given and family names separately. Use romaji or common English equivalents. No explanations.
+{"names":[{"original":"<exact name characters>","part":"family|given|unknown","english":"<best English rendering>"}],"terms":[{"original":"<exact Japanese term>","english":"<canonical English rendering>"}]}
 ```
+Terms include distinctive items, skills, magic systems, ranks, organizations, places, and fictional concepts, but exclude person names and ordinary vocabulary.
 
 **Name Collection** (`collect_names_stream(text: &str) -> impl Iterator<Item = Vec<NameEntry>>`):
 
@@ -718,7 +725,8 @@ Returns an iterator (or async stream) that yields parsed name lists per chunk:
 2. For each chunk:
    - Display: "Name scout chunk X/Y ({char_count} chars)"
    - Retry loop (up to json_retries):
-     - Call `call_model(chunk)` to get raw LLM response
+     - Prefix the chunk with already-selected name and term renderings whose originals occur in it (names use the katakana word-boundary rule); the snapshot is refreshed after each scouted chapter
+     - Call `call_model(message)` to get raw LLM response
      - On network error: log warning, apply backoff, retry
      - On empty/refusal response: log warning, apply backoff, retry
      - On success: parse response with `parse_response(raw)`

@@ -8,17 +8,20 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use tokio::sync::{Mutex, mpsc};
+use tsundoku::book::{BookMetadata, ChapterMetadata};
 use tsundoku::config::Config;
 use tsundoku::console::{Console, Style};
-use tsundoku::name_mapping::NameMappingStore;
+use tsundoku::epub::BookInfo;
+use tsundoku::name_mapping::{KnownMappings, NameMappingStore};
 use tsundoku::name_scout::{
-    NameScout, NameScoutEvent, NameScoutProgress, NameScoutStatus, ScoutProgressInfo,
+    NameScout, NameScoutEvent, NameScoutProgress, NameScoutStatus, ScoutChunk, ScoutProgressInfo,
     build_chapter_payload,
 };
 use tsundoku::scrapers::{ChapterInfo, ChapterList, ScraperRegistry};
 use tsundoku::translator::{ProgressInfo, TranslationProgress, TranslationStage, Translator};
+use tsundoku::utils::{mark_scene_breaks, strip_chapter_number};
 
 const MAX_FILENAME_COMPONENT_BYTES: usize = 255;
 
@@ -50,6 +53,10 @@ struct Args {
     /// Disable name scouting entirely.
     #[arg(long)]
     no_name_scout: bool,
+
+    /// Download or reuse originals and scout mappings without translating.
+    #[arg(long, conflicts_with = "no_name_scout")]
+    scout_only: bool,
 
     /// Override number of name scout chapter workers.
     #[arg(long)]
@@ -88,6 +95,7 @@ struct ProcessParams<'a> {
     name_mapping: &'a mut NameMappingStore,
     no_name_pause: bool,
     no_name_scout: bool,
+    scout_only: bool,
     name_scout_limit: Option<u32>,
     config: &'a Config,
 }
@@ -121,7 +129,7 @@ async fn main() -> Result<()> {
     }
 
     // Check if this is first run (API key not configured)
-    if !config.api.is_configured() {
+    if !args.scout_only && !config.api.is_configured() {
         let config_path = Config::config_path()?;
         console.warning(&format!(
             "API key not configured. Please edit: {}",
@@ -148,7 +156,7 @@ async fn main() -> Result<()> {
     }
 
     config
-        .validate_with_options(!args.no_name_scout)
+        .validate_for_workflow(!args.scout_only, !args.no_name_scout)
         .context("Invalid configuration")?;
     console.success("Configuration loaded");
 
@@ -197,9 +205,9 @@ async fn main() -> Result<()> {
         .context("Failed to initialize name mapping store")?;
 
     console.info(&format!(
-        "Name mapping: {} names loaded, {} chapters covered",
+        "Name mapping: {} names and {} glossary terms loaded",
         name_mapping.len(),
-        name_mapping.coverage().len()
+        name_mapping.term_len()
     ));
 
     // Initialize translator
@@ -239,6 +247,7 @@ async fn main() -> Result<()> {
         name_mapping: &mut name_mapping,
         no_name_pause: args.no_name_pause,
         no_name_scout: args.no_name_scout,
+        scout_only: args.scout_only,
         name_scout_limit: args.name_scout_limit,
         config: &config,
     };
@@ -259,15 +268,25 @@ async fn process_oneshot(params: &mut ProcessParams<'_>) -> Result<()> {
     params.console.section("Processing One-Shot Story");
 
     // Find or create story folder
-    let folder_name = find_or_create_folder(
-        params.console,
-        params.output_dir,
-        params.scraper.id(),
-        &params.novel_info.novel_id,
-        &params.novel_info.title,
-        params.translator,
-    )
-    .await?;
+    let folder_name = if params.scout_only {
+        find_or_create_scout_folder(
+            params.console,
+            params.output_dir,
+            params.scraper.id(),
+            &params.novel_info.novel_id,
+            &params.novel_info.title,
+        )
+    } else {
+        find_or_create_folder(
+            params.console,
+            params.output_dir,
+            params.scraper.id(),
+            &params.novel_info.novel_id,
+            &params.novel_info.title,
+            params.translator,
+        )
+        .await?
+    };
 
     let story_dir = params.output_dir.join(&folder_name);
     std::fs::create_dir_all(&story_dir)?;
@@ -315,6 +334,13 @@ async fn process_oneshot(params: &mut ProcessParams<'_>) -> Result<()> {
         manual_name_review(params.console, params.name_mapping, params.config)?;
     }
 
+    if params.scout_only {
+        params
+            .console
+            .success("Mapping scout complete; skipping translation");
+        return Ok(());
+    }
+
     // Translate content
     let translated_path = story_dir.join("oneshot.txt");
     if translated_path.exists() {
@@ -324,8 +350,12 @@ async fn process_oneshot(params: &mut ProcessParams<'_>) -> Result<()> {
     } else {
         params.console.step("Translating content...");
 
-        // Apply name mapping
-        let mapped_content = params.name_mapping.apply_to_text(&content);
+        // Apply name mapping, mark blank-line scene breaks, and collect canonical
+        // terms for this story.
+        let mapped_content = mark_scene_breaks(params.name_mapping.apply_to_text(&content));
+        let glossary = params
+            .name_mapping
+            .glossary_for_text(&mapped_content, params.config.translation.glossary_max_entries);
 
         let progress = ProgressInfo {
             chapter: 1,
@@ -337,7 +367,7 @@ async fn process_oneshot(params: &mut ProcessParams<'_>) -> Result<()> {
 
         let translated = params
             .translator
-            .translate(&mapped_content, false, Some(progress))
+            .translate(&mapped_content, false, &glossary, Some(progress))
             .await
             .context("Failed to translate content")?;
 
@@ -358,19 +388,39 @@ async fn process_chapters(
     params.console.section("Processing Multi-Chapter Story");
 
     // Find or create story folder
-    let folder_name = find_or_create_folder(
-        params.console,
-        params.output_dir,
-        params.scraper.id(),
-        &params.novel_info.novel_id,
-        &params.novel_info.title,
-        params.translator,
-    )
-    .await?;
+    let folder_name = if params.scout_only {
+        find_or_create_scout_folder(
+            params.console,
+            params.output_dir,
+            params.scraper.id(),
+            &params.novel_info.novel_id,
+            &params.novel_info.title,
+        )
+    } else {
+        find_or_create_folder(
+            params.console,
+            params.output_dir,
+            params.scraper.id(),
+            &params.novel_info.novel_id,
+            &params.novel_info.title,
+            params.translator,
+        )
+        .await?
+    };
 
     let story_dir = params.output_dir.join(&folder_name);
     let original_dir = story_dir.join("Original");
     std::fs::create_dir_all(&original_dir)?;
+    let mut cached_originals = cached_originals_by_chapter(&original_dir)?;
+
+    // Record the novel's source in book.json; hand-edited title and author are kept.
+    let mut book = BookMetadata::load(&story_dir)?.unwrap_or_default();
+    if book.title.is_empty() {
+        book.title = BookInfo::from_folder_name(&folder_name).title;
+    }
+    book.original_title.clone_from(&params.novel_info.title);
+    book.source_url.clone_from(&params.novel_info.base_url);
+    book.save(&story_dir)?;
 
     // Calculate padding for chapter numbers
     let total_chapters = chapters.len();
@@ -390,10 +440,12 @@ async fn process_chapters(
         let chapter_num_str = format!("{:0width$}", chapter.number, width = padding);
         let filename = chapter_filename(&chapter_num_str, &chapter.title);
         let original_path = original_dir.join(&filename);
-
         let content = if original_path.exists() {
             already_downloaded.push(chapter.number);
             std::fs::read_to_string(&original_path)?
+        } else if let Some(cached_path) = cached_originals.get(&chapter.number) {
+            already_downloaded.push(chapter.number);
+            std::fs::read_to_string(cached_path)?
         } else {
             report_chapter_ranges(
                 params.console,
@@ -412,6 +464,7 @@ async fn process_chapters(
                 .with_context(|| format!("Failed to download chapter {}", chapter.number))?;
 
             std::fs::write(&original_path, &content)?;
+            cached_originals.insert(chapter.number, original_path);
             params
                 .console
                 .success(&format!("Saved ({} chars)", content.chars().count()));
@@ -463,6 +516,13 @@ async fn process_chapters(
         manual_name_review(params.console, params.name_mapping, params.config)?;
     }
 
+    if params.scout_only {
+        params
+            .console
+            .success("Mapping scout complete; skipping translation");
+        return Ok(());
+    }
+
     // Translation phase
     params.console.section("Translation Phase");
 
@@ -472,8 +532,10 @@ async fn process_chapters(
         params.name_mapping,
         &downloaded_chapters,
         &story_dir,
+        &mut book,
         padding,
         params.config.translation.workers,
+        params.config.translation.glossary_max_entries,
     )
     .await?;
 
@@ -486,8 +548,10 @@ async fn translate_chapters(
     name_mapping: &NameMappingStore,
     downloaded_chapters: &[ChapterData],
     story_dir: &Path,
+    book: &mut BookMetadata,
     padding: usize,
     workers: usize,
+    glossary_max_entries: usize,
 ) -> Result<()> {
     console.info(&format!(
         "Translating with {} chapter worker{}",
@@ -513,12 +577,15 @@ async fn translate_chapters(
             continue;
         }
 
+        let mapped_content = mark_scene_breaks(name_mapping.apply_to_text(&chapter_data.content));
+        let glossary = name_mapping.glossary_for_text(&mapped_content, glossary_max_entries);
         jobs.push(TranslationJob {
             number: chapter_data.number,
             title: chapter_data.title.clone(),
             chapter_num_str,
             mapped_title: name_mapping.apply_to_text(&chapter_data.title),
-            mapped_content: name_mapping.apply_to_text(&chapter_data.content),
+            mapped_content,
+            glossary,
         });
     }
 
@@ -579,6 +646,14 @@ async fn translate_chapters(
             let chapter = result?;
             let translated_path = story_dir.join(&chapter.filename);
             std::fs::write(&translated_path, &chapter.content)?;
+            book.chapters.insert(
+                chapter.number,
+                ChapterMetadata {
+                    title: chapter.title,
+                    original_title: chapter.original_title,
+                },
+            );
+            book.save(story_dir)?;
             console.clear_line();
             console.success(&format!("Saved: {}", chapter.filename));
         }
@@ -658,10 +733,19 @@ async fn translate_chapter_job(
         reporter: Some(progress_tx.clone()),
     };
 
-    let translated_title = translator
-        .translate(&job.mapped_title, true, Some(title_progress))
-        .await
-        .with_context(|| format!("Failed to translate title for chapter {}", job.number))?;
+    // Translate only the title text and write the number ourselves, so every chapter
+    // is headed `Chapter N: …` instead of "Chapter Two" or "Episode 5". The file's
+    // chapter number is used because authors' own numbering contains typos.
+    let title_text = strip_chapter_number(&job.mapped_title);
+    let translated_title = if title_text.is_empty() {
+        format!("Chapter {}", job.number)
+    } else {
+        let translated_text = translator
+            .translate(title_text, true, &[], Some(title_progress))
+            .await
+            .with_context(|| format!("Failed to translate title for chapter {}", job.number))?;
+        format!("Chapter {}: {}", job.number, translated_text)
+    };
 
     let progress = ProgressInfo {
         chapter: job.number,
@@ -672,12 +756,15 @@ async fn translate_chapter_job(
     };
 
     let translated_content = translator
-        .translate(&job.mapped_content, false, Some(progress))
+        .translate(&job.mapped_content, false, &job.glossary, Some(progress))
         .await
         .with_context(|| format!("Failed to translate chapter {}", job.number))?;
 
     Ok(TranslatedChapter {
         filename: chapter_filename(&job.chapter_num_str, &translated_title),
+        number: job.number,
+        title: translated_title,
+        original_title: job.title,
         content: translated_content,
     })
 }
@@ -688,10 +775,14 @@ struct TranslationJob {
     chapter_num_str: String,
     mapped_title: String,
     mapped_content: String,
+    glossary: Vec<tsundoku::name_mapping::TermEntry>,
 }
 
 struct TranslatedChapter {
     filename: String,
+    number: u32,
+    title: String,
+    original_title: String,
     content: String,
 }
 
@@ -805,8 +896,8 @@ fn render_translation_stats(console: &Console, stats: &HashMap<usize, WorkerStat
     let _ = io::stdout().flush();
 }
 
-/// Runs name scout on chapters that haven't been covered.
-/// Returns true if any scouting was performed, false if all chapters were already covered.
+/// Runs the mapping scout on chapters missing either names or terminology coverage.
+/// Returns true if any scouting was performed, false if all chapters were covered.
 async fn run_name_scout(
     console: &Console,
     name_scout: &NameScout,
@@ -815,21 +906,30 @@ async fn run_name_scout(
     workers: usize,
     limit: Option<u32>,
 ) -> Result<bool> {
-    console.section("Name Scout Phase");
+    console.section("Mapping Scout Phase");
 
     let uncovered: Vec<_> = chapters
         .iter()
-        .filter(|(num, _, _)| limit.is_none_or(|limit| *num <= limit))
-        .filter(|(num, _, _)| !name_mapping.is_chapter_covered(*num))
+        .filter(|(number, _, _)| limit.is_none_or(|limit| *number <= limit))
+        .map(|(number, title, content)| {
+            (
+                *number,
+                *title,
+                *content,
+                !name_mapping.is_chapter_covered(*number),
+                !name_mapping.is_chapter_terms_covered(*number),
+            )
+        })
+        .filter(|(_, _, _, missing_names, missing_terms)| *missing_names || *missing_terms)
         .collect();
 
     if uncovered.is_empty() {
-        console.info("All chapters already scouted for names");
+        console.info("All chapters already scouted for names and terminology");
         return Ok(false);
     }
 
     console.info(&format!(
-        "Scouting {} chapters for character names with {} chapter worker{}",
+        "Scouting {} chapters for character names and terminology with {} chapter worker{}",
         uncovered.len(),
         workers,
         if workers == 1 { "" } else { "s" }
@@ -840,10 +940,14 @@ async fn run_name_scout(
     let worker_ids = Arc::new(Mutex::new((1..=workers).rev().collect::<Vec<_>>()));
 
     let mut scout_error = None;
+    // Workers read the latest selections when they start a chapter, so later chapters
+    // reuse renderings voted on by chapters that finished before them.
+    let known = RwLock::new(Arc::new(name_mapping.known_mappings()));
+    let known = &known;
 
     {
         let scouted = stream::iter(uncovered)
-            .map(|(number, title, content)| {
+            .map(|(number, title, content, record_names, record_terms)| {
                 let worker_ids = Arc::clone(&worker_ids);
                 let progress_tx = progress_tx.clone();
 
@@ -854,11 +958,15 @@ async fn run_name_scout(
                         .pop()
                         .expect("worker id pool cannot be empty");
 
+                    let snapshot = Arc::clone(&known.read().unwrap_or_else(PoisonError::into_inner));
                     let result = scout_chapter_job(
                         name_scout,
-                        *number,
+                        number,
                         title,
                         content,
+                        &snapshot.present_in(content),
+                        record_names,
+                        record_terms,
                         worker,
                         progress_tx.clone(),
                     )
@@ -890,19 +998,30 @@ async fn run_name_scout(
                 }
             };
 
-            for entries in &chapter.name_chunks {
-                name_mapping.record_votes(entries);
+            for entries in &chapter.mapping_chunks {
+                if chapter.record_names {
+                    name_mapping.record_votes(&entries.names);
+                }
+                if chapter.record_terms {
+                    name_mapping.record_term_votes(&entries.terms);
+                }
                 name_mapping.save()?;
             }
 
-            // Mark chapter as covered
-            name_mapping.add_coverage(&[chapter.number]);
+            if chapter.record_names {
+                name_mapping.add_coverage(&[chapter.number]);
+            }
+            if chapter.record_terms {
+                name_mapping.add_term_coverage(&[chapter.number]);
+            }
             name_mapping.save()?;
+            *known.write().unwrap_or_else(PoisonError::into_inner) =
+                Arc::new(name_mapping.known_mappings());
 
             clear_status_line();
             console.success(&format!(
-                "Scouted chapter {}: found {} names",
-                chapter.number, chapter.total_names
+                "Scouted chapter {}: found {} names and {} terms",
+                chapter.number, chapter.total_names, chapter.total_terms
             ));
         }
     }
@@ -917,8 +1036,9 @@ async fn run_name_scout(
     }
 
     console.success(&format!(
-        "Name mapping now has {} names",
-        name_mapping.len()
+        "Name mapping now has {} names and {} glossary terms",
+        name_mapping.len(),
+        name_mapping.term_len()
     ));
 
     Ok(true)
@@ -926,8 +1046,11 @@ async fn run_name_scout(
 
 struct ScoutedChapter {
     number: u32,
+    record_names: bool,
+    record_terms: bool,
     total_names: usize,
-    name_chunks: Vec<Vec<tsundoku::name_mapping::NameEntry>>,
+    total_terms: usize,
+    mapping_chunks: Vec<ScoutChunk>,
 }
 
 async fn scout_chapter_job(
@@ -935,6 +1058,9 @@ async fn scout_chapter_job(
     number: u32,
     title: &str,
     content: &str,
+    known: &KnownMappings,
+    record_names: bool,
+    record_terms: bool,
     worker: usize,
     progress_tx: mpsc::UnboundedSender<NameScoutEvent>,
 ) -> Result<ScoutedChapter> {
@@ -944,17 +1070,21 @@ async fn scout_chapter_job(
         worker,
         reporter: Some(progress_tx),
     };
-    let name_chunks = name_scout
-        .collect_names_with_progress(&payload, Some(progress))
+    let mapping_chunks = name_scout
+        .collect_mappings_with_progress(&payload, known, Some(progress))
         .await
-        .with_context(|| format!("Failed to scout names for chapter {}", number))?;
+        .with_context(|| format!("Failed to scout mappings for chapter {}", number))?;
 
-    let total_names = name_chunks.iter().map(|c| c.len()).sum();
+    let total_names = mapping_chunks.iter().map(|chunk| chunk.names.len()).sum();
+    let total_terms = mapping_chunks.iter().map(|chunk| chunk.terms.len()).sum();
 
     Ok(ScoutedChapter {
         number,
+        record_names,
+        record_terms,
         total_names,
-        name_chunks,
+        total_terms,
+        mapping_chunks,
     })
 }
 
@@ -1156,6 +1286,25 @@ fn manual_name_review(
     Ok(())
 }
 
+/// Finds an existing story folder for the novel.
+fn find_existing_folder(output_dir: &Path, module_name: &str, novel_id: &str) -> Option<String> {
+    let new_format_prefix = format!("[{}: {}]", module_name, novel_id);
+    let old_format_prefix = format!("[{}]", novel_id);
+
+    std::fs::read_dir(output_dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .find_map(|entry| {
+            if !entry.path().is_dir() {
+                return None;
+            }
+
+            let name = entry.file_name().to_string_lossy().to_string();
+            (name.starts_with(&new_format_prefix) || name.starts_with(&old_format_prefix))
+                .then_some(name)
+        })
+}
+
 /// Finds an existing folder or creates a new one with translated title.
 async fn find_or_create_folder(
     console: &Console,
@@ -1165,26 +1314,14 @@ async fn find_or_create_folder(
     original_title: &str,
     translator: &Translator,
 ) -> Result<String> {
-    // Check for existing folders
-    let new_format_prefix = format!("[{}: {}]", module_name, novel_id);
-    let old_format_prefix = format!("[{}]", novel_id);
-
-    if let Ok(entries) = std::fs::read_dir(output_dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            if entry.path().is_dir() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with(&new_format_prefix) || name.starts_with(&old_format_prefix) {
-                    console.info(&format!("Using existing folder: {}", name));
-                    return Ok(name);
-                }
-            }
-        }
+    if let Some(name) = find_existing_folder(output_dir, module_name, novel_id) {
+        console.info(&format!("Using existing folder: {}", name));
+        return Ok(name);
     }
 
-    // Create new folder with translated title
     console.step("Translating title for folder name...");
     let translated_title = translator
-        .translate(original_title, true, None)
+        .translate(original_title, true, &[], None)
         .await
         .context("Failed to translate title for folder name")?;
 
@@ -1194,10 +1331,36 @@ async fn find_or_create_folder(
         MAX_FILENAME_COMPONENT_BYTES.saturating_sub(folder_prefix.len()),
     );
     let folder_name = format!("{}{}", folder_prefix, safe_title);
-
     console.success(&format!("Creating folder: {}", folder_name));
 
     Ok(folder_name)
+}
+
+/// Finds an existing folder or creates one without translating its title.
+fn find_or_create_scout_folder(
+    console: &Console,
+    output_dir: &Path,
+    module_name: &str,
+    novel_id: &str,
+    original_title: &str,
+) -> String {
+    if let Some(name) = find_existing_folder(output_dir, module_name, novel_id) {
+        console.info(&format!("Using existing folder: {}", name));
+        return name;
+    }
+
+    let folder_prefix = format!("[{}: {}] ", module_name, novel_id);
+    let safe_title = sanitize_filename_with_max_bytes(
+        original_title,
+        MAX_FILENAME_COMPONENT_BYTES.saturating_sub(folder_prefix.len()),
+    );
+    let folder_name = format!("{}{}", folder_prefix, safe_title);
+    console.success(&format!(
+        "Creating scout-only folder without translating its title: {}",
+        folder_name
+    ));
+
+    folder_name
 }
 
 /// Validates the chapter range arguments.
@@ -1256,6 +1419,36 @@ fn chapter_filename(chapter_num_str: &str, title: &str) -> String {
     format!("{}{}{}", prefix, safe_title, extension)
 }
 
+/// Index original chapter files by their numeric filename prefix.
+fn cached_originals_by_chapter(original_dir: &Path) -> Result<HashMap<u32, PathBuf>> {
+    let mut originals = HashMap::new();
+
+    for entry in std::fs::read_dir(original_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let filename = entry.file_name();
+        let filename = filename.to_string_lossy();
+        if !filename.ends_with(".txt") {
+            continue;
+        }
+
+        let Some((number, _)) = filename.split_once(" - ") else {
+            continue;
+        };
+        let Ok(number) = number.parse() else {
+            continue;
+        };
+
+        originals.entry(number).or_insert(path);
+    }
+
+    Ok(originals)
+}
+
 /// Sanitizes a string for use as a filename.
 fn sanitize_filename(name: &str) -> String {
     // Replace invalid characters with underscore
@@ -1305,6 +1498,7 @@ fn expand_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn chapter_filename_respects_component_byte_limit() {
@@ -1315,6 +1509,22 @@ mod tests {
         assert!(filename.len() <= MAX_FILENAME_COMPONENT_BYTES);
         assert!(filename.ends_with(".txt"));
         assert!(filename.is_char_boundary(filename.len() - ".txt".len()));
+    }
+
+    #[test]
+    fn cached_originals_survive_999_to_1000_chapter_padding_change() {
+        let temp_dir = TempDir::new().unwrap();
+        let legacy_filename = chapter_filename("999", "A chapter");
+        std::fs::write(temp_dir.path().join(&legacy_filename), "cached").unwrap();
+
+        let current_filename = chapter_filename("0999", "A chapter");
+        assert_ne!(legacy_filename, current_filename);
+
+        let originals = cached_originals_by_chapter(temp_dir.path()).unwrap();
+        assert_eq!(
+            originals.get(&999),
+            Some(&temp_dir.path().join(legacy_filename))
+        );
     }
 
     #[test]
@@ -1335,5 +1545,57 @@ mod tests {
     #[test]
     fn chapter_ranges_preserve_gaps() {
         assert_eq!(format_chapter_ranges(&[1, 2, 4, 6, 7, 8]), "1-2, 4, 6-8");
+    }
+
+    #[test]
+    fn scout_only_flag_parses() {
+        let args =
+            Args::try_parse_from(["tsundoku", "--scout-only", "https://example.com"]).unwrap();
+
+        assert!(args.scout_only);
+    }
+
+    #[test]
+    fn scout_only_conflicts_with_no_name_scout() {
+        let args = Args::try_parse_from([
+            "tsundoku",
+            "--scout-only",
+            "--no-name-scout",
+            "https://example.com",
+        ]);
+
+        assert!(args.is_err());
+    }
+
+    #[test]
+    fn scout_folder_uses_existing_folder() {
+        let temp_dir = TempDir::new().unwrap();
+        let existing = "[syosetu: n1234ab] Existing title";
+        std::fs::create_dir(temp_dir.path().join(existing)).unwrap();
+
+        let folder = find_or_create_scout_folder(
+            &Console::new(),
+            temp_dir.path(),
+            "syosetu",
+            "n1234ab",
+            "原題",
+        );
+
+        assert_eq!(folder, existing);
+    }
+
+    #[test]
+    fn scout_folder_uses_original_title_without_translation() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let folder = find_or_create_scout_folder(
+            &Console::new(),
+            temp_dir.path(),
+            "syosetu",
+            "n1234ab",
+            "原題",
+        );
+
+        assert_eq!(folder, "[syosetu: n1234ab] 原題");
     }
 }

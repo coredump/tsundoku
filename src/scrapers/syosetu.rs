@@ -234,7 +234,7 @@ impl SyosetuScraper {
         let paragraphs: Vec<String> = content_doc
             .select(&self.selectors.paragraph)
             .map(|p| {
-                // Get text, excluding <rt> elements (ruby text)
+                // Get text, excluding ruby readings and their fallback brackets
                 extract_text_without_ruby(p)
             })
             .collect();
@@ -250,24 +250,22 @@ impl SyosetuScraper {
     }
 }
 
-/// Extracts text from an element, excluding ruby annotation (<rt>) content.
+/// Extracts text from an element, excluding ruby annotations.
+///
+/// Both the reading (`<rt>`) and the fallback brackets around it (`<rp>`, `《》` on
+/// Syosetu) are dropped, so `宮城《きゅうじょう》` becomes `宮城`.
 fn extract_text_without_ruby(elem: scraper::ElementRef) -> String {
     let mut text = String::new();
 
     for node in elem.descendants() {
         if let scraper::node::Node::Text(t) = node.value() {
-            // Check if this text is inside an <rt> element
-            let mut is_in_rt = false;
-            for ancestor in node.ancestors() {
-                if let Some(elem) = ancestor.value().as_element()
-                    && elem.name() == "rt"
-                {
-                    is_in_rt = true;
-                    break;
-                }
-            }
-
-            if !is_in_rt {
+            let in_annotation = node.ancestors().any(|ancestor| {
+                ancestor
+                    .value()
+                    .as_element()
+                    .is_some_and(|elem| matches!(elem.name(), "rt" | "rp"))
+            });
+            if !in_annotation {
                 text.push_str(t);
             }
         }
@@ -384,6 +382,16 @@ impl Scraper for SyosetuScraper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_ruby_readings_and_brackets_are_dropped() {
+        let html = Html::parse_fragment(
+            "<p>先に<ruby>宮城<rp>《</rp><rt>きゅうじょう</rt><rp>》</rp></ruby>へ行った。</p>",
+        );
+        let paragraph = html.select(&Selector::parse("p").unwrap()).next().unwrap();
+
+        assert_eq!(extract_text_without_ruby(paragraph), "先に宮城へ行った。");
+    }
 
     #[test]
     fn test_url_patterns() {
