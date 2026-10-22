@@ -1069,6 +1069,11 @@ For stories with chapter list:
 
 7. **EPUB QA counts**: `tsundoku-epub` loads the record of every chapter of a volume and prints the issue counts per kind (`Vol. 01 QA: 3 glossary_missing, 2 name_near_miss`), noting chapters without a record; volumes without any record print nothing, and unreadable records are reported without stopping the build
 
+8. **Rewriting chapter texts** (`tsundoku-epub --rewrite-text`, offline), before the EPUB build:
+   - Output rules: policy from `book.json` `honorifics`, else `translation.honorifics` from the user's config file (`Config::config_path()`; defaults when it does not exist, and none is created); known names from `NameMappingStore` at `novel_file_path(config.names_dir(), module, id, ".json")`, with `(module, id)` from the folder prefix `[module: id]`; `book.json` `replacements`. Without a prefix or mapping file: warn and use `OutputRules::without_known_names` (every capitalised word counts as a name, so `names-only` strips only after lowercase words)
+   - For every chapter from `epub::collect_chapters` (so `.tsundoku/` is never read as chapters): load its record; without one, save `ChapterRecord::legacy(number, title, current .txt, [])` (title from `book.json` or the file name; `source: null`, no issues). Then write `postprocess(record.raw_text(), rules)` to the `.txt` when it differs
+   - Print `Rewrote N chapter(s) from their records: C file(s) changed, S record(s) created from existing text`; an unreadable record or file stops the run
+
 ### Filename Sanitization
 
 **Function**: `sanitize_filename(name)`

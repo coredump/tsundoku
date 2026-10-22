@@ -157,7 +157,7 @@ The policy works in three places:
 
 - **Before translating**, an honorific directly after a substituted name is rewritten (`Ruriちゃん` → `Ruri-chan`, or `Ruri` with `drop`), so the model no longer decides per chunk. Honorifics after Japanese words (`村長さん`) are left to the model.
 - **In the prompt**, one line tells the model the policy.
-- **After translating**, the chapter `.txt` gets the policy's output rule: `names-only` removes honorifics from lowercase words and from words that are not a known English name (`cat-san` → `cat`, `Village Chief-san` → `Village Chief`); `drop` removes every one; `keep` changes nothing. The chunk record keeps the model's raw output, so the rules are always applied to the raw text and never compound.
+- **After translating**, the chapter `.txt` gets the policy's output rule: `names-only` removes honorifics from lowercase words and from words that are not a known English name (`cat-san` → `cat`, `Village Chief-san` → `Village Chief`); `drop` removes every one; `keep` changes nothing. The chunk record keeps the model's raw output, so the rules are always applied to the raw text and never compound, and `tsundoku-epub --rewrite-text` can re-apply them to chapters already translated (see [Building EPUBs](#building-epubs)).
 
 A novel's `book.json` can override the policy and add its own find/replace rules, applied in order to the translated text after the honorific rule:
 
@@ -174,7 +174,7 @@ A novel's `book.json` can override the policy and add its own find/replace rules
 
 A literal `find` is case-sensitive and matches whole words (`Tatyuya` does not touch `Tatyuyas`); `$` in its `replace` is literal. With `"regex": true`, `find` is a [regex](https://docs.rs/regex/latest/regex/#syntax) and `replace` may use `$1`-style groups; JSON needs every backslash doubled. An invalid regex stops `tsundoku` and `tsundoku-epub` at load with the entry's index (`replacements[1]`).
 
-Changing the policy or the replacements part-way through a novel affects only chapters translated or rechecked afterwards: the source side (what the model is sent) and the output rules are applied when a chapter is saved. Since names followed by an honorific are now sent as `Ruri-chan` instead of `Ruriちゃん`, `--recheck stale` re-translates such chunks of chapters recorded before this rewrite existed.
+Changing the policy part-way through a novel affects the source side (what the model is sent) only for chapters translated or rechecked afterwards; run `tsundoku-epub --rewrite-text` to apply a changed policy's output rule or changed replacements to the chapters already translated. Since names followed by an honorific are now sent as `Ruri-chan` instead of `Ruriちゃん`, `--recheck stale` re-translates such chunks of chapters recorded before this rewrite existed.
 
 ## Usage
 
@@ -317,9 +317,9 @@ tsundoku-epub "[syosetu: n1234ab] Novel Title"
 
 Volumes are written to `<novel folder>/EPUB/` as `Novel Title - Vol. 01 (0001-0100).epub`, `Vol. 02 (0101-0200)`, and so on. Volume ranges follow chapter numbers, so rerunning after more chapters are translated rebuilds the same files with the new chapters added. Chapters missing from the middle of a volume are reported as warnings; chapters after the last translated one are not. For each volume with chunk records it also prints the recorded quality issues by kind (`Vol. 01 QA: 3 glossary_missing, 2 name_near_miss`), noting chapters that have no record yet.
 
-Each non-empty line becomes a paragraph, consecutive lines starting with `- ` or a single `・` become a list, and lines made only of break glyphs (`◆　◆　◆`, `* * *`, `---`) become scene breaks. Authors also mark scene changes with three or more blank lines, which models collapse; `tsundoku` therefore replaces each such gap with a `* * *` line before translating, so the break survives into the book. Dialogue made of punctuation, such as `「……」`, stays as text. Straight quotes and apostrophes are converted to curly ones (`"It's"` → `“It’s”`) and every three periods to an ellipsis (`...` → `…`), so every book uses one style even when the model mixed both. Japanese punctuation the model left in is converted too: `「」`/`『』` to curly quotes, `・・・` to `…`, a single `・` to a space between names or `·` elsewhere, `――` and `--` to `—`, and full-width `！？～` and digits to ASCII. The `.txt` files are left untouched. Each book has a title page, a table of contents (EPUB 3 nav plus NCX for older readers), and series metadata that Calibre and KOReader use to order volumes.
+Each non-empty line becomes a paragraph, consecutive lines starting with `- ` or a single `・` become a list, and lines made only of break glyphs (`◆　◆　◆`, `* * *`, `---`) become scene breaks. Authors also mark scene changes with three or more blank lines, which models collapse; `tsundoku` therefore replaces each such gap with a `* * *` line before translating, so the break survives into the book. Dialogue made of punctuation, such as `「……」`, stays as text. Straight quotes and apostrophes are converted to curly ones (`"It's"` → `“It’s”`) and every three periods to an ellipsis (`...` → `…`), so every book uses one style even when the model mixed both. Japanese punctuation the model left in is converted too: `「」`/`『』` to curly quotes, `・・・` to `…`, a single `・` to a space between names or `·` elsewhere, `――` and `--` to `—`, and full-width `！？～` and digits to ASCII. These conversions happen only in the book; the `.txt` files are left untouched (only `--rewrite-text`, below, rewrites them). Each book has a title page, a table of contents (EPUB 3 nav plus NCX for older readers), and series metadata that Calibre and KOReader use to order volumes.
 
-`tsundoku` keeps a `book.json` in the novel folder with the book title, original title, source URL, and each translated chapter's exact title and original title. `tsundoku-epub` uses it for headings (file names lose characters such as `?`) and for the EPUB's title, author, and source. `author` is never filled automatically; set it by hand (or later in Calibre). Edits to `title` and `author` are preserved; chapters translated before `book.json` existed fall back to their file names.
+`tsundoku` keeps a `book.json` in the novel folder with the book title, original title, source URL, and each translated chapter's exact title and original title. `tsundoku-epub` uses it for headings (file names lose characters such as `?`) and for the EPUB's title, author, and source. `author` is never filled automatically; set it by hand (or later in Calibre). Edits to `title` and `author` are preserved; chapters translated before `book.json` existed fall back to their file names. You can also add `honorifics` and `replacements` (see [Honorifics](#honorifics)).
 
 ```json
 {
@@ -339,6 +339,13 @@ Options:
 - `--title TEXT`: book title (defaults to `title` in `book.json`, then the folder name without its `[site: id]` prefix)
 - `--author TEXT`: author name for the metadata (defaults to `author` in `book.json`)
 - `-o, --output DIR`: output folder (default `<novel folder>/EPUB`)
+- `--rewrite-text`: before building, rewrite every chapter `.txt` from the raw translation in its chunk record, with the novel's honorific rule and `book.json` replacements applied (offline; no model is called)
+
+`--rewrite-text` applies an edited `honorifics` policy or `replacements` list to chapters already translated. The policy comes from `book.json`, else `[translation] honorifics` in your config file. For the `names-only` rule it reads the novel's name mapping from the names directory (`paths.names_directory`, found through the folder's `[site: id]` prefix); without it, it warns and keeps honorifics on every capitalised word, stripping only `cat-san`-style ones. A chapter translated before chunk records existed has no raw text yet: the first `--rewrite-text` saves its current `.txt` as its record, and later runs start from that, so the rules never compound (a replacement `Ruri` → `Ruri-chan` stays `Ruri-chan` however often you rewrite). Hand edits made to a `.txt` are replaced by the record's text; put lasting fixes in `replacements` instead. It prints how many chapters were rewritten, how many files changed and how many records were created:
+
+```bash
+tsundoku-epub --rewrite-text "[syosetu: n1234ab] Novel Title"
+```
 
 ## Name and Terminology Mapping
 

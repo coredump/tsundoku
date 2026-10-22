@@ -925,7 +925,7 @@ fn novel_output_rules(
     known_names: &[String],
 ) -> Result<Arc<OutputRules>> {
     let rules = book
-        .output_rules(translation_config.honorifics, known_names)
+        .output_rules(translation_config.honorifics, Some(known_names))
         .context("Invalid book.json replacements")?;
     Ok(Arc::new(rules))
 }

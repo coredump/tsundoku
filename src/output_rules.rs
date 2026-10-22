@@ -26,11 +26,15 @@ pub(crate) struct CompiledReplacement {
 }
 
 /// Everything [`postprocess`] needs for one novel.
+///
+/// The default rules keep honorifics, have no replacements and do not know the
+/// novel's names (as [`OutputRules::without_known_names`]).
 #[derive(Debug, Clone, Default)]
 pub struct OutputRules {
     policy: HonorificPolicy,
-    /// Known English name words (each name and each of its parts).
-    known_names: HashSet<String>,
+    /// Known English name words (each name and each of its parts); `None` when
+    /// the novel's names are unknown, so every capitalised word counts as a name.
+    known_names: Option<HashSet<String>>,
     replacements: Vec<CompiledReplacement>,
 }
 
@@ -61,7 +65,21 @@ impl OutputRules {
         }
         Ok(Self {
             policy,
-            known_names: names,
+            known_names: Some(names),
+            replacements: compile_replacements(replacements)?,
+        })
+    }
+
+    /// Build rules for a novel whose names are unknown: every capitalised word
+    /// counts as a name, so `names-only` strips honorifics after lowercase words
+    /// only (`cat-san`, but not `Village Chief-san`).
+    pub fn without_known_names(
+        policy: HonorificPolicy,
+        replacements: &[Replacement],
+    ) -> Result<Self, ReplacementError> {
+        Ok(Self {
+            policy,
+            known_names: None,
             replacements: compile_replacements(replacements)?,
         })
     }
@@ -73,7 +91,11 @@ impl OutputRules {
 
     /// Whether `word` (the token before an honorific) is a character name.
     fn is_name(&self, word: &str) -> bool {
-        word.starts_with(|c: char| c.is_ascii_uppercase()) && self.known_names.contains(word)
+        word.starts_with(|c: char| c.is_ascii_uppercase())
+            && self
+                .known_names
+                .as_ref()
+                .is_none_or(|names| names.contains(word))
     }
 }
 
@@ -254,6 +276,19 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.index, 1);
         assert!(error.to_string().contains("replacements[1]"));
+    }
+
+    #[test]
+    fn test_unknown_names_strip_only_after_lowercase_words() {
+        let rules = OutputRules::without_known_names(
+            HonorificPolicy::NamesOnly,
+            &[literal("Tatyuya", "Tatsuya")],
+        )
+        .unwrap();
+        assert_eq!(
+            postprocess("Tatyuya-kun fed the cat-san for Village Chief-san.", &rules),
+            "Tatsuya-kun fed the cat for Village Chief-san."
+        );
     }
 
     #[test]

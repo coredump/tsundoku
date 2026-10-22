@@ -11,9 +11,13 @@ use tokio::runtime::Runtime;
 use tsundoku::Console;
 use tsundoku::book::BookMetadata;
 use tsundoku::chapter_record::ChapterRecord;
+use tsundoku::config::Config;
 use tsundoku::epub::{
-    BookInfo, Volume, apply_chapter_titles, collect_chapters, plan_volumes, write_volume,
+    BookInfo, ChapterFile, Volume, apply_chapter_titles, collect_chapters, plan_volumes,
+    write_volume,
 };
+use tsundoku::name_mapping::{NameMappingStore, novel_file_path};
+use tsundoku::output_rules::{OutputRules, postprocess};
 use tsundoku::qa::IssueKind;
 
 /// Build EPUB volumes from the translated chapters in a Tsundoku novel folder.
@@ -40,6 +44,12 @@ struct Args {
     /// Output directory (defaults to `<novel_dir>/EPUB`).
     #[arg(long, short)]
     output: Option<PathBuf>,
+
+    /// Before building, rewrite every chapter `.txt` from the raw translation in
+    /// its chunk record, with the honorific policy and book.json replacements
+    /// applied. A chapter without a record first gets one holding its current text.
+    #[arg(long)]
+    rewrite_text: bool,
 
     /// Generate shell completions to stdout.
     #[arg(long, value_enum)]
@@ -83,17 +93,23 @@ fn main() -> Result<()> {
         );
     }
 
+    let console = Console::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("Failed to start the async runtime")?;
+    if args.rewrite_text {
+        let rules = rewrite_rules(&console, &folder_name, &metadata)?;
+        let summary = runtime.block_on(rewrite_chapter_texts(&novel_dir, &chapters, &rules))?;
+        console.success(&summary.describe());
+    }
+
     let output_dir = args.output.unwrap_or_else(|| novel_dir.join("EPUB"));
     std::fs::create_dir_all(&output_dir).with_context(|| {
         format!("Failed to create output folder: {}", output_dir.display())
     })?;
 
-    let console = Console::new();
     console.section(&format!("Building EPUB volumes for {}", book.title));
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("Failed to start the async runtime")?;
     let modified = SystemTime::now();
     for volume in plan_volumes(chapters, args.chapters_per_volume) {
         let path = output_dir.join(book.volume_file_name(&volume));
@@ -116,6 +132,152 @@ fn main() -> Result<()> {
         report_volume_qa(&console, &runtime, &novel_dir, &volume);
     }
     Ok(())
+}
+
+/// Output rules for `--rewrite-text`: the policy from book.json, else the config's
+/// `[translation] honorifics`; the novel's known English names; the book.json
+/// replacements. Without the novel's names file, every capitalised word counts as
+/// a name, so `names-only` strips honorifics after lowercase words only.
+fn rewrite_rules(
+    console: &Console,
+    folder_name: &str,
+    metadata: &BookMetadata,
+) -> Result<OutputRules> {
+    let config = load_config(console)?;
+    let names = match novel_key(folder_name) {
+        Some((module, novel_id)) => {
+            let names_dir = config.names_dir()?;
+            let names = known_names(&names_dir, module, novel_id)?;
+            if names.is_none() {
+                console.warning(&format!(
+                    "No name mapping for [{module}: {novel_id}] in {}; honorifics are kept on every capitalised word",
+                    names_dir.display()
+                ));
+            }
+            names
+        }
+        None => {
+            console.warning(
+                "Folder name has no `[module: id]` prefix, so the novel's names are unknown; honorifics are kept on every capitalised word",
+            );
+            None
+        }
+    };
+    metadata
+        .output_rules(config.translation.honorifics, names.as_deref())
+        .context("Invalid book.json replacements")
+}
+
+/// The user's config file, or the defaults when there is none (never creates one).
+fn load_config(console: &Console) -> Result<Config> {
+    let path = Config::config_path()?;
+    if !path.exists() {
+        return Ok(Config::default());
+    }
+    let config = Config::load_from(&path)
+        .with_context(|| format!("Failed to load configuration from {}", path.display()))?;
+    for key in &config.ignored_keys {
+        console.warning(&format!(
+            "Unknown config key `{key}` is ignored; check its spelling and section (keys are case-sensitive)"
+        ));
+    }
+    Ok(config)
+}
+
+/// `(module, novel id)` from a folder named `[module: id] Title`, the format
+/// `tsundoku` creates.
+fn novel_key(folder_name: &str) -> Option<(&str, &str)> {
+    let (key, _) = folder_name.strip_prefix('[')?.split_once(']')?;
+    let (module, novel_id) = key.split_once(": ")?;
+    (!module.is_empty() && !novel_id.is_empty()).then_some((module, novel_id))
+}
+
+/// Selected English renderings of the novel's names, from its mapping file in
+/// `names_dir`; `None` when there is no mapping file.
+fn known_names(names_dir: &Path, module: &str, novel_id: &str) -> Result<Option<Vec<String>>> {
+    let path = novel_file_path(names_dir, module, novel_id, ".json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let store = NameMappingStore::new(names_dir, module, novel_id)
+        .with_context(|| format!("Failed to load the name mapping {}", path.display()))?;
+    Ok(Some(
+        store
+            .known_mappings()
+            .names
+            .into_iter()
+            .map(|entry| entry.english)
+            .collect(),
+    ))
+}
+
+/// What `--rewrite-text` did.
+#[derive(Debug, Default, PartialEq)]
+struct RewriteSummary {
+    /// Chapters whose text was regenerated from their record.
+    rewritten: usize,
+    /// Records created from the current text of chapters that had none.
+    snapshots: usize,
+    /// Chapter files whose content changed.
+    changed: usize,
+}
+
+impl RewriteSummary {
+    fn describe(&self) -> String {
+        format!(
+            "Rewrote {} chapter(s) from their records: {} file(s) changed, {} record(s) created from existing text",
+            self.rewritten, self.changed, self.snapshots
+        )
+    }
+}
+
+/// Rewrite each chapter's `.txt` as `postprocess(record.raw_text())`.
+///
+/// A chapter without a record was translated before records existed: its current
+/// text is first saved as a legacy record (unknown source, no issues), so every
+/// later run starts from the same raw text and the rules never compound. Files
+/// whose text is unchanged are not written.
+async fn rewrite_chapter_texts(
+    novel_dir: &Path,
+    chapters: &[ChapterFile],
+    rules: &OutputRules,
+) -> Result<RewriteSummary> {
+    let mut summary = RewriteSummary::default();
+    for chapter in chapters {
+        let number = chapter.number;
+        let current = tokio::fs::read_to_string(&chapter.path)
+            .await
+            .with_context(|| format!("Failed to read {}", chapter.path.display()))?;
+        let record = match ChapterRecord::load(novel_dir, number)
+            .await
+            .with_context(|| format!("Failed to load the record of chapter {number}"))?
+        {
+            Some(record) => record,
+            None => {
+                let record = ChapterRecord::legacy(
+                    number,
+                    chapter.title.clone(),
+                    current.clone(),
+                    Vec::new(),
+                );
+                record
+                    .save(novel_dir)
+                    .await
+                    .with_context(|| format!("Failed to save the record of chapter {number}"))?;
+                summary.snapshots += 1;
+                record
+            }
+        };
+        let text = postprocess(&record.raw_text(), rules);
+        if text != current {
+            tokio::fs::write(&chapter.path, &text)
+                .await
+                .with_context(|| format!("Failed to write {}", chapter.path.display()))?;
+            summary.changed += 1;
+        }
+        summary.rewritten += 1;
+    }
+    Ok(summary)
 }
 
 /// Print the QA issue counts recorded in the chapter records of `volume`.
@@ -195,6 +357,149 @@ fn format_ranges(numbers: &[u32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+    use tsundoku::book::Replacement;
+    use tsundoku::chapter_record::{CHAPTER_RECORD_VERSION, ChunkRecord};
+    use tsundoku::honorifics::HonorificPolicy;
+    use tsundoku::name_mapping::NameEntry;
+
+    fn write_chapter(dir: &Path, file_name: &str, text: &str) {
+        std::fs::write(dir.join(file_name), text).unwrap();
+    }
+
+    fn chapters(dir: &Path) -> Vec<ChapterFile> {
+        collect_chapters(dir).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rewrite_regenerates_text_from_record_raw() {
+        let dir = TempDir::new().unwrap();
+        write_chapter(dir.path(), "0001 - Chapter 1: Cats.txt", "Edited by hand.");
+        let record = ChapterRecord {
+            version: CHAPTER_RECORD_VERSION,
+            chapter: 1,
+            title: "Chapter 1: Cats".to_string(),
+            chunks: ["Ruri fed the cat-san.", "Village Chief-san waved."]
+                .into_iter()
+                .map(|raw| ChunkRecord {
+                    source: Some("原文".to_string()),
+                    raw: raw.to_string(),
+                    issues: Vec::new(),
+                })
+                .collect(),
+        };
+        record.save(dir.path()).await.unwrap();
+        let rules = OutputRules::new(HonorificPolicy::NamesOnly, ["Ruri"], &[]).unwrap();
+
+        let summary = rewrite_chapter_texts(dir.path(), &chapters(dir.path()), &rules)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            summary,
+            RewriteSummary {
+                rewritten: 1,
+                snapshots: 0,
+                changed: 1,
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("0001 - Chapter 1: Cats.txt")).unwrap(),
+            "Ruri fed the cat.\n\nVillage Chief waved."
+        );
+        assert_eq!(
+            ChapterRecord::load(dir.path(), 1).await.unwrap(),
+            Some(record)
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_snapshots_chapters_without_a_record_once_and_never_compounds() {
+        let dir = TempDir::new().unwrap();
+        write_chapter(dir.path(), "0002 - Chapter 2: Waves.txt", "Ruri waved.");
+        // Records and stray text files under .tsundoku/ are not chapters.
+        std::fs::create_dir_all(dir.path().join(".tsundoku")).unwrap();
+        write_chapter(&dir.path().join(".tsundoku"), "0009 - Stray.txt", "Ruri.");
+        let book = BookMetadata {
+            replacements: vec![Replacement {
+                find: "Ruri".to_string(),
+                replace: "Ruri-chan".to_string(),
+                regex: false,
+            }],
+            ..BookMetadata::default()
+        };
+        let rules = book.output_rules(HonorificPolicy::Keep, None).unwrap();
+        let path = dir.path().join("0002 - Chapter 2: Waves.txt");
+
+        let first = rewrite_chapter_texts(dir.path(), &chapters(dir.path()), &rules)
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            RewriteSummary {
+                rewritten: 1,
+                snapshots: 1,
+                changed: 1,
+            }
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "Ruri-chan waved.");
+        let record = ChapterRecord::load(dir.path(), 2).await.unwrap().unwrap();
+        assert!(record.is_legacy());
+        assert_eq!(record.title, "Chapter 2: Waves");
+        assert_eq!(record.raw_text(), "Ruri waved.");
+
+        let second = rewrite_chapter_texts(dir.path(), &chapters(dir.path()), &rules)
+            .await
+            .unwrap();
+        assert_eq!(
+            second,
+            RewriteSummary {
+                rewritten: 1,
+                snapshots: 0,
+                changed: 0,
+            }
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "Ruri-chan waved.");
+        assert_eq!(
+            ChapterRecord::load(dir.path(), 2).await.unwrap(),
+            Some(record)
+        );
+        assert_eq!(chapters(dir.path()).len(), 1);
+        assert_eq!(ChapterRecord::load(dir.path(), 9).await.unwrap(), None);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".tsundoku/0009 - Stray.txt")).unwrap(),
+            "Ruri."
+        );
+    }
+
+    #[test]
+    fn novel_key_reads_the_folder_prefix() {
+        assert_eq!(
+            novel_key("[syosetu: n1234ab] Some Novel"),
+            Some(("syosetu", "n1234ab"))
+        );
+        assert_eq!(novel_key("[n1234ab] Old Format"), None);
+        assert_eq!(novel_key("Plain Folder"), None);
+    }
+
+    #[test]
+    fn known_names_come_from_the_mapping_file_when_present() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(known_names(dir.path(), "syosetu", "n1").unwrap(), None);
+
+        let mut store = NameMappingStore::new(dir.path(), "syosetu", "n1").unwrap();
+        store.record_votes(&[NameEntry {
+            original: "ルリ".to_string(),
+            english: "Ruri".to_string(),
+            ..NameEntry::default()
+        }]);
+        store.save().unwrap();
+
+        assert_eq!(
+            known_names(dir.path(), "syosetu", "n1").unwrap(),
+            Some(vec!["Ruri".to_string()])
+        );
+    }
 
     #[test]
     fn volume_qa_summary_lists_counts_and_unrecorded_chapters() {

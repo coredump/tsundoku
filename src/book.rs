@@ -77,20 +77,18 @@ impl BookMetadata {
 
     /// The novel's output rules: its honorific policy (falling back to
     /// `default_policy`), the known English name renderings and its replacements.
-    pub fn output_rules<I, S>(
+    /// With `known_names` `None` (the names are unknown), every capitalised word
+    /// counts as a name ([`OutputRules::without_known_names`]).
+    pub fn output_rules(
         &self,
         default_policy: HonorificPolicy,
-        known_names: I,
-    ) -> Result<OutputRules, ReplacementError>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        OutputRules::new(
-            self.honorific_policy(default_policy),
-            known_names,
-            &self.replacements,
-        )
+        known_names: Option<&[String]>,
+    ) -> Result<OutputRules, ReplacementError> {
+        let policy = self.honorific_policy(default_policy);
+        match known_names {
+            Some(names) => OutputRules::new(policy, names, &self.replacements),
+            None => OutputRules::without_known_names(policy, &self.replacements),
+        }
     }
 
     /// Load `book.json` from `novel_dir`, or `None` if the folder has none.
