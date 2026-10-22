@@ -91,6 +91,18 @@ editor_command = "kate"  # or "vim", "nano", "code", "notepad", etc.
 
 If not specified, Tsundoku will auto-detect a suitable editor based on your platform.
 
+#### Chunk Size
+
+Chapters are sent to the model in chunks. Sizes are counted in characters (not bytes), and chunks end at scene breaks (`◇◇◇`, `＊＊＊`, `* * *`, wide blank gaps) where possible. A scene longer than the limit is split into pieces of about equal size at paragraph boundaries, and an over-long paragraph at sentence ends.
+
+```toml
+[translation]
+chunk_size_chars = 1500  # default
+
+[name_scout]
+chunk_size_chars = 900   # default
+```
+
 ## Usage
 
 Download and translate a novel:

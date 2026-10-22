@@ -2,6 +2,7 @@
 
 use crate::error::TranslationError;
 use regex::Regex;
+use std::ops::Range;
 use std::sync::LazyLock;
 
 /// Regex for a leading chapter number such as `第三百九十話　　` or `第12章 `.
@@ -164,44 +165,238 @@ pub fn mark_scene_breaks(text: String) -> String {
     out
 }
 
-/// Splits text into chunks by lines, respecting a maximum chunk size.
+/// Glyphs that, alone on a line (with optional spaces), mark a scene change.
+const SCENE_BREAK_GLYPHS: [char; 23] = [
+    '◇', '◆', '○', '●', '□', '■', '☆', '★', '＊', '*', '※', '・', '―', '—', '－', 'ー', '〜', '~',
+    '＝', '=', '#', '♢', '♦',
+];
+
+/// Characters that end a sentence; a line is split after a run of them.
+const SENTENCE_END_CHARS: [char; 7] = ['。', '！', '？', '!', '?', '」', '』'];
+
+/// Returns whether `line` is a scene-break line such as `◇◇◇`, `＊＊＊` or the
+/// `* * *` marker from [`mark_scene_breaks`]: non-empty and made only of break glyphs
+/// and spaces.
+fn is_scene_break_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|c| c.is_whitespace() || SCENE_BREAK_GLYPHS.contains(&c))
+}
+
+/// Characters in `lens.len()` lines of the given lengths once joined with `"\n"`.
+fn joined_len(lens: &[usize]) -> usize {
+    lens.iter().sum::<usize>() + lens.len().saturating_sub(1)
+}
+
+/// A piece of text that [`split_into_scene_chunks`] packs into chunks.
+enum ChunkUnit {
+    /// Whole lines: a scene, or part of a scene too long for one chunk.
+    Lines {
+        range: Range<usize>,
+        starts_scene: bool,
+        ends_scene: bool,
+    },
+    /// Part of a single line too long for one chunk; always a chunk of its own.
+    LinePiece(String),
+}
+
+/// Splits text into chunks of at most `max_chars` characters, preferring scene breaks.
 ///
-/// This function splits text into chunks where each chunk is at most `chunk_size`
-/// characters. It prefers to split on line boundaries to maintain context.
+/// The text is cut into scenes at scene-break lines (the break line opens the next
+/// scene, so it is translated in context), and whole scenes are packed greedily into
+/// chunks. A scene longer than `max_chars` is split into the fewest pieces of roughly
+/// equal size at line boundaries; its first and last pieces may share a chunk with
+/// the neighbouring scenes. A single line longer than `max_chars` is split the same
+/// way at sentence ends, or at character boundaries if it has none.
 ///
-/// # Arguments
-/// * `text` - The text to split
-/// * `chunk_size` - Maximum size of each chunk in characters
-///
-/// # Returns
-/// A vector of text chunks, each no larger than `chunk_size` (unless a single line
-/// exceeds the limit, in which case that line becomes its own chunk).
-pub fn split_text_into_line_chunks(text: &str, chunk_size: usize) -> Vec<String> {
+/// Size is counted in characters, not bytes. Joining the chunks with `"\n"` gives back
+/// the input lines, except that an over-long line is spread over several chunks.
+pub fn split_into_scene_chunks(text: &str, max_chars: usize) -> Vec<String> {
+    let max_chars = max_chars.max(1);
     let lines: Vec<&str> = text.lines().collect();
-    let mut chunks: Vec<String> = Vec::new();
-    let mut current_chunk: Vec<&str> = Vec::new();
-    let mut current_size: usize = 0;
+    let lens: Vec<usize> = lines.iter().map(|line| line.chars().count()).collect();
 
-    for line in lines {
-        let line_size = line.len() + if current_chunk.is_empty() { 0 } else { 1 };
+    let mut scenes: Vec<Range<usize>> = Vec::new();
+    let mut start = 0;
+    for (i, line) in lines.iter().enumerate().skip(1) {
+        if is_scene_break_line(line) {
+            scenes.push(start..i);
+            start = i;
+        }
+    }
+    if !lines.is_empty() {
+        scenes.push(start..lines.len());
+    }
 
-        if current_size + line_size > chunk_size && !current_chunk.is_empty() {
-            // Push current chunk and start new one
-            chunks.push(current_chunk.join("\n"));
-            current_chunk = vec![line];
-            current_size = line.len();
+    let mut units = Vec::new();
+    for scene in scenes {
+        if joined_len(&lens[scene.clone()]) > max_chars {
+            split_oversized_scene(&lines, &lens, scene, max_chars, &mut units);
         } else {
-            current_chunk.push(line);
-            current_size += line_size;
+            units.push(ChunkUnit::Lines {
+                range: scene,
+                starts_scene: true,
+                ends_scene: true,
+            });
         }
     }
 
-    // Remember the last chunk
-    if !current_chunk.is_empty() {
-        chunks.push(current_chunk.join("\n"));
+    // Lines packed so far, and whether they end at a scene boundary.
+    let mut packed: Option<(Range<usize>, bool)> = None;
+    let mut chunks = Vec::new();
+    for unit in units {
+        match unit {
+            ChunkUnit::Lines {
+                range,
+                starts_scene,
+                ends_scene,
+            } => match packed.as_mut() {
+                Some((open, open_ends_scene))
+                    if (starts_scene || *open_ends_scene)
+                        && joined_len(&lens[open.start..range.end]) <= max_chars =>
+                {
+                    open.end = range.end;
+                    *open_ends_scene = ends_scene;
+                }
+                _ => {
+                    if let Some((open, _)) = packed.replace((range, ends_scene)) {
+                        chunks.push(lines[open].join("\n"));
+                    }
+                }
+            },
+            ChunkUnit::LinePiece(piece) => {
+                if let Some((open, _)) = packed.take() {
+                    chunks.push(lines[open].join("\n"));
+                }
+                chunks.push(piece);
+            }
+        }
     }
-
+    if let Some((open, _)) = packed {
+        chunks.push(lines[open].join("\n"));
+    }
     chunks
+}
+
+/// Splits the lines in `scene`, longer than `max_chars` in total, into balanced units
+/// at line boundaries; lines that alone exceed `max_chars` are split at sentence ends.
+fn split_oversized_scene(
+    lines: &[&str],
+    lens: &[usize],
+    scene: Range<usize>,
+    max_chars: usize,
+    units: &mut Vec<ChunkUnit>,
+) {
+    let push_run = |run: Range<usize>, units: &mut Vec<ChunkUnit>| {
+        for part in balanced_partition(&lens[run.clone()], 1, max_chars) {
+            let range = run.start + part.start..run.start + part.end;
+            units.push(ChunkUnit::Lines {
+                starts_scene: range.start == scene.start,
+                ends_scene: range.end == scene.end,
+                range,
+            });
+        }
+    };
+    let mut run_start = scene.start;
+    for i in scene.clone() {
+        if lens[i] > max_chars {
+            push_run(run_start..i, units);
+            split_long_line(lines[i], max_chars, units);
+            run_start = i + 1;
+        }
+    }
+    push_run(run_start..scene.end, units);
+}
+
+/// Splits a line longer than `max_chars` into balanced pieces at sentence ends,
+/// hard-splitting at character boundaries any sentence that is itself too long.
+fn split_long_line(line: &str, max_chars: usize, units: &mut Vec<ChunkUnit>) {
+    // Byte ranges of the pieces, each at most `max_chars` characters.
+    let mut pieces: Vec<Range<usize>> = Vec::new();
+    let mut lens: Vec<usize> = Vec::new();
+    let mut push_sentence = |sentence: Range<usize>| {
+        let text = &line[sentence.clone()];
+        let count = text.chars().count();
+        let parts = count.div_ceil(max_chars);
+        let mut char_starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+        char_starts.push(text.len());
+        for k in 0..parts {
+            let from = k * count / parts;
+            let to = (k + 1) * count / parts;
+            pieces.push(sentence.start + char_starts[from]..sentence.start + char_starts[to]);
+            lens.push(to - from);
+        }
+    };
+
+    let mut sentence_start = 0;
+    let mut chars = line.char_indices().peekable();
+    while let Some((_, c)) = chars.next() {
+        if let Some(&(next_index, next)) = chars.peek()
+            && SENTENCE_END_CHARS.contains(&c)
+            && !SENTENCE_END_CHARS.contains(&next)
+        {
+            push_sentence(sentence_start..next_index);
+            sentence_start = next_index;
+        }
+    }
+    push_sentence(sentence_start..line.len());
+
+    for part in balanced_partition(&lens, 0, max_chars) {
+        let bytes = pieces[part.start].start..pieces[part.end - 1].end;
+        units.push(ChunkUnit::LinePiece(line[bytes].to_string()));
+    }
+}
+
+/// Groups consecutive items into the fewest parts of roughly equal size whose joined
+/// length (items plus `sep` characters between neighbours) is at most `max_chars`.
+///
+/// Every item must be at most `max_chars` long. Each cut goes at the item boundary
+/// nearest an equal share of the total, without overfilling the part it closes.
+fn balanced_partition(lens: &[usize], sep: usize, max_chars: usize) -> Vec<Range<usize>> {
+    let count = lens.len();
+    if count == 0 {
+        return Vec::new();
+    }
+    // `offsets[i]` is where item `i` starts if every item is followed by `sep`, so a
+    // part `i..j` holds `offsets[j] - offsets[i] - sep` characters.
+    let mut offsets = Vec::with_capacity(count + 1);
+    offsets.push(0);
+    for &len in lens {
+        offsets.push(offsets[offsets.len() - 1] + len + sep);
+    }
+    let span = offsets[count];
+    let limit = max_chars + sep;
+
+    for parts in span.div_ceil(limit).max(1)..=count {
+        let mut bounds = vec![0];
+        for k in 1..parts {
+            let prev = bounds[k - 1];
+            let lo = prev + 1;
+            let fits = offsets.partition_point(|&offset| offset <= offsets[prev] + limit) - 1;
+            let hi = (count - (parts - k)).min(fits).max(lo);
+            let target = k * span / parts;
+            let after = offsets
+                .partition_point(|&offset| offset < target)
+                .clamp(lo, hi);
+            let before = after.saturating_sub(1).clamp(lo, hi);
+            let bound = if target.abs_diff(offsets[before]) <= target.abs_diff(offsets[after]) {
+                before
+            } else {
+                after
+            };
+            bounds.push(bound);
+        }
+        bounds.push(count);
+        if bounds
+            .windows(2)
+            .all(|pair| offsets[pair[1]] - offsets[pair[0]] <= limit)
+        {
+            return bounds.windows(2).map(|pair| pair[0]..pair[1]).collect();
+        }
+    }
+    (0..count).map(|i| i..i + 1).collect()
 }
 
 /// Checks if an HTTP response is successful, and if not, returns a detailed error.
@@ -296,53 +491,110 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_split_empty_text() {
-        let chunks = split_text_into_line_chunks("", 100);
-        assert_eq!(chunks.len(), 0);
+    fn char_len(chunk: &str) -> usize {
+        chunk.chars().count()
     }
 
     #[test]
-    fn test_split_single_line() {
-        let text = "Hello world";
-        let chunks = split_text_into_line_chunks(text, 100);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], text);
-    }
-
-    #[test]
-    fn test_split_multiple_lines_fits() {
-        let text = "Line 1\nLine 2\nLine 3";
-        let chunks = split_text_into_line_chunks(text, 100);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], text);
-    }
-
-    #[test]
-    fn test_split_multiple_chunks_needed() {
-        let text = "Line 1\nLine 2\nLine 3\nLine 4";
-        let chunks = split_text_into_line_chunks(text, 15);
-        // "Line 1\nLine 2" = 13 chars
-        // "Line 3\nLine 4" = 13 chars
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0], "Line 1\nLine 2");
-        assert_eq!(chunks[1], "Line 3\nLine 4");
-    }
-
-    #[test]
-    fn test_split_single_long_line() {
-        let text = "This is a very long line that exceeds the chunk size limit";
-        let chunks = split_text_into_line_chunks(text, 20);
-        // Should keep the whole line as one chunk even though it exceeds limit
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], text);
-    }
-
-    #[test]
-    fn test_split_with_empty_lines() {
+    fn test_scene_chunks_empty_and_small_text() {
+        assert!(split_into_scene_chunks("", 100).is_empty());
         let text = "Line 1\n\nLine 3";
-        let chunks = split_text_into_line_chunks(text, 100);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], text);
+        assert_eq!(split_into_scene_chunks(text, 100), vec![text]);
+    }
+
+    #[test]
+    fn test_scene_break_lines_are_recognised() {
+        for line in ["◇◇◇", "＊＊＊", "* * *", "　◆　◆　◆", "――――", "※"]
+        {
+            assert!(is_scene_break_line(line), "should be a break: {line}");
+        }
+        for line in ["「――」", "", "　", "◇彼は言った", "……"] {
+            assert!(!is_scene_break_line(line), "should not be a break: {line}");
+        }
+    }
+
+    #[test]
+    fn test_scene_chunks_pack_whole_scenes() {
+        let scene_one = "AAAAAAAAAA\nBBBBBBBBBB";
+        let scene_two = "◇◇◇\nCCCCCCCCCC";
+        let scene_three = "＊＊＊\nDDDDD";
+        let text = format!("{scene_one}\n{scene_two}\n{scene_three}");
+        assert_eq!(
+            split_into_scene_chunks(&text, 30),
+            vec![scene_one.to_string(), format!("{scene_two}\n{scene_three}")]
+        );
+    }
+
+    #[test]
+    fn test_oversized_scene_split_balanced_at_paragraphs() {
+        let lines: Vec<String> = (0..10).map(|i| format!("line{i:05}")).collect();
+        let chunks = split_into_scene_chunks(&lines.join("\n"), 60);
+        // Greedy filling would give 6 + 4 lines.
+        assert_eq!(chunks, vec![lines[..5].join("\n"), lines[5..].join("\n")]);
+    }
+
+    #[test]
+    fn test_short_scene_shares_chunk_with_split_neighbour() {
+        let lines: Vec<String> = (0..6).map(|i| format!("line{i:05}")).collect();
+        let text = format!("short\n◇◇◇\n{}", lines.join("\n"));
+        assert_eq!(
+            split_into_scene_chunks(&text, 40),
+            vec![
+                format!("short\n◇◇◇\n{}", lines[..3].join("\n")),
+                lines[3..].join("\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_oversized_line_split_at_sentence_ends() {
+        let line = "「はい。」と言った。".repeat(4);
+        let chunks = split_into_scene_chunks(&line, 25);
+        assert_eq!(chunks, vec!["「はい。」と言った。".repeat(2); 2]);
+
+        let line = "あいうえお。".repeat(5);
+        let chunks = split_into_scene_chunks(&line, 20);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.concat(), line);
+        for chunk in &chunks {
+            assert!(char_len(chunk) <= 20 && chunk.ends_with('。'), "{chunk}");
+        }
+    }
+
+    #[test]
+    fn test_line_without_sentence_end_is_hard_split() {
+        let line = "あ".repeat(25);
+        let chunks = split_into_scene_chunks(&line, 10);
+        let sizes: Vec<usize> = chunks.iter().map(|chunk| char_len(chunk)).collect();
+        assert_eq!(sizes, vec![8, 8, 9]);
+        assert_eq!(chunks.concat(), line);
+    }
+
+    #[test]
+    fn test_scene_chunks_count_characters_not_bytes() {
+        let text = format!("{}\n{}", "あ".repeat(10), "い".repeat(10));
+        assert_eq!(split_into_scene_chunks(&text, 21), vec![text.clone()]);
+        assert_eq!(split_into_scene_chunks(&text, 20).len(), 2);
+    }
+
+    #[test]
+    fn test_scene_chunks_round_trip_lines() {
+        let mut text = String::from("\n冒頭の一文。\n");
+        for scene in 0..6 {
+            text.push_str("\n* * *\n\n");
+            for paragraph in 0..(scene * 3 + 1) {
+                text.push_str(&format!("「場面{scene}の段落{paragraph}です。」\n\n"));
+            }
+        }
+        for max in [15, 40, 100, 1000] {
+            let chunks = split_into_scene_chunks(&text, max);
+            assert_eq!(
+                chunks.join("\n"),
+                text.lines().collect::<Vec<_>>().join("\n")
+            );
+            for chunk in &chunks {
+                assert!(char_len(chunk) <= max, "{max}: {chunk}");
+            }
+        }
     }
 }

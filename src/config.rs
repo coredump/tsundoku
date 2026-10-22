@@ -97,7 +97,8 @@ impl ApiConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TranslationConfig {
-    /// Maximum characters per translation chunk.
+    /// Maximum characters (not bytes) per translation chunk; chunks end at scene
+    /// breaks where possible.
     pub chunk_size_chars: usize,
 
     /// Number of retry attempts for failed translations.
@@ -121,7 +122,7 @@ pub struct TranslationConfig {
 impl Default for TranslationConfig {
     fn default() -> Self {
         Self {
-            chunk_size_chars: 4000,
+            chunk_size_chars: 1500,
             retries: 3,
             delay_between_requests_sec: 1.0,
             history_length: 5,
@@ -135,7 +136,8 @@ impl Default for TranslationConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NameScoutConfig {
-    /// Maximum characters per name scout chunk.
+    /// Maximum characters (not bytes) per name scout chunk; chunks end at scene
+    /// breaks where possible.
     pub chunk_size_chars: usize,
 
     /// Number of retry attempts.
@@ -157,7 +159,7 @@ pub struct NameScoutConfig {
 impl Default for NameScoutConfig {
     fn default() -> Self {
         Self {
-            chunk_size_chars: 2500,
+            chunk_size_chars: 900,
             retries: 3,
             delay_between_requests_sec: 1.0,
             request_timeout_sec: 300,
@@ -399,7 +401,8 @@ mod tests {
         assert!(!config.api.is_configured());
         assert!(config.scout_api.is_some());
         assert!(!config.scout_api.as_ref().unwrap().is_configured());
-        assert_eq!(config.translation.chunk_size_chars, 4000);
+        assert_eq!(config.translation.chunk_size_chars, 1500);
+        assert_eq!(config.name_scout.chunk_size_chars, 900);
         assert_eq!(config.translation.workers, 1);
         assert_eq!(config.name_scout.workers, 1);
         assert_eq!(config.name_scout.request_timeout_sec, 300);

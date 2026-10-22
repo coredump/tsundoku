@@ -543,10 +543,10 @@ impl NameScout {
         }
     }
 
-    /// Split text into chunks for processing.
+    /// Split text into chunks of at most `chunk_size_chars` characters, preferring
+    /// scene breaks.
     fn split_into_chunks(&self, text: &str) -> Vec<String> {
-        let chunk_size = self.scout_config.chunk_size_chars;
-        crate::utils::split_text_into_line_chunks(text, chunk_size)
+        crate::utils::split_into_scene_chunks(text, self.scout_config.chunk_size_chars)
     }
 
     /// Call the LLM model to extract names.
@@ -941,7 +941,7 @@ I hope this helps!"#;
 
         assert!(chunks.len() > 1);
         for chunk in &chunks {
-            assert!(chunk.len() <= 60); // Allow some leeway for line boundaries
+            assert!(chunk.chars().count() <= 50, "{chunk}");
         }
     }
 

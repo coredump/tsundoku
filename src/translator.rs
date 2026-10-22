@@ -299,45 +299,10 @@ impl Translator {
         prompt
     }
 
-    /// Split text into chunks that fit within the configured size limit.
+    /// Split text into chunks of at most `chunk_size_chars` characters, preferring
+    /// scene breaks.
     fn split_text_into_chunks(&self, text: &str) -> Vec<String> {
-        let chunk_size = self.translation_config.chunk_size_chars;
-
-        // Phase 1: Line-based chunking
-        let chunks = crate::utils::split_text_into_line_chunks(text, chunk_size);
-
-        // Phase 2: Word-based splitting for oversized chunks
-        let mut final_chunks: Vec<String> = Vec::new();
-
-        for chunk in chunks {
-            if chunk.len() <= chunk_size {
-                final_chunks.push(chunk);
-            } else {
-                // Split by whitespace (for Japanese, this mainly handles mixed content)
-                let words: Vec<&str> = chunk.split_whitespace().collect();
-                let mut current_chunk: Vec<&str> = Vec::new();
-                let mut current_size: usize = 0;
-
-                for word in words {
-                    let word_size = word.len() + if current_chunk.is_empty() { 0 } else { 1 };
-
-                    if current_size + word_size > chunk_size && !current_chunk.is_empty() {
-                        final_chunks.push(current_chunk.join(" "));
-                        current_chunk = vec![word];
-                        current_size = word.len();
-                    } else {
-                        current_chunk.push(word);
-                        current_size += word_size;
-                    }
-                }
-
-                if !current_chunk.is_empty() {
-                    final_chunks.push(current_chunk.join(" "));
-                }
-            }
-        }
-
-        final_chunks
+        crate::utils::split_into_scene_chunks(text, self.translation_config.chunk_size_chars)
     }
 
     /// Translate one request, retrying up to the configured number of attempts.
@@ -777,8 +742,7 @@ mod tests {
         let chunks = translator.split_text_into_chunks(text);
         assert!(chunks.len() > 1);
         for chunk in &chunks {
-            // Each chunk should be at most chunk_size_chars (approximately, due to line boundaries)
-            assert!(chunk.len() <= 30); // Allow some leeway for line-based splitting
+            assert!(chunk.chars().count() <= 20, "{chunk}");
         }
     }
 

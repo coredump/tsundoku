@@ -84,7 +84,7 @@ Optional separate API for name scouting (falls back to [API] if not set):
 
 #### [Translation] Section
 Translation behavior configuration:
-- `chunk_size_chars`: Maximum UTF-8 bytes per source chunk (default: "4000", integer)
+- `chunk_size_chars`: Maximum characters (not bytes) per source chunk; chunks end at scene breaks where possible (default: "1500", integer)
 - `retries`: Number of retry attempts for failed translations (default: "3", integer)
 - `delay_between_requests_sec`: Delay between API requests (default: "1", float)
 - `history_length`: Number of message pairs to retain in conversation history (default: "5", integer)
@@ -92,7 +92,7 @@ Translation behavior configuration:
 
 #### [NameScout] Section
 Name and terminology extraction configuration:
-- `chunk_size_chars`: Maximum UTF-8 bytes per mapping scout chunk (default: "2500", integer)
+- `chunk_size_chars`: Maximum characters (not bytes) per mapping scout chunk; chunks end at scene breaks where possible (default: "900", integer)
 - `retries`: Number of retry attempts (default: "3", integer)
 - `delay_between_requests_sec`: Delay between requests (default: "1", float)
 - `json_retries`: Number of JSON parsing retry attempts (default: "3", integer)
@@ -475,7 +475,7 @@ const REFUSAL_PHRASES: &[&str] = &[
 3. **Content Translation** (is_title=False):
    - Add canonical glossary entries present in the name-substituted text to content_translation_prompt, overrides first, then by vote count
    - Initialize message history with that system message
-   - Split text into chunks using `_split_text_into_chunks`
+   - Split text into chunks using `split_text_into_chunks`
    - For each chunk, with the shared retry logic:
      - Display preparing status before API call
      - Call `_translate_single_chunk` with progress info
@@ -486,36 +486,15 @@ const REFUSAL_PHRASES: &[&str] = &[
    - Join translated chunks with "\n\n"
    - Return result
 
-**Text Chunking Algorithm** (`split_text_into_chunks`):
+**Text Chunking Algorithm** (`utils::split_into_scene_chunks`, used by both `split_text_into_chunks` and the name scout):
 
-Phase 1 - Line-based chunking:
-1. Split text by `"\n"` into lines
-2. Initialize: `chunks: Vec<String>`, `current_chunk: Vec<&str>`, `current_size: usize = 0`
-3. For each line:
-   - Calculate `line_size = line.len() + if current_chunk.is_empty() { 0 } else { 1 }`
-   - If `current_size + line_size > chunk_size` AND `!current_chunk.is_empty()`:
-     - Push `current_chunk.join("\n")` to chunks
-     - Start new chunk with current line
-   - Else:
-     - Push line to current_chunk
-     - Add line_size to current_size
-4. Push remaining current_chunk to chunks if not empty
+Sizes are counted in characters (`chars().count()`); a chunk's size includes the `"\n"` between its lines.
 
-Phase 2 - Word-based splitting for oversized chunks:
-1. For each chunk from phase 1:
-   - If `chunk.len() <= chunk_size`: push to final_chunks
-   - Else: split by whitespace (word boundaries)
-     - Initialize: `current_chunk: Vec<&str>`, `current_size: usize = 0`
-     - For each word:
-       - Calculate `word_size = word.len() + if current_chunk.is_empty() { 0 } else { 1 }`
-       - If `current_size + word_size > chunk_size` AND `!current_chunk.is_empty()`:
-         - Push `current_chunk.join(" ")` to final_chunks
-         - Start new chunk with current word
-       - Else:
-         - Push word to current_chunk
-         - Add word_size to current_size
-     - Push remaining current_chunk to final_chunks
-2. Return final_chunks
+1. Split text into lines (`str::lines`) and the lines into scenes. A scene-break line is non-empty after trimming and made only of the glyphs `◇◆○●□■☆★＊*※・―—－ー〜~＝=#♢♦` and whitespace (this includes the `* * *` marker from `mark_scene_breaks`). A break line opens the next scene, so it is translated in context and kept in the output. `「――」` is not a break.
+2. Pack whole scenes greedily: add the next scene to the current chunk while the total stays ≤ `chunk_size_chars`, otherwise start a new chunk.
+3. A scene longer than `chunk_size_chars` is split at line boundaries into the fewest pieces that fit, starting from `n = ceil(len / chunk_size_chars)`. Each cut goes at the line boundary nearest `k × len / n` without overfilling the piece it closes; if the last piece still overflows, `n` grows by one. Its first piece may join the chunk of the preceding scenes and its last piece the following scenes (same greedy rule); its inner pieces are chunks of their own.
+4. A line longer than `chunk_size_chars` becomes its own chunk(s): it is split into sentences after a run of `。！？!?」』` that is followed by more text (any sentence still too long is cut into equal character pieces) and the sentences are grouped the same balanced way. Splits never fall inside a UTF-8 character.
+5. Joining all chunks with `"\n"` gives back the input lines, blank lines included; only an over-long line is spread over several chunks.
 
 **Single Chunk Translation** (`translate_single_chunk`):
 
