@@ -159,7 +159,7 @@ The policy works in three places:
 - **In the prompt**, one line tells the model the policy.
 - **After translating**, the chapter `.txt` gets the policy's output rule: `names-only` removes honorifics from lowercase words and from words that are not a known English name (`cat-san` → `cat`, `Village Chief-san` → `Village Chief`); `drop` removes every one; `keep` changes nothing. The chunk record keeps the model's raw output, so the rules are always applied to the raw text and never compound, and `tsundoku-epub --rewrite-text` can re-apply them to chapters already translated (see [Building EPUBs](#building-epubs)).
 
-A novel's `book.json` can override the policy and add its own find/replace rules, applied in order to the translated text after the honorific rule:
+A novel's `book.json` can override the policy and add its own find/replace rules, applied in order to the translated text before the honorific rule (so a spelling fix such as `Tatyuya` → `Tatsuya` makes the name known and `names-only` keeps its `-san`):
 
 ```json
 {

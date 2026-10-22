@@ -142,13 +142,24 @@ pub(crate) fn compile_replacements(
         .collect()
 }
 
-/// Apply honorific rules, then user replacements in order, to raw model output.
+/// Apply user replacements in order, then honorific rules, to raw model output.
+///
+/// Replacements run first so a spelling fix (`Tatyuya` → `Tatsuya`) turns a
+/// misspelled name into a known one before `names-only` decides whether its
+/// honorific stays.
 pub fn postprocess(raw: &str, rules: &OutputRules) -> String {
-    let mut text = match rules.policy {
-        HonorificPolicy::Keep => raw.to_string(),
-        HonorificPolicy::Drop => ENGLISH_HONORIFIC.replace_all(raw, "$1").into_owned(),
+    let mut text = raw.to_string();
+    for replacement in &rules.replacements {
+        text = replacement
+            .pattern
+            .replace_all(&text, replacement.replace.as_str())
+            .into_owned();
+    }
+    match rules.policy {
+        HonorificPolicy::Keep => text,
+        HonorificPolicy::Drop => ENGLISH_HONORIFIC.replace_all(&text, "$1").into_owned(),
         HonorificPolicy::NamesOnly => ENGLISH_HONORIFIC
-            .replace_all(raw, |caps: &Captures| {
+            .replace_all(&text, |caps: &Captures| {
                 if rules.is_name(&caps[1]) {
                     caps[0].to_string()
                 } else {
@@ -156,14 +167,7 @@ pub fn postprocess(raw: &str, rules: &OutputRules) -> String {
                 }
             })
             .into_owned(),
-    };
-    for replacement in &rules.replacements {
-        text = replacement
-            .pattern
-            .replace_all(&text, replacement.replace.as_str())
-            .into_owned();
     }
-    text
 }
 
 /// Honorifics attached to something other than a known name (`cat-san`,
@@ -249,6 +253,20 @@ mod tests {
         assert_eq!(
             postprocess("the Chief Inspector came", &rules),
             "the Section Chief (Inspector) came"
+        );
+    }
+
+    #[test]
+    fn test_spelling_fix_runs_before_names_only_strip() {
+        let rules = OutputRules::new(
+            HonorificPolicy::NamesOnly,
+            ["Tatsuya"],
+            &[literal("Tatyuya", "Tatsuya")],
+        )
+        .unwrap();
+        assert_eq!(
+            postprocess("Tatyuya-san waved at the dog-san.", &rules),
+            "Tatsuya-san waved at the dog."
         );
     }
 
