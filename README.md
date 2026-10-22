@@ -82,7 +82,7 @@ model = "gpt-4o-mini"
 
 #### Sampling
 
-Tsundoku sends no sampling settings unless you set them, so the server's defaults apply (llama-server takes them from the model file when it has them; check `/props`). Set them per API, so the scout can run cooler than the translator:
+Tsundoku sends no sampling settings unless you set them, so the server's defaults apply (llama-server reports the ones in effect at `/props`). Set them per API, so the scout can run cooler than the translator:
 
 ```toml
 [api.sampling]

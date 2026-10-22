@@ -1049,6 +1049,38 @@ mod tests {
     use crate::honorifics::HonorificPolicy;
     use crate::name_mapping::Gender;
 
+    #[test]
+    fn test_request_sends_only_configured_sampling() {
+        let messages = Vec::new();
+        let unset = SamplingParams::default();
+        let body = serde_json::to_value(ChatRequest {
+            model: "m".to_string(),
+            messages: messages.clone(),
+            stream: true,
+            max_tokens: None,
+            sampling: &unset,
+        })
+        .unwrap();
+        assert_eq!(body, serde_json::json!({"model": "m", "messages": [], "stream": true}));
+
+        let set = SamplingParams {
+            temperature: Some(0.5),
+            seed: Some(4),
+            ..SamplingParams::default()
+        };
+        let body = serde_json::to_value(ChatRequest {
+            model: "m".to_string(),
+            messages,
+            stream: true,
+            max_tokens: None,
+            sampling: &set,
+        })
+        .unwrap();
+        assert_eq!(body["temperature"], serde_json::json!(0.5));
+        assert_eq!(body["seed"], serde_json::json!(4));
+        assert!(body.get("top_k").is_none());
+    }
+
     fn make_translator() -> Translator {
         Translator::new(
             ApiConfig::default(),
