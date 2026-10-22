@@ -53,8 +53,9 @@ pub struct ChapterFile {
 
 /// Collect translated chapters (`NNNN - Title.txt`) directly inside `novel_dir`.
 ///
-/// Subfolders such as `Original/` are ignored. Chapters are sorted by number; if two
-/// files share a number, the first by file name is kept.
+/// Subfolders such as `Original/` and `.tsundoku/` (chapter records) are ignored.
+/// Chapters are sorted by number; if two files share a number, the first by file
+/// name is kept.
 pub fn collect_chapters(novel_dir: &Path) -> Result<Vec<ChapterFile>, EpubError> {
     let mut chapters = Vec::new();
     for entry in fs::read_dir(novel_dir)? {
@@ -754,6 +755,7 @@ mod tests {
     fn test_collect_chapters_ignores_originals_and_sorts_numerically() {
         let dir = TempDir::new().unwrap();
         std::fs::create_dir(dir.path().join("Original")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".tsundoku/chunks")).unwrap();
         for name in [
             "1000 - Late.txt",
             "999 - Legacy padding.txt",
@@ -761,6 +763,8 @@ mod tests {
             "notes.txt",
             "oneshot.txt",
             "Original/0001 - 原文.txt",
+            ".tsundoku/chunks/1.json",
+            ".tsundoku/chunks/0001 - Record.txt",
         ] {
             std::fs::write(dir.path().join(name), "text").unwrap();
         }

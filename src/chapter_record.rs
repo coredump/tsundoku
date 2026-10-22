@@ -7,6 +7,7 @@
 
 use crate::error::ChapterRecordError;
 use crate::qa::{Issue, IssueClass, IssueKind};
+use crate::translator::ChunkResult;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -40,6 +41,16 @@ pub struct ChunkRecord {
     pub raw: String,
     /// Problems found in this chunk.
     pub issues: Vec<Issue>,
+}
+
+impl From<ChunkResult> for ChunkRecord {
+    fn from(result: ChunkResult) -> Self {
+        Self {
+            source: Some(result.source),
+            raw: result.output,
+            issues: result.issues,
+        }
+    }
 }
 
 /// How a record compares with the chunks the current source would produce.

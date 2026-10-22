@@ -152,6 +152,7 @@ tsundoku https://ncode.syosetu.com/n1234ab/
 - `--end N`: Stop downloading at chapter N (1-based, inclusive)
 - `--no-name-pause`: Skip manual name mapping review pause
 - `--debug`: Enable scraper debug logging
+- `--recheck KINDS`: Re-translate already translated chapters whose chunk record matches KINDS (see [Rechecking Translations](#rechecking-translations))
 
 ### Examples
 
@@ -165,6 +166,12 @@ Download without pausing for name review:
 
 ```bash
 tsundoku --no-name-pause https://kakuyomu.jp/works/1234567890
+```
+
+Re-translate the chunks of chapters 1-50 that missed a glossary term or misspelled a name:
+
+```bash
+tsundoku --recheck glossary,names --end 50 https://ncode.syosetu.com/n1234ab/
 ```
 
 ### Pixiv Login Cookies
@@ -220,9 +227,24 @@ This means you can:
 - Stop and restart the program at any time
 - Re-run the same command to continue where you left off
 - Add new chapters to an existing series by running with a wider `--end` range
-- Retry failed translations without redoing successful ones
+- Redo only the parts that went wrong with `--recheck`, without redoing successful ones
 
 Simply run the same command again, and Tsundoku will intelligently skip completed work.
+
+### Rechecking Translations
+
+Each translated chapter has a chunk record in `.tsundoku/chunks/<number>.json` inside the novel folder: for every chunk, the exact text sent to the model, the model's reply, and the [quality issues](#quality-checks) it was kept with. The chapter's `.txt` is the replies joined by blank lines.
+
+`--recheck KINDS` re-translates already translated chapters in the `--start`/`--end` range, after the usual download and scouting. KINDS is a comma list of issue classes (`failed`, `truncated`, `foreign`, `glossary`, `names`, `paragraphs`, `length`, `repetition`, `honorifics`), `all` for every class, and `stale` for chunks whose input changed since they were translated, for example after you edited a name mapping or override. Chapters not yet translated are translated as usual.
+
+- Only the matching chunks are sent again, with the chunks before them as context; the others keep their translation, and the title is kept.
+- With `stale`, a chapter whose chunk count changed is re-translated whole.
+- Chapters translated before chunk records existed are checked as a whole on their first recheck and get a one-chunk record without a source. If they match KINDS they are re-translated whole; `stale` cannot judge them and they are counted as skipped in the summary.
+- A re-translated chapter whose title changed replaces its old `.txt`.
+
+A summary at the end lists how many chapters were checked, re-translated, and skipped.
+
+**Never run `--recheck` while another tsundoku process is translating the same novel**: both would write the same chapter files and records.
 
 ### Output Structure
 
@@ -235,7 +257,9 @@ Multi-chapter novels:
 │   └── ...
 ├── 001 - Chapter 1 Title.txt
 ├── 002 - Chapter 2 Title.txt
-└── ...
+├── ...
+├── book.json
+└── .tsundoku/chunks/     # chunk records: 1.json, 2.json, …
 ```
 
 One-shot stories:
@@ -347,7 +371,7 @@ All-katakana names are substituted only as whole katakana words, so a name `ロ�
 
 The scout also sees the renderings already chosen for any names and terms that appear in the chunk it is reading, and is told to reuse them. That keeps it from romanizing the same name differently in every chapter. Changing an `override` therefore also steers later scouting toward that rendering.
 
-To apply changed mappings to an already translated chapter, delete that chapter's translated output file before rerunning Tsundoku.
+To apply changed mappings to already translated chapters, run `tsundoku --recheck stale` (see [Rechecking Translations](#rechecking-translations)).
 
 ### Chapter Summaries
 

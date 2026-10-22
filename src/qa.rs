@@ -40,6 +40,30 @@ pub enum IssueKind {
     HonorificOnNoun,
 }
 
+impl IssueKind {
+    /// The `snake_case` name used in chapter records (`name_near_miss`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IssueKind::Failed => "failed",
+            IssueKind::Truncated => "truncated",
+            IssueKind::ForeignScript => "foreign_script",
+            IssueKind::GlossaryMissing => "glossary_missing",
+            IssueKind::NameMissing => "name_missing",
+            IssueKind::NameNearMiss => "name_near_miss",
+            IssueKind::ParagraphMismatch => "paragraph_mismatch",
+            IssueKind::LengthRatio => "length_ratio",
+            IssueKind::Repetition => "repetition",
+            IssueKind::HonorificOnNoun => "honorific_on_noun",
+        }
+    }
+}
+
+impl fmt::Display for IssueKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One problem found in a translated chunk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Issue {
@@ -530,6 +554,27 @@ mod tests {
             known_names: known,
         };
         check_chunk(&ctx, output, &QaConfig::default())
+    }
+
+    #[test]
+    fn test_issue_kind_names_match_serialized_names() {
+        for kind in [
+            IssueKind::Failed,
+            IssueKind::Truncated,
+            IssueKind::ForeignScript,
+            IssueKind::GlossaryMissing,
+            IssueKind::NameMissing,
+            IssueKind::NameNearMiss,
+            IssueKind::ParagraphMismatch,
+            IssueKind::LengthRatio,
+            IssueKind::Repetition,
+            IssueKind::HonorificOnNoun,
+        ] {
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::Value::from(kind.to_string())
+            );
+        }
     }
 
     #[test]

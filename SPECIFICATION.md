@@ -851,12 +851,14 @@ A chapter is covered once its key exists (possibly with an empty synopsis). Chun
 - `--start N`: Start downloading from chapter N (1-based, integer >= 1)
 - `--end N`: Stop downloading at chapter N (1-based, inclusive, integer >= 1)
 - `--no-name-pause`: Skip manual name mapping review pause
+- `--recheck KINDS`: Comma list of `all` (every issue class), `stale`, and issue classes (`failed`, `truncated`, `foreign`, `glossary`, `names`, `paragraphs`, `length`, `repetition`, `honorifics`); re-translates matching chunks of already translated chapters (see Translation Phase). Conflicts with `--scout-only`
 
 **Validation**:
 - Range values must be positive integers
 - Start cannot exceed end
 - Start/end cannot exceed total chapter count
 - Start/end cannot be used with one-shot stories
+- `--recheck` cannot be used with one-shot stories
 
 **Argument Parsing Implementation**:
 Uses `clap` crate with derive macros for argument parsing:
@@ -976,7 +978,8 @@ For stories where chapter_list == "ONESHOT":
 5. **Translate Content**:
    - Check if `oneshot.txt` exists
    - If not:
-     - Render the translation input with `render_translation_input` (`ruby::for_translation` → name substitution → `mark_scene_breaks`)
+     - Render the translation input with `render_translation_input`, which returns `TranslationInput { rendered, mapped }`: `rendered` is `ruby::for_translation(original)` (the cast is matched against it) and `mapped` is `rendered` after name substitution and `mark_scene_breaks`, exactly what the model is sent
+     - Build the prompt with `chapter_prompt_context(.., &rendered, &mapped)`
      - Call `translator.translate_content()` with the known English name renderings and progress info and write the chunk outputs joined with "\n\n"
      - Save as UTF-8
    - Display success/failure message
@@ -1016,19 +1019,26 @@ For stories with chapter list:
    - Same as one-shot review process
 
 5. **Translation Phase**:
+   - Index translated chapters with `epub::collect_chapters` (files `N - Title.txt` directly in the story folder, any padding; `Original/` and `.tsundoku/` are ignored)
+   - Known names: the English renderings of `NameMappingStore::known_mappings().names`
    - For each downloaded chapter:
-     - Check if translation already exists (glob `{chapter_num_str} - *.txt`)
-     - If exists: skip
-     - If not:
-       - Translate title with `translate_and_validate_title_filepath()`:
-         - Apply name mapping to title source
-         - Translate with retries
-         - Validate: no newlines, valid filesystem path
-         - On repeated failure: use original title + "[TRANSLATION_FAILED]"
-       - Apply name mapping to chapter content
-       - Translate content with progress info
-       - Save as UTF-8 to translated filepath
-       - Display success/failure message
+     - Not translated yet: translate it whole (below)
+     - Translated, no `--recheck`: skip
+     - Translated, with `--recheck`: plan a recheck (below); skip if nothing matches
+   - Every chapter to translate or recheck: render the input with `render_translation_input` (the single translation input pipeline, shared with one-shots and the recheck checks) and build its prompt once with `chapter_prompt_context`
+   - Whole chapter:
+     - Translate the title: apply name mapping, strip the author's chapter number, translate, and head it `Chapter N: …` (`Chapter N` for an empty title)
+     - Translate content with `translate_content` and build a `ChapterRecord` (one `ChunkRecord { source, raw: output, issues }` per chunk)
+   - Save each finished chapter: write the record to `.tsundoku/chunks/{N}.json`, then the `.txt` from `record.raw_text()` (the raw outputs joined with "\n\n"), then remove the file it replaces if the file name changed (`tsundoku-epub` keeps only the first file per number); update `book.json`; print one warning per issue of the chunks just translated
+   - Display success/failure message
+
+6. **Recheck planning** (`--recheck`), per translated chapter:
+   - No record (legacy chapter): read the `.txt`, run `qa::check_chunk` on the whole text against the whole rendered input (`mapped`), the glossary of the chapter's prompt and the known names, and save `ChapterRecord::legacy` (one chunk, `source: null`, title from `book.json` or the file name)
+   - Legacy record: re-translate the whole chapter if any issue matches the requested classes; `stale` cannot compare it and it is counted as skipped
+   - Normal record: flag chunks with an issue in the requested classes; with `stale`, compare `split_text_into_chunks(mapped)` with the record (`Staleness`): changed chunks are flagged, a different chunk count re-translates the whole chapter
+   - Flagged chunks of a normal record: build one `ChunkPlan` per recorded chunk (`Translate` with the current source when the chunk count is unchanged, else the recorded source; `Keep { source, raw }` for the rest), translate with `translate_chunks`, splice the results into the record, keep the title, and save as above
+   - Print a summary at the end: chapters checked, re-translated whole and in part (and chunk count), legacy chapters recorded, and legacy chapters skipped for `stale`
+   - Must not run while another process translates the same novel (both write the same files)
 
 ### Filename Sanitization
 

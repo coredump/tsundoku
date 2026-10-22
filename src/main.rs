@@ -4,26 +4,29 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
 use futures::{StreamExt, stream};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 use tokio::sync::{Mutex, mpsc};
 use tsundoku::book::{BookMetadata, ChapterMetadata};
+use tsundoku::chapter_record::{CHAPTER_RECORD_VERSION, ChapterRecord, ChunkRecord, Staleness};
 use tsundoku::config::{Config, TranslationConfig};
 use tsundoku::console::{Console, Style};
-use tsundoku::epub::BookInfo;
-use tsundoku::name_mapping::{KnownMappings, NameMappingStore};
+use tsundoku::epub::{BookInfo, ChapterFile, collect_chapters};
+use tsundoku::name_mapping::{KnownMappings, NameMappingStore, TermEntry};
 use tsundoku::name_scout::{
     NameScout, NameScoutEvent, NameScoutProgress, NameScoutStatus, ScoutChunk, ScoutProgressInfo,
     build_chapter_payload,
 };
+use tsundoku::qa::{self, ChunkContext, Issue, IssueClass, QaConfig};
 use tsundoku::ruby;
 use tsundoku::scrapers::{ChapterInfo, ChapterList, ScraperRegistry};
 use tsundoku::summaries::{SummaryStore, chapter_synopsis};
 use tsundoku::translator::{
-    ChunkResult, ProgressInfo, PromptContext, TranslationProgress, TranslationStage, Translator,
+    ChunkPlan, ChunkResult, ProgressInfo, PromptContext, TranslationProgress, TranslationStage,
+    Translator,
 };
 use tsundoku::utils::{mark_scene_breaks, strip_chapter_number};
 
@@ -77,6 +80,73 @@ struct Args {
     /// Enable debug logging for scrapers.
     #[arg(long)]
     debug: bool,
+
+    /// Re-translate chapters in the --start/--end range whose chapter record matches
+    /// KINDS, a comma list of: `all` (every issue class), `stale` (the text sent to
+    /// the model has changed since, e.g. after a name mapping edit), or issue classes
+    /// `failed`, `truncated`, `foreign`, `glossary`, `names`, `paragraphs`, `length`,
+    /// `repetition`, `honorifics`. Only flagged chunks are re-translated. Never run it
+    /// while another tsundoku process is translating the same novel.
+    #[arg(
+        long,
+        value_name = "KINDS",
+        value_delimiter = ',',
+        value_parser = parse_recheck_kind,
+        conflicts_with = "scout_only"
+    )]
+    recheck: Option<Vec<RecheckKind>>,
+}
+
+/// One item of the `--recheck` list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecheckKind {
+    /// Every issue class.
+    All,
+    /// Chunks whose current source differs from the recorded one.
+    Stale,
+    /// Chunks with an issue of this class.
+    Class(IssueClass),
+}
+
+/// Parse one `--recheck` item.
+fn parse_recheck_kind(value: &str) -> Result<RecheckKind, String> {
+    match value.trim() {
+        "all" => Ok(RecheckKind::All),
+        "stale" => Ok(RecheckKind::Stale),
+        other => other
+            .parse()
+            .map(RecheckKind::Class)
+            .map_err(|error: String| format!("{error}, or `all` or `stale`")),
+    }
+}
+
+/// What `--recheck` re-translates in already translated chapters.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Recheck {
+    /// Chunks with an issue in one of these classes.
+    classes: Vec<IssueClass>,
+    /// Chunks whose source changed since they were translated.
+    stale: bool,
+}
+
+impl Recheck {
+    fn from_kinds(kinds: &[RecheckKind]) -> Self {
+        let mut recheck = Self::default();
+        let mut add = |class: IssueClass| {
+            if !recheck.classes.contains(&class) {
+                recheck.classes.push(class);
+            }
+        };
+        for kind in kinds {
+            match *kind {
+                RecheckKind::All => IssueClass::ALL.into_iter().for_each(&mut add),
+                RecheckKind::Class(class) => add(class),
+                RecheckKind::Stale => {}
+            }
+        }
+        recheck.stale = kinds.contains(&RecheckKind::Stale);
+        recheck
+    }
 }
 
 /// Downloaded chapter data.
@@ -102,6 +172,8 @@ struct ProcessParams<'a> {
     no_name_scout: bool,
     scout_only: bool,
     name_scout_limit: Option<u32>,
+    /// `--recheck` selection, if given.
+    recheck: Option<Recheck>,
     config: &'a Config,
 }
 
@@ -208,6 +280,10 @@ async fn main() -> Result<()> {
     // Validate chapter range
     let (start_chapter, end_chapter) =
         validate_chapter_range(args.start, args.end, &chapter_list, &console)?;
+    if chapter_list.is_oneshot() && args.recheck.is_some() {
+        anyhow::bail!("--recheck works on chapters; one-shot stories have none");
+    }
+    let recheck = args.recheck.as_deref().map(Recheck::from_kinds);
 
     // Initialize name mapping store
     let names_dir = config.names_dir()?;
@@ -265,6 +341,7 @@ async fn main() -> Result<()> {
         no_name_scout: args.no_name_scout,
         scout_only: args.scout_only,
         name_scout_limit: args.name_scout_limit,
+        recheck,
         config: &config,
     };
 
@@ -397,7 +474,14 @@ async fn process_oneshot(params: &mut ProcessParams<'_>) -> Result<()> {
 
         std::fs::write(&translated_path, chapter_text(&chunks))?;
         params.console.success("Translation saved");
-        warn_chunk_issues(params.console, 1, &chunks);
+        warn_chunk_issues(
+            params.console,
+            1,
+            chunks
+                .iter()
+                .enumerate()
+                .map(|(index, chunk)| (index, chunk.issues.as_slice())),
+        );
     }
 
     Ok(())
@@ -562,12 +646,15 @@ async fn process_chapters(
         &mut book,
         padding,
         &params.config.translation,
+        &params.config.qa,
+        params.recheck.as_ref(),
     )
     .await?;
 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn translate_chapters(
     console: &Console,
     translator: &Translator,
@@ -578,6 +665,8 @@ async fn translate_chapters(
     book: &mut BookMetadata,
     padding: usize,
     translation_config: &TranslationConfig,
+    qa_config: &QaConfig,
+    recheck: Option<&Recheck>,
 ) -> Result<()> {
     let workers = translation_config.workers;
     console.info(&format!(
@@ -586,20 +675,16 @@ async fn translate_chapters(
         if workers == 1 { "" } else { "s" }
     ));
 
+    let known_names = known_name_renderings(name_mapping);
+    let translations = translated_chapter_files(story_dir)?;
+    let mut summary = RecheckSummary::default();
     let mut jobs = Vec::new();
     let mut already_translated = Vec::new();
 
     for chapter_data in downloaded_chapters {
-        // Check if translation already exists
         let chapter_num_str = format!("{:0width$}", chapter_data.number, width = padding);
-        let pattern = format!("{} - ", chapter_num_str);
-
-        let translation_exists = std::fs::read_dir(&story_dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_file())
-            .any(|e| e.file_name().to_string_lossy().starts_with(&pattern));
-
-        if translation_exists {
+        let existing = translations.get(&chapter_data.number);
+        if existing.is_some() && recheck.is_none() {
             already_translated.push(chapter_data.number);
             continue;
         }
@@ -613,29 +698,93 @@ async fn translate_chapters(
             &input.rendered,
             &input.mapped,
         );
-        let mapped_content = input.mapped;
+        let scope = match (existing, recheck) {
+            (Some(existing), Some(recheck)) => {
+                let title = book
+                    .chapters
+                    .get(&chapter_data.number)
+                    .map(|chapter| chapter.title.as_str())
+                    .filter(|title| !title.is_empty())
+                    .unwrap_or(&existing.title);
+                let ctx = RecheckContext {
+                    translator,
+                    story_dir,
+                    known_names: &known_names,
+                    qa_config,
+                    recheck,
+                };
+                let planned = plan_recheck(
+                    &ctx,
+                    existing,
+                    title,
+                    &input.mapped,
+                    &prompt.glossary,
+                    &mut summary,
+                )
+                .await?;
+                match planned {
+                    Some(scope) => scope,
+                    None => {
+                        already_translated.push(chapter_data.number);
+                        continue;
+                    }
+                }
+            }
+            _ => JobScope::Whole,
+        };
+
         jobs.push(TranslationJob {
             number: chapter_data.number,
             title: chapter_data.title.clone(),
             chapter_num_str,
             mapped_title: name_mapping.apply_to_text(&ruby::for_translation(&chapter_data.title)),
-            mapped_content,
+            mapped_content: input.mapped,
             prompt,
+            previous_path: existing.map(|existing| existing.path.clone()),
+            scope,
         });
     }
 
     report_chapter_ranges(
         console,
         &mut already_translated,
-        "already translated, skipping",
+        if recheck.is_some() {
+            "already translated, nothing to recheck"
+        } else {
+            "already translated, skipping"
+        },
     );
 
-    if jobs.is_empty() {
-        return Ok(());
+    if !jobs.is_empty() {
+        run_translation_jobs(
+            console,
+            translator,
+            &known_names,
+            jobs,
+            story_dir,
+            book,
+            workers,
+        )
+        .await?;
     }
 
-    let known_names = known_name_renderings(name_mapping);
-    let known_names = known_names.as_slice();
+    if recheck.is_some() {
+        summary.report(console);
+    }
+
+    Ok(())
+}
+
+/// Translate jobs on `workers` concurrent workers, saving each chapter as it finishes.
+async fn run_translation_jobs(
+    console: &Console,
+    translator: &Translator,
+    known_names: &[String],
+    jobs: Vec<TranslationJob>,
+    story_dir: &Path,
+    book: &mut BookMetadata,
+    workers: usize,
+) -> Result<()> {
     let (progress_tx, progress_rx) = mpsc::unbounded_channel();
     let progress_display = tokio::spawn(display_translation_stats(progress_rx, workers));
     let worker_ids = Arc::new(Mutex::new((1..=workers).rev().collect::<Vec<_>>()));
@@ -682,20 +831,35 @@ async fn translate_chapters(
         futures::pin_mut!(translated);
         while let Some(result) = translated.next().await {
             let chapter = result?;
-            let content = chapter_text(&chapter.chunks);
-            let translated_path = story_dir.join(&chapter.filename);
-            std::fs::write(&translated_path, &content)?;
+            let removed = save_translated_chapter(story_dir, &chapter).await?;
             book.chapters.insert(
                 chapter.number,
                 ChapterMetadata {
-                    title: chapter.title,
-                    original_title: chapter.original_title,
+                    title: chapter.record.title.clone(),
+                    original_title: chapter.original_title.clone(),
                 },
             );
             book.save(story_dir)?;
             console.clear_line();
             console.success(&format!("Saved: {}", chapter.filename));
-            warn_chunk_issues(console, chapter.number, &chapter.chunks);
+            if let Some(removed) = removed {
+                console.info(&format!(
+                    "Removed {}, replaced by {}",
+                    removed.display(),
+                    chapter.filename
+                ));
+            }
+            warn_chunk_issues(
+                console,
+                chapter.number,
+                chapter.translated_chunks.iter().filter_map(|&index| {
+                    chapter
+                        .record
+                        .chunks
+                        .get(index)
+                        .map(|chunk| (index, chunk.issues.as_slice()))
+                }),
+            );
         }
     }
 
@@ -761,6 +925,204 @@ fn known_name_renderings(name_mapping: &NameMappingStore) -> Vec<String> {
         .collect()
 }
 
+/// Translated chapter files in `story_dir` by chapter number, as `tsundoku-epub`
+/// sees them (the first file by name when several share a number). Folders such
+/// as `Original/` and `.tsundoku/` are ignored.
+fn translated_chapter_files(story_dir: &Path) -> Result<HashMap<u32, ChapterFile>> {
+    let chapters = collect_chapters(story_dir).with_context(|| {
+        format!(
+            "Failed to list translated chapters in {}",
+            story_dir.display()
+        )
+    })?;
+    Ok(chapters
+        .into_iter()
+        .map(|chapter| (chapter.number, chapter))
+        .collect())
+}
+
+/// Inputs shared by the `--recheck` decisions of one run.
+struct RecheckContext<'a> {
+    translator: &'a Translator,
+    story_dir: &'a Path,
+    known_names: &'a [String],
+    qa_config: &'a QaConfig,
+    recheck: &'a Recheck,
+}
+
+/// Counts reported at the end of a `--recheck` run.
+#[derive(Debug, Default, PartialEq)]
+struct RecheckSummary {
+    /// Translated chapters examined.
+    checked: usize,
+    /// Chapters re-translated as a whole.
+    whole: usize,
+    /// Chapters re-translated in part.
+    partial: usize,
+    /// Chunks re-translated in partly re-translated chapters.
+    chunks: usize,
+    /// Legacy chapters (no record) that got their first, chapter-level record.
+    legacy_recorded: usize,
+    /// Legacy chapters `stale` could not compare, having no recorded source.
+    legacy_stale_skipped: usize,
+}
+
+impl RecheckSummary {
+    fn report(&self, console: &Console) {
+        console.info(&format!(
+            "Recheck: {} translated chapter(s) checked; re-translated {} whole and {} in part ({} chunk(s))",
+            self.checked, self.whole, self.partial, self.chunks
+        ));
+        if self.legacy_recorded > 0 {
+            console.info(&format!(
+                "Recheck: recorded chapter-level QA issues for {} chapter(s) translated before chunk records existed",
+                self.legacy_recorded
+            ));
+        }
+        if self.legacy_stale_skipped > 0 {
+            console.info(&format!(
+                "Recheck: skipped {} legacy chapter(s) for `stale` (no recorded source); recheck them by issue class to replace them",
+                self.legacy_stale_skipped
+            ));
+        }
+    }
+}
+
+/// Decide what `--recheck` re-translates in an already translated chapter.
+///
+/// A chapter without a record is a legacy translation: it is checked as a whole
+/// against the current translation input (`mapped_content`, with `glossary`, the
+/// glossary of the chapter's prompt) and gets a one-chunk record with no
+/// source. A legacy chapter with a matching issue is re-translated whole; `stale`
+/// cannot apply to it. In a normal record, chunks with a matching issue and (with
+/// `stale`) chunks whose source changed are re-translated, from the current source
+/// when the chunk count is unchanged and from the recorded source otherwise; a
+/// stale chunk count re-translates the whole chapter. Returns `None` when nothing
+/// matches.
+async fn plan_recheck(
+    ctx: &RecheckContext<'_>,
+    existing: &ChapterFile,
+    title: &str,
+    mapped_content: &str,
+    glossary: &[TermEntry],
+    summary: &mut RecheckSummary,
+) -> Result<Option<JobScope>> {
+    let number = existing.number;
+    summary.checked += 1;
+    let record = match ChapterRecord::load(ctx.story_dir, number)
+        .await
+        .with_context(|| format!("Failed to load the record of chapter {number}"))?
+    {
+        Some(record) => record,
+        None => {
+            let text = tokio::fs::read_to_string(&existing.path)
+                .await
+                .with_context(|| format!("Failed to read {}", existing.path.display()))?;
+            let qa_ctx = ChunkContext {
+                source: mapped_content,
+                glossary,
+                known_names: ctx.known_names,
+            };
+            let issues = qa::check_chunk(&qa_ctx, &text, ctx.qa_config);
+            let record = ChapterRecord::legacy(number, title.to_string(), text, issues);
+            record
+                .save(ctx.story_dir)
+                .await
+                .with_context(|| format!("Failed to save the record of chapter {number}"))?;
+            summary.legacy_recorded += 1;
+            record
+        }
+    };
+
+    let mut flagged: BTreeSet<usize> = record
+        .chunks_matching(&ctx.recheck.classes)
+        .into_iter()
+        .collect();
+    if record.is_legacy() {
+        if !flagged.is_empty() {
+            summary.whole += 1;
+            return Ok(Some(JobScope::Whole));
+        }
+        if ctx.recheck.stale {
+            summary.legacy_stale_skipped += 1;
+        }
+        return Ok(None);
+    }
+
+    // Blank content is translated as no chunks at all.
+    let current = if mapped_content.trim().is_empty() {
+        Vec::new()
+    } else {
+        ctx.translator.split_text_into_chunks(mapped_content)
+    };
+    if ctx.recheck.stale {
+        match record.staleness(&current) {
+            Staleness::Fresh | Staleness::Legacy => {}
+            Staleness::Chunks(changed) => flagged.extend(changed),
+            Staleness::Whole => {
+                summary.whole += 1;
+                return Ok(Some(JobScope::Whole));
+            }
+        }
+    }
+    if flagged.is_empty() {
+        return Ok(None);
+    }
+
+    let use_current = current.len() == record.chunks.len();
+    let plan = record
+        .chunks
+        .iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            // Every chunk of a non-legacy record has its source.
+            let source = chunk.source.clone().unwrap_or_default();
+            if !flagged.contains(&index) {
+                return ChunkPlan::Keep {
+                    source,
+                    output: chunk.raw.clone(),
+                };
+            }
+            match current.get(index) {
+                Some(current) if use_current => ChunkPlan::Translate(current.clone()),
+                _ => ChunkPlan::Translate(source),
+            }
+        })
+        .collect();
+    summary.partial += 1;
+    summary.chunks += flagged.len();
+    Ok(Some(JobScope::Chunks { record, plan }))
+}
+
+/// Write a translated chapter: its record, then the `.txt` built from the record,
+/// then remove the file it replaces when the name changed (`tsundoku-epub` keeps
+/// only the first file per chapter number). Returns the removed file.
+async fn save_translated_chapter(
+    story_dir: &Path,
+    chapter: &TranslatedChapter,
+) -> Result<Option<PathBuf>> {
+    chapter
+        .record
+        .save(story_dir)
+        .await
+        .with_context(|| format!("Failed to save the record of chapter {}", chapter.number))?;
+    let path = story_dir.join(&chapter.filename);
+    tokio::fs::write(&path, chapter.record.raw_text())
+        .await
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+
+    let Some(previous) = chapter.previous_path.as_ref().filter(|old| **old != path) else {
+        return Ok(None);
+    };
+    match tokio::fs::remove_file(previous).await {
+        Ok(()) => Ok(Some(previous.clone())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("Failed to remove {}", previous.display()))
+        }
+    }
+}
+
 fn report_chapter_ranges(console: &Console, chapters: &mut Vec<u32>, suffix: &str) {
     if chapters.is_empty() {
         return;
@@ -774,7 +1136,8 @@ fn report_chapter_ranges(console: &Console, chapters: &mut Vec<u32>, suffix: &st
     chapters.clear();
 }
 
-/// Join translated chunks into the chapter text written to disk.
+/// Join translated chunks into the one-shot text written to disk, as
+/// [`ChapterRecord::raw_text`] does for chapters.
 fn chapter_text(chunks: &[ChunkResult]) -> String {
     chunks
         .iter()
@@ -783,12 +1146,17 @@ fn chapter_text(chunks: &[ChunkResult]) -> String {
         .join("\n\n")
 }
 
-/// Print one warning per issue a translated chunk was kept with.
-fn warn_chunk_issues(console: &Console, chapter: u32, chunks: &[ChunkResult]) {
-    for (index, chunk) in chunks.iter().enumerate() {
-        for issue in &chunk.issues {
+/// Print one warning per issue a translated chunk was kept with; `chunks` yields
+/// 0-based chunk indices with their issues.
+fn warn_chunk_issues<'a>(
+    console: &Console,
+    chapter: u32,
+    chunks: impl IntoIterator<Item = (usize, &'a [Issue])>,
+) {
+    for (index, issues) in chunks {
+        for issue in issues {
             console.warning(&format!(
-                "Chapter {} chunk {}: {:?} — {}",
+                "Chapter {} chunk {}: {} — {}",
                 chapter,
                 index + 1,
                 issue.kind,
@@ -841,52 +1209,102 @@ async fn translate_chapter_job(
     worker: usize,
     progress_tx: mpsc::UnboundedSender<TranslationProgress>,
 ) -> Result<TranslatedChapter> {
-    console.step(&format!(
-        "Worker {} translating chapter {}: {}",
-        worker, job.number, job.title
-    ));
-
-    let title_progress = ProgressInfo {
-        chapter: job.number,
-        chunk: 0,
-        total_chunks: 0,
-        worker: Some(worker),
-        reporter: Some(progress_tx.clone()),
-    };
-
-    // Translate only the title text and write the number ourselves, so every chapter
-    // is headed `Chapter N: …` instead of "Chapter Two" or "Episode 5". The file's
-    // chapter number is used because authors' own numbering contains typos.
-    let title_text = strip_chapter_number(&job.mapped_title);
-    let translated_title = if title_text.is_empty() {
-        format!("Chapter {}", job.number)
-    } else {
-        let translated_text = translator
-            .translate_title(title_text, Some(title_progress))
-            .await
-            .with_context(|| format!("Failed to translate title for chapter {}", job.number))?;
-        format!("Chapter {}: {}", job.number, translated_text)
-    };
-
     let progress = ProgressInfo {
         chapter: job.number,
         chunk: 1,
         total_chunks: 1, // Will be updated by translator
         worker: Some(worker),
-        reporter: Some(progress_tx),
+        reporter: Some(progress_tx.clone()),
     };
 
-    let chunks = translator
-        .translate_content(&job.mapped_content, &job.prompt, known_names, Some(progress))
-        .await
-        .with_context(|| format!("Failed to translate chapter {}", job.number))?;
+    let (record, translated_chunks) = match job.scope {
+        JobScope::Whole => {
+            console.step(&format!(
+                "Worker {} translating chapter {}: {}",
+                worker, job.number, job.title
+            ));
+
+            let title_progress = ProgressInfo {
+                chapter: job.number,
+                chunk: 0,
+                total_chunks: 0,
+                worker: Some(worker),
+                reporter: Some(progress_tx),
+            };
+
+            // Translate only the title text and write the number ourselves, so every
+            // chapter is headed `Chapter N: …` instead of "Chapter Two" or "Episode 5".
+            // The file's chapter number is used because authors' own numbering
+            // contains typos.
+            let title_text = strip_chapter_number(&job.mapped_title);
+            let translated_title = if title_text.is_empty() {
+                format!("Chapter {}", job.number)
+            } else {
+                let translated_text = translator
+                    .translate_title(title_text, Some(title_progress))
+                    .await
+                    .with_context(|| {
+                        format!("Failed to translate title for chapter {}", job.number)
+                    })?;
+                format!("Chapter {}: {}", job.number, translated_text)
+            };
+
+            let chunks = translator
+                .translate_content(
+                    &job.mapped_content,
+                    &job.prompt,
+                    known_names,
+                    Some(progress),
+                )
+                .await
+                .with_context(|| format!("Failed to translate chapter {}", job.number))?;
+            let record = ChapterRecord {
+                version: CHAPTER_RECORD_VERSION,
+                chapter: job.number,
+                title: translated_title,
+                chunks: chunks.into_iter().map(ChunkRecord::from).collect(),
+            };
+            let translated_chunks = (0..record.chunks.len()).collect();
+            (record, translated_chunks)
+        }
+        JobScope::Chunks { mut record, plan } => {
+            let chunk_numbers: Vec<u32> = plan
+                .iter()
+                .enumerate()
+                .filter(|(_, chunk)| matches!(chunk, ChunkPlan::Translate(_)))
+                .map(|(index, _)| index as u32 + 1)
+                .collect();
+            console.step(&format!(
+                "Worker {} re-translating chapter {} chunk(s) {} of {}: {}",
+                worker,
+                job.number,
+                format_chapter_ranges(&chunk_numbers),
+                plan.len(),
+                job.title
+            ));
+
+            let results = translator
+                .translate_chunks(plan, &job.prompt, known_names, Some(progress))
+                .await
+                .with_context(|| format!("Failed to re-translate chapter {}", job.number))?;
+            let translated_chunks = results.iter().map(|(index, _)| *index).collect();
+            record.splice(
+                results
+                    .into_iter()
+                    .map(|(index, result)| (index, ChunkRecord::from(result)))
+                    .collect(),
+            );
+            (record, translated_chunks)
+        }
+    };
 
     Ok(TranslatedChapter {
-        filename: chapter_filename(&job.chapter_num_str, &translated_title),
+        filename: chapter_filename(&job.chapter_num_str, &record.title),
         number: job.number,
-        title: translated_title,
         original_title: job.title,
-        chunks,
+        record,
+        previous_path: job.previous_path,
+        translated_chunks,
     })
 }
 
@@ -897,14 +1315,35 @@ struct TranslationJob {
     mapped_title: String,
     mapped_content: String,
     prompt: PromptContext,
+    /// Translation file this job replaces (`--recheck`).
+    previous_path: Option<PathBuf>,
+    /// What to translate.
+    scope: JobScope,
+}
+
+/// What a translation job translates.
+enum JobScope {
+    /// The title and every chunk.
+    Whole,
+    /// The [`ChunkPlan::Translate`] chunks of a recorded chapter, keeping its title.
+    Chunks {
+        /// The chapter's record, spliced with the new chunks.
+        record: ChapterRecord,
+        /// One entry per recorded chunk.
+        plan: Vec<ChunkPlan>,
+    },
 }
 
 struct TranslatedChapter {
     filename: String,
     number: u32,
-    title: String,
     original_title: String,
-    chunks: Vec<ChunkResult>,
+    /// The chapter's complete record; its raw text is the chapter file.
+    record: ChapterRecord,
+    /// Translation file replaced, removed if `filename` differs.
+    previous_path: Option<PathBuf>,
+    /// Indices of the chunks translated by this job.
+    translated_chunks: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -1691,6 +2130,8 @@ fn expand_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use tsundoku::config::{ApiConfig, TranslationConfig};
+    use tsundoku::name_mapping::{NameEntry, TermEntry};
 
     #[test]
     fn chapter_filename_respects_component_byte_limit() {
@@ -1939,5 +2380,471 @@ mod tests {
         );
 
         assert_eq!(folder, "[syosetu: n1234ab] 原題");
+    }
+
+    #[test]
+    fn recheck_parses_kinds_all_and_stale() {
+        let args = Args::try_parse_from([
+            "tsundoku",
+            "--recheck",
+            "names,stale,glossary,names",
+            "https://example.com",
+        ])
+        .unwrap();
+        let recheck = Recheck::from_kinds(args.recheck.as_deref().unwrap());
+        assert_eq!(
+            recheck,
+            Recheck {
+                classes: vec![IssueClass::Names, IssueClass::Glossary],
+                stale: true,
+            }
+        );
+
+        let all = Recheck::from_kinds(&[RecheckKind::All]);
+        assert_eq!(all.classes, IssueClass::ALL);
+        assert!(!all.stale);
+
+        let error = Args::try_parse_from(["tsundoku", "--recheck", "typo", "https://example.com"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown issue class `typo`"), "{error}");
+        assert!(
+            Args::try_parse_from([
+                "tsundoku",
+                "--recheck",
+                "all",
+                "--scout-only",
+                "https://example.com",
+            ])
+            .is_err()
+        );
+    }
+
+    /// A story folder with a name mapping and a translator splitting at 14 chars.
+    struct RecheckFixture {
+        dir: TempDir,
+        name_mapping: NameMappingStore,
+        translator: Translator,
+    }
+
+    impl RecheckFixture {
+        fn new() -> Self {
+            let dir = TempDir::new().unwrap();
+            let mut name_mapping =
+                NameMappingStore::new(&dir.path().join("names"), "syosetu", "n1").unwrap();
+            name_mapping.record_votes(&[NameEntry {
+                original: "達也".to_string(),
+                english: "Tatsuya".to_string(),
+                ..NameEntry::default()
+            }]);
+            name_mapping.record_term_votes(&[TermEntry {
+                original: "魔石".to_string(),
+                english: "Magic Stone".to_string(),
+            }]);
+            let translator = Translator::new(
+                ApiConfig::default(),
+                TranslationConfig {
+                    chunk_size_chars: 14,
+                    ..TranslationConfig::default()
+                },
+                QaConfig::default(),
+                String::new(),
+                String::new(),
+            );
+            Self {
+                dir,
+                name_mapping,
+                translator,
+            }
+        }
+
+        fn story_dir(&self) -> &Path {
+            self.dir.path()
+        }
+
+        async fn plan(
+            &self,
+            recheck: &Recheck,
+            existing: &ChapterFile,
+            original: &str,
+            summary: &mut RecheckSummary,
+        ) -> Option<JobScope> {
+            let known_names = known_name_renderings(&self.name_mapping);
+            let ctx = RecheckContext {
+                translator: &self.translator,
+                story_dir: self.story_dir(),
+                known_names: &known_names,
+                qa_config: &QaConfig::default(),
+                recheck,
+            };
+            let mapped = render_translation_input(&self.name_mapping, original).mapped;
+            let glossary = self.name_mapping.glossary_for_text(&mapped, 100);
+            plan_recheck(&ctx, existing, &existing.title, &mapped, &glossary, summary)
+                .await
+                .unwrap()
+        }
+    }
+
+    fn chapter_file(story_dir: &Path, number: u32, title: &str, text: &str) -> ChapterFile {
+        let path = story_dir.join(chapter_filename(&number.to_string(), title));
+        std::fs::write(&path, text).unwrap();
+        ChapterFile {
+            number,
+            title: title.to_string(),
+            path,
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_recheck_retranslates_only_chunks_changed_by_a_mapping_edit() {
+        let mut fixture = RecheckFixture::new();
+        let original = "達也は笑った。\n花子は泣いた。";
+        let sources = fixture.translator.split_text_into_chunks(
+            &render_translation_input(&fixture.name_mapping, original).mapped,
+        );
+        assert_eq!(sources, ["Tatsuyaは笑った。", "花子は泣いた。"]);
+        let record = ChapterRecord {
+            version: CHAPTER_RECORD_VERSION,
+            chapter: 3,
+            title: "Chapter 3: Tears".to_string(),
+            chunks: sources
+                .iter()
+                .zip(["Tatsuya laughed.", "花子 cried."])
+                .map(|(source, raw)| ChunkRecord {
+                    source: Some(source.clone()),
+                    raw: raw.to_string(),
+                    issues: Vec::new(),
+                })
+                .collect(),
+        };
+        record.save(fixture.story_dir()).await.unwrap();
+        let existing = chapter_file(fixture.story_dir(), 3, &record.title, &record.raw_text());
+        let stale = Recheck {
+            classes: Vec::new(),
+            stale: true,
+        };
+        let mut summary = RecheckSummary::default();
+        assert!(
+            fixture
+                .plan(&stale, &existing, original, &mut summary)
+                .await
+                .is_none()
+        );
+
+        fixture.name_mapping.record_votes(&[NameEntry {
+            original: "花子".to_string(),
+            english: "Hanako".to_string(),
+            ..NameEntry::default()
+        }]);
+        let Some(JobScope::Chunks {
+            record: planned,
+            plan,
+        }) = fixture
+            .plan(&stale, &existing, original, &mut summary)
+            .await
+        else {
+            panic!("expected a partial re-translation");
+        };
+
+        assert_eq!(planned, record);
+        assert_eq!(
+            plan,
+            [
+                ChunkPlan::Keep {
+                    source: "Tatsuyaは笑った。".to_string(),
+                    output: "Tatsuya laughed.".to_string(),
+                },
+                ChunkPlan::Translate("Hanakoは泣いた。".to_string()),
+            ]
+        );
+        assert_eq!(
+            summary,
+            RecheckSummary {
+                checked: 2,
+                partial: 1,
+                chunks: 1,
+                ..RecheckSummary::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_chapter_gets_a_chapter_level_record_and_is_retranslated_whole() {
+        let fixture = RecheckFixture::new();
+        let original = "魔石を拾った。";
+        let existing = chapter_file(
+            fixture.story_dir(),
+            1,
+            "Chapter 1: Old",
+            "He picked up a stone.",
+        );
+        let mut summary = RecheckSummary::default();
+
+        let stale_only = Recheck {
+            classes: Vec::new(),
+            stale: true,
+        };
+        assert!(
+            fixture
+                .plan(&stale_only, &existing, original, &mut summary)
+                .await
+                .is_none()
+        );
+        let record = ChapterRecord::load(fixture.story_dir(), 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(record.is_legacy());
+        assert_eq!(record.title, "Chapter 1: Old");
+        assert_eq!(record.raw_text(), "He picked up a stone.");
+        assert_eq!(
+            record.issue_counts().into_iter().collect::<Vec<_>>(),
+            [(qa::IssueKind::GlossaryMissing, 1)]
+        );
+
+        let glossary = Recheck {
+            classes: vec![IssueClass::Glossary],
+            stale: false,
+        };
+        assert!(matches!(
+            fixture
+                .plan(&glossary, &existing, original, &mut summary)
+                .await,
+            Some(JobScope::Whole)
+        ));
+        assert_eq!(
+            summary,
+            RecheckSummary {
+                checked: 2,
+                whole: 1,
+                legacy_recorded: 1,
+                legacy_stale_skipped: 1,
+                ..RecheckSummary::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn saving_a_retitled_chapter_replaces_the_old_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let story_dir = temp_dir.path();
+        let old = chapter_file(story_dir, 7, "Chapter 7: Old", "Old text.");
+        let record = ChapterRecord {
+            version: CHAPTER_RECORD_VERSION,
+            chapter: 7,
+            title: "Chapter 7: New".to_string(),
+            chunks: ["One.", "Two."]
+                .into_iter()
+                .map(|raw| ChunkRecord {
+                    source: Some("原文".to_string()),
+                    raw: raw.to_string(),
+                    issues: Vec::new(),
+                })
+                .collect(),
+        };
+        let chapter = TranslatedChapter {
+            filename: chapter_filename("7", &record.title),
+            number: 7,
+            original_title: "新".to_string(),
+            record,
+            previous_path: Some(old.path.clone()),
+            translated_chunks: vec![0, 1],
+        };
+
+        let removed = save_translated_chapter(story_dir, &chapter).await.unwrap();
+
+        assert_eq!(removed, Some(old.path.clone()));
+        assert!(!old.path.exists());
+        let files = translated_chapter_files(story_dir).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&files[&7].path).unwrap(),
+            "One.\n\nTwo."
+        );
+        assert_eq!(
+            ChapterRecord::load(story_dir, 7).await.unwrap().as_ref(),
+            Some(&chapter.record)
+        );
+
+        // Same title: the file is rewritten in place and nothing is removed.
+        let again = TranslatedChapter {
+            previous_path: Some(files[&7].path.clone()),
+            ..chapter
+        };
+        assert_eq!(
+            save_translated_chapter(story_dir, &again).await.unwrap(),
+            None
+        );
+        assert!(files[&7].path.exists());
+    }
+
+    /// Serve streamed chat completions on a background thread, answering each
+    /// request with `reply(body)`; returns the base URL and the request bodies seen.
+    fn serve_chat(
+        reply: impl Fn(&serde_json::Value) -> String + Send + 'static,
+    ) -> (String, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+        use std::io::{BufRead, BufReader, Read};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&bodies);
+        std::thread::spawn(move || {
+            for socket in listener.incoming() {
+                let mut socket = socket.unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut content_length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let content = reply(&body);
+                seen.lock().unwrap().push(body);
+
+                let delta = serde_json::json!({ "choices": [{ "index": 0, "delta": { "content": content }, "finish_reason": null }] });
+                let stop = serde_json::json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] });
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {delta}\n\ndata: {stop}\n\ndata: [DONE]\n\n"
+                )
+                .unwrap();
+            }
+        });
+        (base_url, bodies)
+    }
+
+    fn last_user_turn(body: &serde_json::Value) -> String {
+        body["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn chapters_get_records_and_recheck_retranslates_only_flagged_chunks() {
+        let fixed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fixed_in_server = Arc::clone(&fixed);
+        let (base_url, bodies) = serve_chat(move |body| {
+            let user = last_user_turn(body);
+            if body["messages"][0]["content"] == "Translate this title" {
+                "Stones".to_string()
+            } else if !user.contains("魔石") {
+                "The next day, he went to town.".to_string()
+            } else if fixed_in_server.load(std::sync::atomic::Ordering::SeqCst) {
+                "He picked up a Magic Stone.".to_string()
+            } else {
+                "He picked up a stone.".to_string()
+            }
+        });
+        let fixture = RecheckFixture::new();
+        let story_dir = fixture.story_dir();
+        let translator = Translator::new(
+            ApiConfig {
+                base_url,
+                ..ApiConfig::default()
+            },
+            TranslationConfig {
+                chunk_size_chars: 10,
+                delay_between_requests_sec: 0.0,
+                ..TranslationConfig::default()
+            },
+            QaConfig {
+                max_retries: 0,
+                ..QaConfig::default()
+            },
+            "Translate this title".to_string(),
+            "Translate this content".to_string(),
+        );
+        let chapters = [ChapterData {
+            number: 1,
+            title: "第一話 魔石".to_string(),
+            content: "魔石を拾った。\n次の日、町へ行った。".to_string(),
+            filename: String::new(),
+        }];
+        let mut book = BookMetadata::default();
+        async fn run(
+            fixture: &RecheckFixture,
+            translator: &Translator,
+            chapters: &[ChapterData],
+            book: &mut BookMetadata,
+            recheck: Option<&Recheck>,
+        ) {
+            let summary_store =
+                SummaryStore::new(&fixture.story_dir().join("names"), "syosetu", "n1").unwrap();
+            translate_chapters(
+                &Console::new(),
+                translator,
+                &fixture.name_mapping,
+                &summary_store,
+                chapters,
+                fixture.story_dir(),
+                book,
+                1,
+                &TranslationConfig::default(),
+                &QaConfig::default(),
+                recheck,
+            )
+            .await
+            .unwrap();
+        }
+
+        run(&fixture, &translator, &chapters, &mut book, None).await;
+        let record = ChapterRecord::load(story_dir, 1).await.unwrap().unwrap();
+        assert_eq!(record.title, "Chapter 1: Stones");
+        assert_eq!(record.chunks.len(), 2);
+        assert_eq!(
+            record.chunks[0].issues.first().map(|issue| issue.kind),
+            Some(qa::IssueKind::GlossaryMissing)
+        );
+        let path = story_dir.join("1 - Chapter 1: Stones.txt");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "He picked up a stone.\n\nThe next day, he went to town."
+        );
+        assert_eq!(bodies.lock().unwrap().len(), 3);
+
+        fixed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let glossary = Recheck {
+            classes: vec![IssueClass::Glossary],
+            stale: false,
+        };
+        run(&fixture, &translator, &chapters, &mut book, Some(&glossary)).await;
+        {
+            let bodies = bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 4);
+            assert_eq!(last_user_turn(&bodies[3]), "魔石を拾った。");
+        }
+        let rechecked = ChapterRecord::load(story_dir, 1).await.unwrap().unwrap();
+        assert_eq!(rechecked.title, record.title);
+        assert!(rechecked.chunks[0].issues.is_empty());
+        assert_eq!(rechecked.chunks[1], record.chunks[1]);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "He picked up a Magic Stone.\n\nThe next day, he went to town."
+        );
+
+        // Nothing left to recheck, and an unchanged mapping is not stale.
+        let glossary_and_stale = Recheck {
+            stale: true,
+            ..glossary
+        };
+        run(
+            &fixture,
+            &translator,
+            &chapters,
+            &mut book,
+            Some(&glossary_and_stale),
+        )
+        .await;
+        assert_eq!(bodies.lock().unwrap().len(), 4);
     }
 }
