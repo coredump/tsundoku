@@ -126,7 +126,7 @@ Every translated chunk is checked against the text that was sent:
 | `paragraphs` | `paragraph_mismatch` | non-empty line count outside `paragraph_ratio` of the source's and off by at least 3 |
 | `length` | `length_ratio` | output characters ÷ source characters outside `length_ratio` |
 | `repetition` | `repetition` | a 4-word phrase more than 8 times, or the same line 4 times in a row |
-| `honorifics` | `honorific_on_noun` | reserved for honorific checks; never retried |
+| `honorifics` | `honorific_on_noun` | `-san`, `-chan`, `-kun`, `-sama`, `-dono`, `-senpai` or `-sensei` on something that is not a known name (`cat-san`, `Village Chief-san`); recorded only, never retried |
 
 When an issue in `retry_on` is found, the chunk is translated again (up to `max_retries` times, separate from `translation.retries`) with a note naming what to fix, such as `render 魔石 as "Magic Stone"`; the attempt with the fewest and least serious issues is kept. Issues that remain are printed after each chapter and saved in its chunk record, where `--recheck` can find them later.
 
@@ -137,6 +137,44 @@ retry_on = ["truncated", "foreign", "glossary", "names", "repetition"]  # defaul
 paragraph_ratio = [0.85, 1.15]                                    # default
 length_ratio = [1.2, 4.0]                                         # default
 ```
+
+#### Honorifics
+
+`translation.honorifics` decides how Japanese honorifics are rendered:
+
+| Value | Names (`ルリちゃん`) | Other words (`村長さん`, `猫さん`) |
+|---|---|---|
+| `keep` (default) | `Ruri-chan` | as the model writes them |
+| `names-only` | `Ruri-chan` | the suffix is removed (`Village Chief`, `the cat`) |
+| `drop` | `Ruri` (`先輩`/`先生` are left for the model to translate by meaning) | the suffix is removed |
+
+```toml
+[translation]
+honorifics = "names-only"  # "keep" (default), "drop" or "names-only"
+```
+
+The policy works in three places:
+
+- **Before translating**, an honorific directly after a substituted name is rewritten (`Ruriちゃん` → `Ruri-chan`, or `Ruri` with `drop`), so the model no longer decides per chunk. Honorifics after Japanese words (`村長さん`) are left to the model.
+- **In the prompt**, one line tells the model the policy.
+- **After translating**, the chapter `.txt` gets the policy's output rule: `names-only` removes honorifics from lowercase words and from words that are not a known English name (`cat-san` → `cat`, `Village Chief-san` → `Village Chief`); `drop` removes every one; `keep` changes nothing. The chunk record keeps the model's raw output, so the rules are always applied to the raw text and never compound.
+
+A novel's `book.json` can override the policy and add its own find/replace rules, applied in order to the translated text after the honorific rule:
+
+```json
+{
+  "honorifics": "names-only",
+  "replacements": [
+    { "find": "Tatyuya", "replace": "Tatsuya" },
+    { "find": "\\bChief (Inspector|Auditor)\\b", "replace": "Section Chief", "regex": true },
+    { "find": "(\\w+)-nee\\b", "replace": "$1-neesan", "regex": true }
+  ]
+}
+```
+
+A literal `find` is case-sensitive and matches whole words (`Tatyuya` does not touch `Tatyuyas`); `$` in its `replace` is literal. With `"regex": true`, `find` is a [regex](https://docs.rs/regex/latest/regex/#syntax) and `replace` may use `$1`-style groups; JSON needs every backslash doubled. An invalid regex stops `tsundoku` and `tsundoku-epub` at load with the entry's index (`replacements[1]`).
+
+Changing the policy or the replacements part-way through a novel affects only chapters translated or rechecked afterwards: the source side (what the model is sent) and the output rules are applied when a chapter is saved. Since names followed by an honorific are now sent as `Ruri-chan` instead of `Ruriちゃん`, `--recheck stale` re-translates such chunks of chapters recorded before this rewrite existed.
 
 ## Usage
 

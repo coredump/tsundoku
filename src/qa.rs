@@ -246,6 +246,8 @@ pub struct ChunkContext<'a> {
     pub glossary: &'a [TermEntry],
     /// Known English name renderings.
     pub known_names: &'a [String],
+    /// The novel's output rules, for [`check_honorifics`]; `None` skips that check.
+    pub output_rules: Option<&'a OutputRules>,
 }
 
 /// Separator between the found word and the expected name in a near-miss detail.
@@ -576,6 +578,7 @@ mod tests {
             source,
             glossary,
             known_names: known,
+            output_rules: None,
         };
         check_chunk(&ctx, output, &QaConfig::default())
     }
@@ -857,6 +860,7 @@ mod tests {
             source: "Tatsuyaは魔石を拾った。",
             glossary: &glossary,
             known_names: &known,
+            output_rules: None,
         };
         let issues = check_chunk(&ctx, "Tatyuya picked up a gem.", &QaConfig::default());
         assert_eq!(

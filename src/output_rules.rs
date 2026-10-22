@@ -66,6 +66,11 @@ impl OutputRules {
         })
     }
 
+    /// The honorific policy these rules apply.
+    pub fn policy(&self) -> HonorificPolicy {
+        self.policy
+    }
+
     /// Whether `word` (the token before an honorific) is a character name.
     fn is_name(&self, word: &str) -> bool {
         word.starts_with(|c: char| c.is_ascii_uppercase()) && self.known_names.contains(word)

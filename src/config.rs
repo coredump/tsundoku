@@ -4,6 +4,7 @@
 //! platform-specific config directories.
 
 use crate::error::ConfigError;
+use crate::honorifics::HonorificPolicy;
 use crate::qa::QaConfig;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -138,6 +139,10 @@ pub struct TranslationConfig {
     /// Set to zero to send no `max_tokens`.
     pub max_tokens_per_char: f64,
 
+    /// How honorifics are rendered: `keep`, `drop` or `names-only`. A novel's
+    /// `book.json` `honorifics` overrides it.
+    pub honorifics: HonorificPolicy,
+
     /// Number of chapters to translate concurrently.
     pub workers: usize,
 }
@@ -153,6 +158,7 @@ impl Default for TranslationConfig {
             cast_max_entries: 30,
             summary_chapters: 2,
             max_tokens_per_char: 2.0,
+            honorifics: HonorificPolicy::default(),
             workers: 1,
         }
     }
@@ -557,6 +563,24 @@ mod tests {
 
         config.qa.length_ratio = [1.2, 4.0];
         assert!(config.validate_with_options(false).is_ok());
+    }
+
+    #[test]
+    fn test_honorifics_setting_loads_and_defaults_to_keep() {
+        assert_eq!(
+            Config::default().translation.honorifics,
+            HonorificPolicy::Keep
+        );
+
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "[translation]\nhonorifics = \"names-only\"\n").unwrap();
+        let config = Config::load_from(file.path()).unwrap();
+
+        assert!(config.ignored_keys.is_empty(), "{:?}", config.ignored_keys);
+        assert_eq!(config.translation.honorifics, HonorificPolicy::NamesOnly);
+
+        std::fs::write(file.path(), "[translation]\nhonorifics = \"polite\"\n").unwrap();
+        assert!(Config::load_from(file.path()).is_err());
     }
 
     #[test]

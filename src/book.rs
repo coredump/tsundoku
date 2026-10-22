@@ -5,8 +5,9 @@
 //! names, which lose characters such as `?` and are length-limited. Fields a person
 //! edits (`title`, `author`) are never overwritten once set.
 
-use crate::error::BookMetadataError;
+use crate::error::{BookMetadataError, ReplacementError};
 use crate::honorifics::HonorificPolicy;
+use crate::output_rules::OutputRules;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -66,6 +67,30 @@ impl BookMetadata {
     /// Path of the metadata file in `novel_dir`.
     pub fn path(novel_dir: &Path) -> PathBuf {
         novel_dir.join(BOOK_METADATA_FILE)
+    }
+
+    /// The novel's honorific policy: `honorifics` when set, else `default` (the
+    /// `[translation] honorifics` setting).
+    pub fn honorific_policy(&self, default: HonorificPolicy) -> HonorificPolicy {
+        self.honorifics.unwrap_or(default)
+    }
+
+    /// The novel's output rules: its honorific policy (falling back to
+    /// `default_policy`), the known English name renderings and its replacements.
+    pub fn output_rules<I, S>(
+        &self,
+        default_policy: HonorificPolicy,
+        known_names: I,
+    ) -> Result<OutputRules, ReplacementError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        OutputRules::new(
+            self.honorific_policy(default_policy),
+            known_names,
+            &self.replacements,
+        )
     }
 
     /// Load `book.json` from `novel_dir`, or `None` if the folder has none.

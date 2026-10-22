@@ -92,6 +92,7 @@ Translation behavior configuration:
 - `cast_max_entries`: Maximum characters (with gender and note) listed in a chapter translation prompt; `0` disables the cast block (default: "30", integer)
 - `summary_chapters`: Number of previous chapters whose scout synopses are added to a chapter translation prompt; `0` disables (default: "2", integer)
 - `max_tokens_per_char`: Reply token limit per source character; each request sends `max_tokens = max(512, ceil(max_tokens_per_char × characters))` and `0` sends none. Must be finite and at least 0 (default: "2.0", float)
+- `honorifics`: Honorific policy, `"keep"`, `"drop"` or `"names-only"`; a novel's `book.json` `honorifics` overrides it (default: `"keep"`). See Honorifics and Output Rules
 
 #### [QA] Section
 Post-translation checks (`qa::check_chunk`) and QA retries:
@@ -432,7 +433,7 @@ normalises `\r\n` to `\n`):
 
 **Use-time rendering** (it runs on cached originals too, so older Pixiv originals need
 no migration):
-- Translation input: `ruby::for_translation` → name substitution → `mark_scene_breaks`.
+- Translation input: `ruby::for_translation` → name substitution → `honorifics::apply_source` → `mark_scene_breaks`.
   This applies to chapter content, chapter titles and one-shot content. Each `｜B《R》`
   is rendered as:
 
@@ -448,6 +449,30 @@ no migration):
 - Name scout payload: `ruby::for_scout` keeps `｜B《R》`. The scout response contract
   says to report `original` as X only and romanise from Y; name originals containing
   `｜`, `《` or `》` are rejected.
+
+### Honorifics and Output Rules (`honorifics.rs`, `output_rules.rs`)
+
+- Policy `HonorificPolicy` (`keep`, `drop`, `names-only`; serde kebab-case). Effective
+  policy per novel: `book.json` `honorifics` if set, else `[translation] honorifics`
+  (`BookMetadata::honorific_policy`).
+- Source side, `honorifics::apply_source(text, policy)`, run after name substitution:
+  a Latin token followed by さん/ちゃん/くん/君/様/さま/殿/先輩/先生 becomes
+  `Name-san`/`-chan`/`-kun`/`-sama`/`-dono`/`-senpai`/`-sensei` (`keep`, `names-only`)
+  or `Name` (`drop`; 先輩/先生 are left untouched). Suffixes after Japanese text are left
+  for the model.
+- Prompt: one line per policy, `honorifics::prompt_line(policy)`, rendered between the
+  rules and the cast.
+- Output side, `output_rules::postprocess(raw, &OutputRules)`, with
+  `OutputRules::new(policy, known English names, &book.replacements)` built once per
+  novel (`BookMetadata::output_rules`): first the honorific rule (`names-only` strips
+  `-(san|chan|kun|sama|dono|senpai|sensei)` after a word that is lowercase or not a known
+  name or name part; `drop` strips every one; `keep` nothing), then each `book.json`
+  replacement in order (literal: case-sensitive, whole word at word-character ends, `$`
+  literal; `"regex": true`: regex with `$1` groups). Regexes are compiled when
+  `book.json` is loaded; an invalid one is a load error naming `replacements[i]`.
+- Always applied to the record's raw text, never to an already processed `.txt`, so
+  re-applying never compounds. QA: `qa::check_honorifics` flags the names-only strip
+  matches as `honorific_on_noun` (record-only, never retried).
 
 ## Translation System
 
@@ -485,7 +510,7 @@ const REFUSAL_PHRASES: &[&str] = &[
    - Split text into chunks using `split_text_into_chunks` (public, so callers can compare chunk sources) and translate them all with `translate_chunks`
 
 **Chunk Translation** (`translate_chunks(plan: Vec<ChunkPlan>, ctx: &PromptContext, known_names: &[String], progress_info: Option<ProgressInfo>) -> Result<Vec<(usize, ChunkResult)>>`), where `ChunkPlan` is `Translate(source)` or `Keep { source, output }`:
-   - Render the system prompt once per chapter with `PromptContext::system_prompt(content_translation_prompt)`, so it is byte-identical for every chunk. Sections, in fixed order and separated by a blank line: the configured prompt; the English-only and ruby rules; the cast; the canonical glossary entries present in the name-substituted text (overrides first, then by vote count, capped at `glossary_max_entries`); the previous chapters' synopses. Empty sections are omitted
+   - Render the system prompt once per chapter with `PromptContext::system_prompt(content_translation_prompt)`, so it is byte-identical for every chunk. Sections, in fixed order and separated by a blank line: the configured prompt; the English-only and ruby rules; the honorific policy line (`honorifics::prompt_line(output_rules.policy())`, only when `PromptContext.output_rules` is set); the cast; the canonical glossary entries present in the name-substituted text (overrides first, then by vote count, capped at `glossary_max_entries`); the previous chapters' synopses. Empty sections are omitted
    - The cast is `NameMappingStore::cast_for_text(ruby::for_translation(raw_content), cast_max_entries)`: names whose original occurs in the chapter text before name substitution and that have a gender or a note, ordered by `count` descending then English name. It renders as `Characters in this chapter (use matching pronouns even where the Japanese omits the subject):` followed by one `- {english}: {gender}; {note}` line per entry (`- {english}: {gender}` or `- {english}: {note}` when one is missing)
    - The synopses are `SummaryStore::previous(chapter, summary_chapters)` (chapters `chapter - k` … `chapter - 1` that have a non-empty synopsis, oldest first), each passed through `NameMappingStore::normalize_renderings` so losing renderings of a name become the selected one. They render as `Story so far (context only; do not translate):` followed by one `- Ch {number}: {synopsis}` line per chapter
    - `Keep` chunks are not sent: they enter the history as if just translated (a kept `[TRANSLATION FAILED]` chunk clears it, as a refusal does), so a re-translated chunk sees the same preceding context as in a full run
@@ -496,7 +521,7 @@ const REFUSAL_PHRASES: &[&str] = &[
      - On failure: retry up to `retries` times with exponential backoff; a refusal or empty reply clears history first
      - Reply cut off at the token limit (`finish_reason == "length"`) or still containing Chinese/Japanese characters: retry at once without adding it to history; on the last attempt keep it with a `truncated` / `foreign_script` issue
      - Refused on every attempt: output "[TRANSLATION FAILED]\n{original_chunk}" with a `failed` issue; other errors fail the chapter
-     - QA: run `qa::check_chunk` with `ChunkContext { source: chunk, glossary: ctx.glossary, known_names }` and append its issues, skipping kinds the translator already reported. While the latest attempt has an issue with `qa.retries_on(kind)` and fewer than `qa.max_retries` QA retries were made, send the chunk again with `qa::requirements(..)` prepended to the user turn (`{requirements}\n\nPassage:\n{chunk}`; the plain chunk when there are none). Failed attempts and requirements never enter the history. Keep the attempt with the lowest `qa::severity` (the later one on a tie); a QA retry that fails outright keeps the best earlier attempt. The history records the plain chunk and the kept reply
+     - QA: run `qa::check_chunk` with `ChunkContext { source: chunk, glossary: ctx.glossary, known_names, output_rules: ctx.output_rules }`, plus `qa::check_honorifics(reply, output_rules)` when the context has output rules, and append their issues, skipping kinds the translator already reported. While the latest attempt has an issue with `qa.retries_on(kind)` and fewer than `qa.max_retries` QA retries were made, send the chunk again with `qa::requirements(..)` prepended to the user turn (`{requirements}\n\nPassage:\n{chunk}`; the plain chunk when there are none). Failed attempts and requirements never enter the history. Keep the attempt with the lowest `qa::severity` (the later one on a tie); a QA retry that fails outright keeps the best earlier attempt. The history records the plain chunk and the kept reply
    - Callers print one warning per issue (`Chapter N chunk i: kind — detail`, kind in snake_case)
 
 **Text Chunking Algorithm** (`utils::split_into_scene_chunks`, used by both `split_text_into_chunks` and the name scout):
@@ -978,9 +1003,10 @@ For stories where chapter_list == "ONESHOT":
 5. **Translate Content**:
    - Check if `oneshot.txt` exists
    - If not:
-     - Render the translation input with `render_translation_input`, which returns `TranslationInput { rendered, mapped }`: `rendered` is `ruby::for_translation(original)` (the cast is matched against it) and `mapped` is `rendered` after name substitution and `mark_scene_breaks`, exactly what the model is sent
-     - Build the prompt with `chapter_prompt_context(.., &rendered, &mapped)`
-     - Call `translator.translate_content()` with the known English name renderings and progress info and write the chunk outputs joined with "\n\n"
+     - Load the story folder's `book.json` if present and build the output rules with `novel_output_rules` (policy from `book.json` `honorifics`, else `translation.honorifics`; the known English name renderings; `book.json` `replacements`)
+     - Render the translation input with `render_translation_input(name_mapping, original, policy)`, which returns `TranslationInput { rendered, mapped }`: `rendered` is `ruby::for_translation(original)` (the cast is matched against it) and `mapped` is `rendered` after name substitution, `honorifics::apply_source(.., policy)` and `mark_scene_breaks`, exactly what the model is sent
+     - Build the prompt with `chapter_prompt_context(.., &output_rules, .., &rendered, &mapped)`
+     - Call `translator.translate_content()` with the known English name renderings and progress info and write `output_rules::postprocess` of the chunk outputs joined with "\n\n"
      - Save as UTF-8
    - Display success/failure message
 
@@ -1021,19 +1047,20 @@ For stories with chapter list:
 5. **Translation Phase**:
    - Index translated chapters with `epub::collect_chapters` (files `N - Title.txt` directly in the story folder, any padding; `Original/` and `.tsundoku/` are ignored)
    - Known names: the English renderings of `NameMappingStore::known_mappings().names`
+   - Output rules, built once per novel with `novel_output_rules`: the policy from `book.json` `honorifics`, else `translation.honorifics`; the known names; `book.json` `replacements`
    - For each downloaded chapter:
      - Not translated yet: translate it whole (below)
      - Translated, no `--recheck`: skip
      - Translated, with `--recheck`: plan a recheck (below); skip if nothing matches
-   - Every chapter to translate or recheck: render the input with `render_translation_input` (the single translation input pipeline, shared with one-shots and the recheck checks) and build its prompt once with `chapter_prompt_context`
+   - Every chapter to translate or recheck: render the input with `render_translation_input(.., policy)` (the single translation input pipeline, shared with one-shots and the recheck checks, always with the novel's effective policy so `stale` compares like with like) and build its prompt once with `chapter_prompt_context` (which carries the output rules)
    - Whole chapter:
-     - Translate the title: apply name mapping, strip the author's chapter number, translate, and head it `Chapter N: …` (`Chapter N` for an empty title)
+     - Translate the title: apply name mapping and `honorifics::apply_source`, strip the author's chapter number, translate, and head it `Chapter N: …` (`Chapter N` for an empty title)
      - Translate content with `translate_content` and build a `ChapterRecord` (one `ChunkRecord { source, raw: output, issues }` per chunk)
-   - Save each finished chapter: write the record to `.tsundoku/chunks/{N}.json`, then the `.txt` from `record.raw_text()` (the raw outputs joined with "\n\n"), then remove the file it replaces if the file name changed (`tsundoku-epub` keeps only the first file per number); update `book.json`; print one warning per issue of the chunks just translated
+   - Save each finished chapter: write the record to `.tsundoku/chunks/{N}.json`, then the `.txt` as `output_rules::postprocess(record.raw_text())` (the raw outputs joined with "\n\n", then the honorific rule and replacements; the record keeps the raw outputs, so rules never compound), then remove the file it replaces if the file name changed (`tsundoku-epub` keeps only the first file per number); update `book.json`; print one warning per issue of the chunks just translated
    - Display success/failure message
 
 6. **Recheck planning** (`--recheck`), per translated chapter:
-   - No record (legacy chapter): read the `.txt`, run `qa::check_chunk` on the whole text against the whole rendered input (`mapped`), the glossary of the chapter's prompt and the known names, and save `ChapterRecord::legacy` (one chunk, `source: null`, title from `book.json` or the file name)
+   - No record (legacy chapter): read the `.txt`, run `qa::check_chunk` on the whole text against the whole rendered input (`mapped`), the glossary of the chapter's prompt and the known names, plus `qa::check_honorifics` with the output rules, and save `ChapterRecord::legacy` (one chunk, `source: null`, title from `book.json` or the file name)
    - Legacy record: re-translate the whole chapter if any issue matches the requested classes; `stale` cannot compare it and it is counted as skipped
    - Normal record: flag chunks with an issue in the requested classes; with `stale`, compare `split_text_into_chunks(mapped)` with the record (`Staleness`): changed chunks are flagged, a different chunk count re-translates the whole chapter
    - Flagged chunks of a normal record: build one `ChunkPlan` per recorded chunk (`Translate` with the current source when the chunk count is unchanged, else the recorded source; `Keep { source, raw }` for the rest), translate with `translate_chunks`, splice the results into the record, keep the title, and save as above

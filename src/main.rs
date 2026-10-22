@@ -15,11 +15,13 @@ use tsundoku::chapter_record::{CHAPTER_RECORD_VERSION, ChapterRecord, ChunkRecor
 use tsundoku::config::{Config, TranslationConfig};
 use tsundoku::console::{Console, Style};
 use tsundoku::epub::{BookInfo, ChapterFile, collect_chapters};
+use tsundoku::honorifics::{self, HonorificPolicy};
 use tsundoku::name_mapping::{KnownMappings, NameMappingStore, TermEntry};
 use tsundoku::name_scout::{
     NameScout, NameScoutEvent, NameScoutProgress, NameScoutStatus, ScoutChunk, ScoutProgressInfo,
     build_chapter_payload,
 };
+use tsundoku::output_rules::{OutputRules, postprocess};
 use tsundoku::qa::{self, ChunkContext, Issue, IssueClass, QaConfig};
 use tsundoku::ruby;
 use tsundoku::scrapers::{ChapterInfo, ChapterList, ScraperRegistry};
@@ -445,12 +447,17 @@ async fn process_oneshot(params: &mut ProcessParams<'_>) -> Result<()> {
         params.console.step("Translating content...");
 
         // Render the translation input and collect canonical terms and the cast for
-        // this story.
-        let input = render_translation_input(params.name_mapping, &content);
+        // this story. The one-shot's book.json, if any, may set its honorific
+        // policy and replacements.
+        let book = BookMetadata::load(&story_dir)?.unwrap_or_default();
+        let known_names = known_name_renderings(params.name_mapping);
+        let rules = novel_output_rules(&book, &params.config.translation, &known_names)?;
+        let input = render_translation_input(params.name_mapping, &content, rules.policy());
         let prompt = chapter_prompt_context(
             params.name_mapping,
             params.summary_store,
             &params.config.translation,
+            &rules,
             1,
             &input.rendered,
             &input.mapped,
@@ -465,14 +472,16 @@ async fn process_oneshot(params: &mut ProcessParams<'_>) -> Result<()> {
             reporter: None,
         };
 
-        let known_names = known_name_renderings(params.name_mapping);
         let chunks = params
             .translator
             .translate_content(&mapped_content, &prompt, &known_names, Some(progress))
             .await
             .context("Failed to translate content")?;
 
-        std::fs::write(&translated_path, chapter_text(&chunks))?;
+        std::fs::write(
+            &translated_path,
+            postprocess(&chapter_text(&chunks), &rules),
+        )?;
         params.console.success("Translation saved");
         warn_chunk_issues(
             params.console,
@@ -676,6 +685,8 @@ async fn translate_chapters(
     ));
 
     let known_names = known_name_renderings(name_mapping);
+    let rules = novel_output_rules(book, translation_config, &known_names)?;
+    let policy = rules.policy();
     let translations = translated_chapter_files(story_dir)?;
     let mut summary = RecheckSummary::default();
     let mut jobs = Vec::new();
@@ -689,11 +700,12 @@ async fn translate_chapters(
             continue;
         }
 
-        let input = render_translation_input(name_mapping, &chapter_data.content);
+        let input = render_translation_input(name_mapping, &chapter_data.content, policy);
         let prompt = chapter_prompt_context(
             name_mapping,
             summary_store,
             translation_config,
+            &rules,
             chapter_data.number,
             &input.rendered,
             &input.mapped,
@@ -710,6 +722,7 @@ async fn translate_chapters(
                     translator,
                     story_dir,
                     known_names: &known_names,
+                    output_rules: &rules,
                     qa_config,
                     recheck,
                 };
@@ -737,7 +750,10 @@ async fn translate_chapters(
             number: chapter_data.number,
             title: chapter_data.title.clone(),
             chapter_num_str,
-            mapped_title: name_mapping.apply_to_text(&ruby::for_translation(&chapter_data.title)),
+            mapped_title: honorifics::apply_source(
+                &name_mapping.apply_to_text(&ruby::for_translation(&chapter_data.title)),
+                policy,
+            ),
             mapped_content: input.mapped,
             prompt,
             previous_path: existing.map(|existing| existing.path.clone()),
@@ -760,6 +776,7 @@ async fn translate_chapters(
             console,
             translator,
             &known_names,
+            &rules,
             jobs,
             story_dir,
             book,
@@ -776,10 +793,12 @@ async fn translate_chapters(
 }
 
 /// Translate jobs on `workers` concurrent workers, saving each chapter as it finishes.
+#[allow(clippy::too_many_arguments)]
 async fn run_translation_jobs(
     console: &Console,
     translator: &Translator,
     known_names: &[String],
+    output_rules: &OutputRules,
     jobs: Vec<TranslationJob>,
     story_dir: &Path,
     book: &mut BookMetadata,
@@ -831,7 +850,7 @@ async fn run_translation_jobs(
         futures::pin_mut!(translated);
         while let Some(result) = translated.next().await {
             let chapter = result?;
-            let removed = save_translated_chapter(story_dir, &chapter).await?;
+            let removed = save_translated_chapter(story_dir, &chapter, output_rules).await?;
             book.chapters.insert(
                 chapter.number,
                 ChapterMetadata {
@@ -871,13 +890,15 @@ async fn run_translation_jobs(
 
 /// Build a chapter's prompt context: the canonical terms present in the
 /// name-substituted `mapped_content`, the cast whose original names occur in
-/// `rendered` (the ruby-rendered chapter text before name substitution), and the
+/// `rendered` (the ruby-rendered chapter text before name substitution), the
 /// synopses of the chapters before `chapter`, with names normalised to their
-/// selected renderings.
+/// selected renderings, and the novel's `output_rules` (honorific policy line and
+/// honorific QA).
 fn chapter_prompt_context(
     name_mapping: &NameMappingStore,
     summary_store: &SummaryStore,
     translation_config: &TranslationConfig,
+    output_rules: &Arc<OutputRules>,
     chapter: u32,
     rendered: &str,
     mapped_content: &str,
@@ -891,7 +912,22 @@ fn chapter_prompt_context(
             .into_iter()
             .map(|(number, synopsis)| (number, name_mapping.normalize_renderings(&synopsis)))
             .collect(),
+        output_rules: Some(Arc::clone(output_rules)),
     }
+}
+
+/// The novel's output rules: its honorific policy (`book.json`, else
+/// `[translation] honorifics`), the selected English name renderings and the
+/// `book.json` replacements.
+fn novel_output_rules(
+    book: &BookMetadata,
+    translation_config: &TranslationConfig,
+    known_names: &[String],
+) -> Result<Arc<OutputRules>> {
+    let rules = book
+        .output_rules(translation_config.honorifics, known_names)
+        .context("Invalid book.json replacements")?;
+    Ok(Arc::new(rules))
 }
 
 /// Translation input rendered from original text.
@@ -899,19 +935,27 @@ struct TranslationInput {
     /// Ruby rendered for translation, before name substitution (what the cast is
     /// matched against).
     rendered: String,
-    /// Exactly what the translator is sent: `rendered` with names substituted and
-    /// blank-line scene breaks marked.
+    /// Exactly what the translator is sent: `rendered` with names substituted,
+    /// honorifics after them rewritten by the policy, and blank-line scene breaks
+    /// marked.
     mapped: String,
 }
 
 /// Render original chapter text into the translation input: ruby rendered for
-/// translation, then names substituted and blank-line scene breaks marked.
+/// translation, then names substituted, honorifics following them rewritten
+/// ([`honorifics::apply_source`]) and blank-line scene breaks marked.
 ///
-/// Translation, one-shots and the `--recheck` stale and legacy checks all use it,
-/// so recorded chunk sources stay comparable with a fresh render.
-fn render_translation_input(name_mapping: &NameMappingStore, original: &str) -> TranslationInput {
+/// Translation, one-shots and the `--recheck` stale and legacy checks all use it
+/// with the novel's effective policy, so recorded chunk sources stay comparable
+/// with a fresh render.
+fn render_translation_input(
+    name_mapping: &NameMappingStore,
+    original: &str,
+    policy: HonorificPolicy,
+) -> TranslationInput {
     let rendered = ruby::for_translation(original);
-    let mapped = mark_scene_breaks(name_mapping.apply_to_text(&rendered));
+    let named = honorifics::apply_source(&name_mapping.apply_to_text(&rendered), policy);
+    let mapped = mark_scene_breaks(named);
     TranslationInput { rendered, mapped }
 }
 
@@ -946,6 +990,8 @@ struct RecheckContext<'a> {
     translator: &'a Translator,
     story_dir: &'a Path,
     known_names: &'a [String],
+    /// The novel's output rules, for the honorific check of legacy chapters.
+    output_rules: &'a OutputRules,
     qa_config: &'a QaConfig,
     recheck: &'a Recheck,
 }
@@ -1022,8 +1068,10 @@ async fn plan_recheck(
                 source: mapped_content,
                 glossary,
                 known_names: ctx.known_names,
+                output_rules: Some(ctx.output_rules),
             };
-            let issues = qa::check_chunk(&qa_ctx, &text, ctx.qa_config);
+            let mut issues = qa::check_chunk(&qa_ctx, &text, ctx.qa_config);
+            issues.extend(qa::check_honorifics(&text, ctx.output_rules));
             let record = ChapterRecord::legacy(number, title.to_string(), text, issues);
             record
                 .save(ctx.story_dir)
@@ -1094,12 +1142,15 @@ async fn plan_recheck(
     Ok(Some(JobScope::Chunks { record, plan }))
 }
 
-/// Write a translated chapter: its record, then the `.txt` built from the record,
-/// then remove the file it replaces when the name changed (`tsundoku-epub` keeps
-/// only the first file per chapter number). Returns the removed file.
+/// Write a translated chapter: its record, then the `.txt` built from the record's
+/// raw text with `output_rules` applied (the record keeps the raw text, so the
+/// rules can be re-applied without compounding), then remove the file it replaces
+/// when the name changed (`tsundoku-epub` keeps only the first file per chapter
+/// number). Returns the removed file.
 async fn save_translated_chapter(
     story_dir: &Path,
     chapter: &TranslatedChapter,
+    output_rules: &OutputRules,
 ) -> Result<Option<PathBuf>> {
     chapter
         .record
@@ -1107,7 +1158,7 @@ async fn save_translated_chapter(
         .await
         .with_context(|| format!("Failed to save the record of chapter {}", chapter.number))?;
     let path = story_dir.join(&chapter.filename);
-    tokio::fs::write(&path, chapter.record.raw_text())
+    tokio::fs::write(&path, postprocess(&chapter.record.raw_text(), output_rules))
         .await
         .with_context(|| format!("Failed to write {}", path.display()))?;
 
@@ -2223,10 +2274,18 @@ mod tests {
         summaries.set(4, "Ruri leaves.".to_string());
         let config = TranslationConfig::default();
         let previously = |chapter, config: &TranslationConfig| {
-            chapter_prompt_context(&name_mapping, &summaries, config, chapter, "", "")
-                .system_prompt("Base")
-                .split_once("\n\nStory so far (context only; do not translate):\n")
-                .map(|(_, section)| section.to_string())
+            chapter_prompt_context(
+                &name_mapping,
+                &summaries,
+                config,
+                &Arc::new(OutputRules::default()),
+                chapter,
+                "",
+                "",
+            )
+            .system_prompt("Base")
+            .split_once("\n\nStory so far (context only; do not translate):\n")
+            .map(|(_, section)| section.to_string())
         };
 
         assert_eq!(previously(1, &config), None);
@@ -2470,14 +2529,18 @@ mod tests {
             summary: &mut RecheckSummary,
         ) -> Option<JobScope> {
             let known_names = known_name_renderings(&self.name_mapping);
+            let output_rules = OutputRules::default();
             let ctx = RecheckContext {
                 translator: &self.translator,
                 story_dir: self.story_dir(),
                 known_names: &known_names,
+                output_rules: &output_rules,
                 qa_config: &QaConfig::default(),
                 recheck,
             };
-            let mapped = render_translation_input(&self.name_mapping, original).mapped;
+            let mapped =
+                render_translation_input(&self.name_mapping, original, HonorificPolicy::Keep)
+                    .mapped;
             let glossary = self.name_mapping.glossary_for_text(&mapped, 100);
             plan_recheck(&ctx, existing, &existing.title, &mapped, &glossary, summary)
                 .await
@@ -2495,12 +2558,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn translation_input_applies_the_honorific_policy_after_names() {
+        let fixture = RecheckFixture::new();
+        let original = "達也君は笑った。\n村長さんが来た。";
+        let render = |policy| render_translation_input(&fixture.name_mapping, original, policy);
+
+        let keep = render(HonorificPolicy::Keep);
+        assert_eq!(keep.mapped, "Tatsuya-kunは笑った。\n村長さんが来た。");
+        assert_eq!(keep.rendered, original);
+        assert_eq!(
+            render(HonorificPolicy::NamesOnly).mapped,
+            "Tatsuya-kunは笑った。\n村長さんが来た。"
+        );
+        let drop = render(HonorificPolicy::Drop);
+        assert_eq!(drop.mapped, "Tatsuyaは笑った。\n村長さんが来た。");
+        assert_eq!(drop.rendered, original);
+    }
+
     #[tokio::test]
     async fn stale_recheck_retranslates_only_chunks_changed_by_a_mapping_edit() {
         let mut fixture = RecheckFixture::new();
         let original = "達也は笑った。\n花子は泣いた。";
         let sources = fixture.translator.split_text_into_chunks(
-            &render_translation_input(&fixture.name_mapping, original).mapped,
+            &render_translation_input(&fixture.name_mapping, original, HonorificPolicy::Keep)
+                .mapped,
         );
         assert_eq!(sources, ["Tatsuyaは笑った。", "花子は泣いた。"]);
         let record = ChapterRecord {
@@ -2625,6 +2707,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_chapter_records_honorifics_on_nouns() {
+        let fixture = RecheckFixture::new();
+        let existing = chapter_file(
+            fixture.story_dir(),
+            4,
+            "Chapter 4: Cats",
+            "Tatsuya fed the cat-san.",
+        );
+        let honorifics = Recheck {
+            classes: vec![IssueClass::Honorifics],
+            stale: false,
+        };
+
+        let scope = fixture
+            .plan(
+                &honorifics,
+                &existing,
+                "達也は猫さんに餌をやった。",
+                &mut RecheckSummary::default(),
+            )
+            .await;
+
+        assert!(matches!(scope, Some(JobScope::Whole)));
+        let record = ChapterRecord::load(fixture.story_dir(), 4)
+            .await
+            .unwrap()
+            .unwrap();
+        let honorific_issues: Vec<&str> = record.chunks[0]
+            .issues
+            .iter()
+            .filter(|issue| issue.kind == qa::IssueKind::HonorificOnNoun)
+            .map(|issue| issue.detail.as_str())
+            .collect();
+        assert_eq!(honorific_issues, ["cat-san"]);
+    }
+
+    #[tokio::test]
     async fn saving_a_retitled_chapter_replaces_the_old_file() {
         let temp_dir = TempDir::new().unwrap();
         let story_dir = temp_dir.path();
@@ -2651,7 +2770,10 @@ mod tests {
             translated_chunks: vec![0, 1],
         };
 
-        let removed = save_translated_chapter(story_dir, &chapter).await.unwrap();
+        let rules = OutputRules::default();
+        let removed = save_translated_chapter(story_dir, &chapter, &rules)
+            .await
+            .unwrap();
 
         assert_eq!(removed, Some(old.path.clone()));
         assert!(!old.path.exists());
@@ -2672,10 +2794,62 @@ mod tests {
             ..chapter
         };
         assert_eq!(
-            save_translated_chapter(story_dir, &again).await.unwrap(),
+            save_translated_chapter(story_dir, &again, &rules)
+                .await
+                .unwrap(),
             None
         );
         assert!(files[&7].path.exists());
+    }
+
+    #[tokio::test]
+    async fn saved_chapter_text_is_postprocessed_but_the_record_keeps_raw() {
+        let temp_dir = TempDir::new().unwrap();
+        let story_dir = temp_dir.path();
+        let raw = "Ruri waved at the cat-san.";
+        let record = ChapterRecord {
+            version: CHAPTER_RECORD_VERSION,
+            chapter: 2,
+            title: "Chapter 2: Cats".to_string(),
+            chunks: vec![ChunkRecord {
+                source: Some("ルリは猫さんに手を振った。".to_string()),
+                raw: raw.to_string(),
+                issues: Vec::new(),
+            }],
+        };
+        let chapter = TranslatedChapter {
+            filename: chapter_filename("2", &record.title),
+            number: 2,
+            original_title: "猫".to_string(),
+            record,
+            previous_path: None,
+            translated_chunks: vec![0],
+        };
+        let book = BookMetadata {
+            honorifics: Some(HonorificPolicy::NamesOnly),
+            replacements: vec![tsundoku::book::Replacement {
+                find: "Ruri".to_string(),
+                replace: "Ruri-chan".to_string(),
+                regex: false,
+            }],
+            ..BookMetadata::default()
+        };
+        let rules =
+            novel_output_rules(&book, &TranslationConfig::default(), &["Ruri".into()]).unwrap();
+        let path = story_dir.join(&chapter.filename);
+
+        // Saving twice re-applies the rules to the raw text, never to the output.
+        for _ in 0..2 {
+            save_translated_chapter(story_dir, &chapter, &rules)
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "Ruri-chan waved at the cat."
+            );
+            let saved = ChapterRecord::load(story_dir, 2).await.unwrap().unwrap();
+            assert_eq!(saved.raw_text(), raw);
+        }
     }
 
     /// Serve streamed chat completions on a background thread, answering each

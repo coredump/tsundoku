@@ -6,13 +6,16 @@
 use crate::config::{ApiConfig, TranslationConfig};
 use crate::console::Console;
 use crate::error::TranslationError;
+use crate::honorifics;
 use crate::name_mapping::{CastEntry, TermEntry};
+use crate::output_rules::OutputRules;
 use crate::qa::{self, ChunkContext, Issue, IssueKind, QaConfig};
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::io::{self, Write};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -38,6 +41,8 @@ enum PromptSection {
     Base,
     /// The English-only and ruby rules.
     Rules,
+    /// The novel's honorific policy line.
+    Honorifics,
     /// Characters present in the chapter, with gender and note.
     Cast,
     /// Canonical terminology renderings.
@@ -48,9 +53,10 @@ enum PromptSection {
 
 impl PromptSection {
     /// Rendering order of the system prompt sections.
-    const ORDER: [PromptSection; 5] = [
+    const ORDER: [PromptSection; 6] = [
         Self::Base,
         Self::Rules,
+        Self::Honorifics,
         Self::Cast,
         Self::Glossary,
         Self::Previously,
@@ -72,12 +78,16 @@ pub struct PromptContext {
     /// Synopses of the previous chapters as `(chapter number, synopsis)`, oldest
     /// first, with names already normalised to their selected renderings.
     pub previously: Vec<(u32, String)>,
+    /// The novel's output rules. Their honorific policy is rendered as the
+    /// honorifics line, and replies are checked with [`qa::check_honorifics`]
+    /// against them; `None` leaves out both.
+    pub output_rules: Option<Arc<OutputRules>>,
 }
 
 impl PromptContext {
     /// Render the content system prompt: `base`, the English-only and ruby rules,
-    /// the cast, the glossary, then the previous chapters' synopses. Sections are
-    /// separated by a blank line; empty ones are left out.
+    /// the honorific policy, the cast, the glossary, then the previous chapters'
+    /// synopses. Sections are separated by a blank line; empty ones are left out.
     pub fn system_prompt(&self, base: &str) -> String {
         let mut prompt = String::new();
         for section in PromptSection::ORDER {
@@ -102,6 +112,11 @@ impl PromptContext {
                 out.push_str(ENGLISH_ONLY_RULE);
                 out.push('\n');
                 out.push_str(RUBY_RULE);
+            }
+            PromptSection::Honorifics => {
+                if let Some(rules) = &self.output_rules {
+                    out.push_str(honorifics::prompt_line(rules.policy()));
+                }
             }
             PromptSection::Cast => {
                 if self.cast.is_empty() {
@@ -518,6 +533,7 @@ impl Translator {
                 source: &chunk,
                 glossary: &ctx.glossary,
                 known_names,
+                output_rules: ctx.output_rules.as_deref(),
             };
             let result = match self
                 .translate_with_retries(&chunk, &mut history, progress, &label, Some(&qa_ctx))
@@ -639,11 +655,16 @@ impl Translator {
         Ok(best)
     }
 
-    /// Append [`qa::check_chunk`] issues to a reply's, skipping kinds it already has.
+    /// Append [`qa::check_chunk`] and [`qa::check_honorifics`] issues to a reply's,
+    /// skipping kinds it already has.
     fn add_qa_issues(&self, qa_ctx: &ChunkContext<'_>, reply: &mut AcceptedReply) {
         let own: Vec<IssueKind> = reply.issues.iter().map(|issue| issue.kind).collect();
+        let mut issues = qa::check_chunk(qa_ctx, &reply.text, &self.qa_config);
+        if let Some(rules) = qa_ctx.output_rules {
+            issues.extend(qa::check_honorifics(&reply.text, rules));
+        }
         reply.issues.extend(
-            qa::check_chunk(qa_ctx, &reply.text, &self.qa_config)
+            issues
                 .into_iter()
                 .filter(|issue| !own.contains(&issue.kind)),
         );
@@ -1021,6 +1042,7 @@ impl Translator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::honorifics::HonorificPolicy;
     use crate::name_mapping::Gender;
 
     fn make_translator() -> Translator {
@@ -1058,23 +1080,64 @@ mod tests {
                 (3, "Ruri arrives.".to_string()),
                 (4, "Tatsuya leaves.".to_string()),
             ],
+            output_rules: Some(Arc::new(names_only_rules())),
         };
 
         let prompt = ctx.system_prompt("Translate this content");
 
         let rules = prompt.find(ENGLISH_ONLY_RULE).unwrap();
         let ruby = prompt.find(RUBY_RULE).unwrap();
+        let honorifics = prompt
+            .find(honorifics::prompt_line(HonorificPolicy::NamesOnly))
+            .unwrap();
         let cast = prompt.find("Characters in this chapter").unwrap();
         let glossary = prompt
             .find("Use these canonical terminology renderings exactly")
             .unwrap();
         let previously = prompt.find("Story so far").unwrap();
         assert!(prompt.starts_with("Translate this content\n\n"));
-        assert!(rules < ruby && ruby < cast && cast < glossary && glossary < previously);
+        assert!(
+            rules < ruby
+                && ruby < honorifics
+                && honorifics < cast
+                && cast < glossary
+                && glossary < previously
+        );
+        assert!(prompt.contains(&format!(
+            "{RUBY_RULE}\n\n{}\n\nCharacters in this chapter",
+            honorifics::prompt_line(HonorificPolicy::NamesOnly)
+        )));
         assert!(prompt.contains("- 魔石 → Magic Stone\n\nStory so far"));
         assert!(prompt.ends_with(
             "Story so far (context only; do not translate):\n- Ch 3: Ruri arrives.\n- Ch 4: Tatsuya leaves."
         ));
+    }
+
+    fn names_only_rules() -> OutputRules {
+        OutputRules::new(HonorificPolicy::NamesOnly, ["Ruri"], &[]).unwrap()
+    }
+
+    #[test]
+    fn test_system_prompt_renders_each_honorific_policy_after_rules() {
+        for policy in [
+            HonorificPolicy::Keep,
+            HonorificPolicy::Drop,
+            HonorificPolicy::NamesOnly,
+        ] {
+            let ctx = PromptContext {
+                output_rules: Some(Arc::new(
+                    OutputRules::new(policy, Vec::<String>::new(), &[]).unwrap(),
+                )),
+                ..PromptContext::default()
+            };
+            assert_eq!(
+                ctx.system_prompt("Base"),
+                format!(
+                    "Base\n\n{ENGLISH_ONLY_RULE}\n{RUBY_RULE}\n\n{}",
+                    honorifics::prompt_line(policy)
+                )
+            );
+        }
     }
 
     #[test]
@@ -1488,6 +1551,7 @@ mod tests {
                 note: None,
             }],
             previously: vec![(1, "Kirigaya meets Ruri.".to_string())],
+            output_rules: Some(Arc::new(names_only_rules())),
         };
 
         let chunks = translator
@@ -1580,6 +1644,35 @@ mod tests {
         assert_eq!(bodies.len(), 2);
         assert_eq!(chunks[0].output, "He picked up a stone.");
         assert_eq!(kinds(&chunks[0]), [IssueKind::GlossaryMissing]);
+    }
+
+    #[tokio::test]
+    async fn test_honorific_on_noun_is_recorded_without_a_retry() {
+        let (base_url, server) = serve_streamed_replies(&["Ruri-chan fed the cat-san."]);
+        let translator = translator_with_qa(
+            base_url,
+            TranslationConfig::default(),
+            QaConfig {
+                retry_on: crate::qa::IssueClass::ALL.to_vec(),
+                ..QaConfig::default()
+            },
+        );
+        let ctx = PromptContext {
+            output_rules: Some(Arc::new(names_only_rules())),
+            ..PromptContext::default()
+        };
+
+        let chunks = translator
+            .translate_content("Ruri-chanは猫さんに餌をやった。", &ctx, &[], None)
+            .await
+            .unwrap();
+        let bodies = server.join().unwrap();
+
+        // Record-only: one request, the raw reply kept, the issue recorded.
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(chunks[0].output, "Ruri-chan fed the cat-san.");
+        assert_eq!(kinds(&chunks[0]), [IssueKind::HonorificOnNoun]);
+        assert_eq!(chunks[0].issues[0].detail, "cat-san");
     }
 
     #[tokio::test]
