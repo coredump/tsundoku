@@ -7,6 +7,7 @@
 //! - Building EPUB volumes from translated chapters
 
 pub mod book;
+pub mod chapter_record;
 pub mod config;
 pub mod console;
 mod cookies;
@@ -27,7 +28,8 @@ pub mod utils;
 pub use config::Config;
 pub use console::Console;
 pub use error::{
-    BookMetadataError, ConfigError, EpubError, NameMappingError, ScraperError, TranslationError,
+    BookMetadataError, ChapterRecordError, ConfigError, EpubError, NameMappingError, ScraperError,
+    TranslationError,
 };
 pub use name_mapping::{NameEntry, NameMappingStore, NamePart, TermEntry};
 pub use name_scout::NameScout;

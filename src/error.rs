@@ -202,5 +202,36 @@ pub enum EpubError {
     Zip(#[from] zip::result::ZipError),
 }
 
+/// Error type for per-chapter QA records (`.tsundoku/chunks/{chapter}.json`).
+#[derive(Error, Debug)]
+pub enum ChapterRecordError {
+    /// The record could not be read, written, or its folder created.
+    #[error("I/O error on {}: {source}", path.display())]
+    Io {
+        /// Path of the record (or its folder).
+        path: std::path::PathBuf,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+
+    /// The record is not valid JSON for this format, or could not be serialized.
+    #[error("Invalid chapter record {}: {source}", path.display())]
+    Json {
+        /// Path of the record.
+        path: std::path::PathBuf,
+        /// Underlying JSON error.
+        source: serde_json::Error,
+    },
+
+    /// The record was written by a newer (or unknown) format version.
+    #[error("Unsupported chapter record version {version} in {}", path.display())]
+    UnsupportedVersion {
+        /// Path of the record.
+        path: std::path::PathBuf,
+        /// Version found in the file.
+        version: u32,
+    },
+}
+
 /// Result type alias using anyhow for application-level error handling.
 pub type Result<T> = anyhow::Result<T>;
