@@ -1061,7 +1061,7 @@ For stories with chapter list:
 
 6. **Recheck planning** (`--recheck`), per translated chapter:
    - No record (legacy chapter): read the `.txt`, run `qa::check_chunk` on the whole text against the whole rendered input (`mapped`), the glossary of the chapter's prompt and the known names, plus `qa::check_honorifics` with the output rules, and save `ChapterRecord::legacy` (one chunk, `source: null`, title from `book.json` or the file name)
-   - Legacy record: re-translate the whole chapter if any issue matches the requested classes; `stale` cannot compare it and it is counted as skipped
+   - Legacy record (including one snapshotted by `--rewrite-text` with no issues): run the same chapter-level checks on the record's `raw_text()` and save the record when its issues changed; then re-translate the whole chapter if any issue matches the requested classes; `stale` cannot compare it and it is counted as skipped
    - Normal record: flag chunks with an issue in the requested classes; with `stale`, compare `split_text_into_chunks(mapped)` with the record (`Staleness`): changed chunks are flagged, a different chunk count re-translates the whole chapter
    - Flagged chunks of a normal record: build one `ChunkPlan` per recorded chunk (`Translate` with the current source when the chunk count is unchanged, else the recorded source; `Keep { source, raw }` for the rest), translate with `translate_chunks`, splice the results into the record, keep the title, and save as above
    - Print a summary at the end: chapters checked, re-translated whole and in part (and chunk count), legacy chapters recorded, and legacy chapters skipped for `stale`

@@ -1039,12 +1039,14 @@ impl RecheckSummary {
 /// A chapter without a record is a legacy translation: it is checked as a whole
 /// against the current translation input (`mapped_content`, with `glossary`, the
 /// glossary of the chapter's prompt) and gets a one-chunk record with no
-/// source. A legacy chapter with a matching issue is re-translated whole; `stale`
-/// cannot apply to it. In a normal record, chunks with a matching issue and (with
-/// `stale`) chunks whose source changed are re-translated, from the current source
-/// when the chunk count is unchanged and from the recorded source otherwise; a
-/// stale chunk count re-translates the whole chapter. Returns `None` when nothing
-/// matches.
+/// source. An existing legacy record (e.g. one snapshotted by `tsundoku-epub
+/// --rewrite-text`) is checked again the same way, so its issues follow the
+/// current mapping. A legacy chapter with a matching issue is re-translated whole;
+/// `stale` cannot apply to it. In a normal record, chunks with a matching issue
+/// and (with `stale`) chunks whose source changed are re-translated, from the
+/// current source when the chunk count is unchanged and from the recorded source
+/// otherwise; a stale chunk count re-translates the whole chapter. Returns `None`
+/// when nothing matches.
 async fn plan_recheck(
     ctx: &RecheckContext<'_>,
     existing: &ChapterFile,
@@ -1055,23 +1057,40 @@ async fn plan_recheck(
 ) -> Result<Option<JobScope>> {
     let number = existing.number;
     summary.checked += 1;
+    let legacy_issues = |text: &str| {
+        let qa_ctx = ChunkContext {
+            source: mapped_content,
+            glossary,
+            known_names: ctx.known_names,
+            output_rules: Some(ctx.output_rules),
+        };
+        let mut issues = qa::check_chunk(&qa_ctx, text, ctx.qa_config);
+        issues.extend(qa::check_honorifics(text, ctx.output_rules));
+        issues
+    };
     let record = match ChapterRecord::load(ctx.story_dir, number)
         .await
         .with_context(|| format!("Failed to load the record of chapter {number}"))?
     {
-        Some(record) => record,
+        Some(mut record) => {
+            if record.is_legacy() {
+                let issues = legacy_issues(&record.raw_text());
+                if let [chunk] = record.chunks.as_mut_slice()
+                    && chunk.issues != issues
+                {
+                    chunk.issues = issues;
+                    record.save(ctx.story_dir).await.with_context(|| {
+                        format!("Failed to save the record of chapter {number}")
+                    })?;
+                }
+            }
+            record
+        }
         None => {
             let text = tokio::fs::read_to_string(&existing.path)
                 .await
                 .with_context(|| format!("Failed to read {}", existing.path.display()))?;
-            let qa_ctx = ChunkContext {
-                source: mapped_content,
-                glossary,
-                known_names: ctx.known_names,
-                output_rules: Some(ctx.output_rules),
-            };
-            let mut issues = qa::check_chunk(&qa_ctx, &text, ctx.qa_config);
-            issues.extend(qa::check_honorifics(&text, ctx.output_rules));
+            let issues = legacy_issues(&text);
             let record = ChapterRecord::legacy(number, title.to_string(), text, issues);
             record
                 .save(ctx.story_dir)
@@ -2703,6 +2722,50 @@ mod tests {
                 legacy_stale_skipped: 1,
                 ..RecheckSummary::default()
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_legacy_record_without_issues_is_checked_again() {
+        let fixture = RecheckFixture::new();
+        let existing = chapter_file(
+            fixture.story_dir(),
+            2,
+            "Chapter 2: Snapshot",
+            "He picked up a stone.",
+        );
+        // As `tsundoku-epub --rewrite-text` leaves it: a legacy record with no issues.
+        ChapterRecord::legacy(
+            2,
+            "Chapter 2: Snapshot".to_string(),
+            "He picked up a stone.".to_string(),
+            Vec::new(),
+        )
+        .save(fixture.story_dir())
+        .await
+        .unwrap();
+        let glossary = Recheck {
+            classes: vec![IssueClass::Glossary],
+            stale: false,
+        };
+
+        let scope = fixture
+            .plan(
+                &glossary,
+                &existing,
+                "魔石を拾った。",
+                &mut RecheckSummary::default(),
+            )
+            .await;
+
+        assert!(matches!(scope, Some(JobScope::Whole)));
+        let record = ChapterRecord::load(fixture.story_dir(), 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.issue_counts().into_iter().collect::<Vec<_>>(),
+            [(qa::IssueKind::GlossaryMissing, 1)]
         );
     }
 
