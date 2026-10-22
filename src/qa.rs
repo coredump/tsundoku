@@ -282,7 +282,7 @@ pub fn check_chunk(ctx: &ChunkContext<'_>, output: &str, cfg: &QaConfig) -> Vec<
     for term in ctx.glossary {
         if term.original.is_empty()
             || term.english.is_empty()
-            || !ctx.source.contains(&term.original)
+            || !occurs_outside_longer_terms(ctx.source, term, ctx.glossary)
         {
             continue;
         }
@@ -434,6 +434,30 @@ pub fn requirements(ctx: &ChunkContext<'_>, issues: &[Issue]) -> Option<String> 
 /// Issue detail for a missing glossary term; [`requirements`] matches on it.
 fn glossary_detail(term: &TermEntry) -> String {
     format!("{} → {}", term.original, term.english)
+}
+
+/// Whether `term` occurs in `source` other than inside an occurrence of a longer
+/// glossary term that contains it (`認識阻害` inside `認識阻害の魔法`). Such nested
+/// occurrences are rendered by the longer term, so requiring both would demand two
+/// renderings for the same words.
+fn occurs_outside_longer_terms(source: &str, term: &TermEntry, glossary: &[TermEntry]) -> bool {
+    let covering: Vec<(usize, usize)> = glossary
+        .iter()
+        .filter(|other| {
+            other.original.len() > term.original.len() && other.original.contains(&term.original)
+        })
+        .flat_map(|other| {
+            source
+                .match_indices(other.original.as_str())
+                .map(|(start, matched)| (start, start + matched.len()))
+        })
+        .collect();
+    source.match_indices(term.original.as_str()).any(|(start, matched)| {
+        let end = start + matched.len();
+        !covering
+            .iter()
+            .any(|&(cover_start, cover_end)| cover_start <= start && end <= cover_end)
+    })
 }
 
 /// Whether `ratio` is outside `[low, high]`.
@@ -600,6 +624,36 @@ mod tests {
 
         let absent = check("石を拾った。", &glossary, &[], "He picked up a stone.");
         assert!(kinds(&absent, IssueKind::GlossaryMissing).is_empty());
+    }
+
+    #[test]
+    fn test_glossary_term_nested_in_longer_term_is_not_required_separately() {
+        let glossary = [
+            term("認識阻害", "Perception Interference"),
+            term("認識阻害の魔法", "Perception Inhibition Magic"),
+        ];
+
+        let nested = check(
+            "認識阻害の魔法をかけた。",
+            &glossary,
+            &[],
+            "I cast Perception Inhibition Magic.",
+        );
+        assert!(kinds(&nested, IssueKind::GlossaryMissing).is_empty());
+
+        let also_alone = check(
+            "認識阻害の魔法をかけた。認識阻害は便利だ。",
+            &glossary,
+            &[],
+            "I cast Perception Inhibition Magic. It is handy.",
+        );
+        assert_eq!(
+            kinds(&also_alone, IssueKind::GlossaryMissing),
+            [&Issue {
+                kind: IssueKind::GlossaryMissing,
+                detail: "認識阻害 → Perception Interference".to_string(),
+            }]
+        );
     }
 
     #[test]
