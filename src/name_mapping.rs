@@ -6,7 +6,7 @@
 use crate::error::NameMappingError;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -60,6 +60,18 @@ fn is_valid_original_name(original: &str) -> bool {
         && !HOUSEHOLD_SUFFIX_REGEX.is_match(original)
         && !KATAKANA_TITLE_SUFFIX_REGEX.is_match(original)
         && !ROYAL_TITLE_SUFFIX_REGEX.is_match(original)
+}
+
+/// Returns whether `original` is one kanji, such as the surname `橘`.
+///
+/// The scout never records these (a lone kanji matches inside unrelated words), but a
+/// user who knows the novel can add one with a manual override.
+fn is_single_kanji(original: &str) -> bool {
+    let mut chars = original.chars();
+    chars
+        .next()
+        .is_some_and(|c| matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}'))
+        && chars.next().is_none()
 }
 
 /// English honorifics to reject.
@@ -383,6 +395,42 @@ pub struct TermEntry {
     pub english: String,
 }
 
+/// Shortest name, in letters, checked for near-miss spellings; shorter names
+/// (`Cody`, `Ruri`) are one letter away from too many ordinary words.
+pub const NEAR_MISS_MIN_NAME_CHARS: usize = 5;
+
+/// A word in translated text that looks like a misspelling of a known name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NearMissName {
+    /// The word as it appears in the translation.
+    pub found: String,
+    /// The known name rendering it is closest to.
+    pub expected: String,
+    /// How many times the word appears.
+    pub count: usize,
+}
+
+/// Latin letters, including accented ones (`César`); excludes kana and CJK so a
+/// name glued to leftover Japanese is not read as one misspelled word.
+fn is_latin_letter(c: char) -> bool {
+    c.is_alphabetic() && (c as u32) < 0x0250
+}
+
+/// Levenshtein distance between two character sequences.
+fn edit_distance(left: &[char], right: &[char]) -> usize {
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0; right.len() + 1];
+    for (i, left_char) in left.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, right_char) in right.iter().enumerate() {
+            let substitution = previous[j] + usize::from(left_char != right_char);
+            current[j + 1] = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
+
 /// Renderings already selected for names and terms, used to steer the scout.
 #[derive(Debug, Clone, Default)]
 pub struct KnownMappings {
@@ -664,7 +712,13 @@ impl NameMappingStore {
     /// Purge invalid name and glossary votes from the mapping.
     pub fn purge_bad_votes(&mut self) {
         self.data.names.retain(|original, info| {
-            if !is_valid_original_name(original) {
+            let has_valid_override = info
+                .r#override
+                .as_deref()
+                .is_some_and(is_valid_english_rendering);
+            if !is_valid_original_name(original)
+                && !(is_single_kanji(original) && has_valid_override)
+            {
                 return false;
             }
 
@@ -884,6 +938,69 @@ impl NameMappingStore {
                     .map(|(original, info)| (original, info.english.as_ref())),
             ),
         }
+    }
+
+    /// Find words in translated English that look like misspellings of a known name.
+    ///
+    /// A capitalized word is a near miss when it is not itself a known name or term
+    /// word, nor a known name with a plural `s` ("the Yamadas"), starts with the same
+    /// letter as a name of at least [`NEAR_MISS_MIN_NAME_CHARS`] letters, and is one
+    /// edit away from it (two edits for names of eight letters or more). Results are
+    /// sorted by the word found.
+    pub fn near_miss_names(&self, translated: &str) -> Vec<NearMissName> {
+        let names: Vec<Vec<char>> = self
+            .data
+            .names
+            .values()
+            .filter_map(|info| info.english.as_deref())
+            .map(|english| english.chars().collect())
+            .collect();
+        let name_renderings = self.data.names.values().map(|info| info.english.as_deref());
+        let term_renderings = self.data.terms.values().map(|info| info.english.as_deref());
+        let known_words: HashSet<&str> = name_renderings
+            .chain(term_renderings)
+            .flatten()
+            .flat_map(|english| english.split(|c: char| !is_latin_letter(c)))
+            .collect();
+
+        let mut found: BTreeMap<&str, (String, usize)> = BTreeMap::new();
+        for word in translated.split(|c: char| !is_latin_letter(c)) {
+            let is_plural_name = word
+                .strip_suffix('s')
+                .is_some_and(|stem| known_words.contains(stem));
+            if !word.starts_with(|c: char| c.is_uppercase())
+                || known_words.contains(word)
+                || is_plural_name
+            {
+                continue;
+            }
+            if let Some((_, count)) = found.get_mut(word) {
+                *count += 1;
+                continue;
+            }
+            let word_chars: Vec<char> = word.chars().collect();
+            let closest = names
+                .iter()
+                .filter(|name| name.len() >= NEAR_MISS_MIN_NAME_CHARS && name[0] == word_chars[0])
+                .filter_map(|name| {
+                    let allowed = if name.len() >= 8 { 2 } else { 1 };
+                    let distance = edit_distance(&word_chars, name);
+                    (distance <= allowed).then_some((distance, name))
+                })
+                .min();
+            if let Some((_, name)) = closest {
+                found.insert(word, (name.iter().collect(), 1));
+            }
+        }
+
+        found
+            .into_iter()
+            .map(|(word, (expected, count))| NearMissName {
+                found: word.to_string(),
+                expected,
+                count,
+            })
+            .collect()
     }
 
     /// Get the raw data (for testing/debugging).
@@ -1210,6 +1327,29 @@ mod tests {
     }
 
     #[test]
+    fn test_single_kanji_name_is_kept_only_with_manual_override() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut store = NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
+        std::fs::write(
+            store.filepath(),
+            r#"{
+                "names": {
+                    "橘": { "part": "family", "votes": {}, "override": "Tachibana" },
+                    "林": { "part": "family", "votes": { "Hayashi": 3 } }
+                },
+                "coverage": []
+            }"#,
+        )
+        .unwrap();
+        store.reload_from_disk().unwrap();
+        store.save().unwrap();
+
+        let reloaded = NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
+        assert_eq!(reloaded.apply_to_text("橘さんと林さん"), "Tachibanaさんと林さん");
+        assert!(!reloaded.data.names.contains_key("林"));
+    }
+
+    #[test]
     fn test_name_override_removal_restores_vote_winner() {
         let temp_dir = TempDir::new().unwrap();
         let mut store = NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
@@ -1463,6 +1603,64 @@ mod tests {
         assert_eq!(glossary.len(), 1);
         assert_eq!(glossary[0].original, "魔石");
         assert_eq!(store.term_len(), 1);
+    }
+
+    fn near_miss_store(temp_dir: &TempDir) -> NameMappingStore {
+        let mut store = NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
+        store.record_votes(&[
+            name("タツヤ", "Tatsuya"),
+            name("ダリル", "Daryl"),
+            name("コーディー", "Cody"),
+            name("ハリアー", "Harrier"),
+            name("クラリッサ", "Clarissabel"),
+        ]);
+        store.record_term_votes(&[term("結界", "Barrier"), term("村長", "Village Chief")]);
+        store
+    }
+
+    #[test]
+    fn test_near_miss_names_flags_misspellings_with_counts() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = near_miss_store(&temp_dir);
+
+        let misses = store.near_miss_names(
+            "Tatyuya-san waved. Darryl laughed. \"Tatyuya!\" Clarisabell sighed.",
+        );
+
+        assert_eq!(
+            misses,
+            [
+                NearMissName {
+                    found: "Clarisabell".to_string(),
+                    expected: "Clarissabel".to_string(),
+                    count: 1,
+                },
+                NearMissName {
+                    found: "Darryl".to_string(),
+                    expected: "Daryl".to_string(),
+                    count: 1,
+                },
+                NearMissName {
+                    found: "Tatyuya".to_string(),
+                    expected: "Tatsuya".to_string(),
+                    count: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_near_miss_names_ignores_correct_names_and_ordinary_words() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = near_miss_store(&temp_dir);
+
+        let misses = store.near_miss_names(
+            "Tatsuya's Barrier held. Code ran. Carrier pigeons flew. The Village Chief and \
+             Harrier met. tatyuya in lowercase. Tatsuya様 stayed. Tatyuyo is two edits off. \
+             The Daryls visited.",
+        );
+
+        assert_eq!(misses, []);
     }
 
     #[test]

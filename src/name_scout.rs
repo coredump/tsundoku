@@ -20,19 +20,6 @@ static CODE_FENCE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?s)^```[a-zA-Z]*\s*(.*?)\s*```$").expect("Invalid CODE_FENCE_REGEX")
 });
 
-/// Refusal phrases that indicate the model declined to process.
-static REFUSAL_PHRASES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-    vec![
-        "i'm sorry",
-        "i cannot",
-        "i am unable",
-        "as an ai",
-        "my apologies",
-        "i am not programmed",
-        "i do not have the ability",
-    ]
-});
-
 /// Response shape appended to every custom mapping scout prompt.
 const MAPPING_RESPONSE_CONTRACT: &str = r#"Return ONLY JSON with both arrays:
 {"names":[{"original":"<exact name characters>","part":"family|given|unknown","english":"<best English rendering>"}],"terms":[{"original":"<exact Japanese term>","english":"<canonical English rendering>"}]}
@@ -393,8 +380,7 @@ impl NameScout {
                 };
 
                 // Check for refusal
-                let lower = raw_response.to_lowercase();
-                if REFUSAL_PHRASES.iter().any(|p| lower.starts_with(p)) {
+                if crate::utils::is_refusal(&raw_response) {
                     self.report_progress(
                         chunk_num,
                         total_chunks,

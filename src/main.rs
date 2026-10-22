@@ -120,6 +120,11 @@ async fn main() -> Result<()> {
     // Load configuration
     console.step("Loading configuration...");
     let mut config = Config::load().context("Failed to load configuration")?;
+    for key in &config.ignored_keys {
+        console.warning(&format!(
+            "Unknown config key `{key}` is ignored; check its spelling and section (keys are case-sensitive)"
+        ));
+    }
     config.scraping.debug = args.debug;
     if let Some(workers) = args.name_scout_workers {
         config.name_scout.workers = workers.get();
@@ -656,6 +661,12 @@ async fn translate_chapters(
             book.save(story_dir)?;
             console.clear_line();
             console.success(&format!("Saved: {}", chapter.filename));
+            for miss in name_mapping.near_miss_names(&chapter.content) {
+                console.warning(&format!(
+                    "Chapter {}: `{}` ({}x) looks like a misspelling of `{}`",
+                    chapter.number, miss.found, miss.count, miss.expected
+                ));
+            }
         }
     }
 

@@ -24,6 +24,60 @@ pub fn strip_chapter_number(title: &str) -> &str {
         .trim()
 }
 
+/// Openers that only a model talking about itself would produce.
+const UNAMBIGUOUS_REFUSAL_OPENERS: [&str; 3] =
+    ["as an ai", "i am not programmed", "i do not have the ability"];
+
+/// Openers that are also ordinary English (a title `ごめんね` → "I'm sorry").
+const AMBIGUOUS_REFUSAL_OPENERS: [&str; 5] =
+    ["i'm sorry", "my apologies", "i cannot", "i can't", "i am unable"];
+
+/// Phrases that make an ambiguous opener a reply about the request itself. They name
+/// the task ("translate", "this request") rather than words a character could say to
+/// another ("I cannot help you").
+const REFUSAL_REQUEST_PHRASES: [&str; 13] = [
+    "translat",
+    "this request",
+    "your request",
+    "assist with",
+    "help with that",
+    "help with this",
+    "fulfill",
+    "comply with",
+    "this content",
+    "that content",
+    "this text",
+    "provide that",
+    "as an ai",
+];
+
+/// How far into the reply to look for [`REFUSAL_REQUEST_PHRASES`]; a real refusal
+/// says what it declines up front, and story text further in can use them.
+const REFUSAL_WINDOW_CHARS: usize = 200;
+
+/// Returns whether a model reply declines the request instead of answering it.
+///
+/// Apologies and "I cannot" are only refusals when they go on to talk about the
+/// request, so a faithful translation of an apology is accepted.
+pub fn is_refusal(reply: &str) -> bool {
+    let head: String = reply
+        .trim_start()
+        .chars()
+        .take(REFUSAL_WINDOW_CHARS)
+        .collect::<String>()
+        .to_lowercase()
+        .replace('’', "'");
+    UNAMBIGUOUS_REFUSAL_OPENERS
+        .iter()
+        .any(|opener| head.starts_with(opener))
+        || (AMBIGUOUS_REFUSAL_OPENERS
+            .iter()
+            .any(|opener| head.starts_with(opener))
+            && REFUSAL_REQUEST_PHRASES
+                .iter()
+                .any(|phrase| head.contains(phrase)))
+}
+
 /// Count Japanese kana and CJK ideographs in `text`.
 ///
 /// Translated English should contain none; any found indicates untranslated Japanese
@@ -176,6 +230,38 @@ pub async fn check_response_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_refusals_are_detected() {
+        for reply in [
+            "I'm sorry, but I can't help with translating this content.",
+            "I’m sorry, I cannot fulfill this request.",
+            "I cannot assist with that.",
+            "My apologies, but I am unable to provide a translation.",
+            "As an AI, I must decline.",
+        ] {
+            assert!(is_refusal(reply), "should be a refusal: {reply}");
+        }
+    }
+
+    #[test]
+    fn test_translated_apologies_are_not_refusals() {
+        let long_chapter = format!(
+            "I cannot believe it. The village was quiet.\n{}\nShe asked for my help.",
+            "The wind blew over the fields. ".repeat(10)
+        );
+        for reply in [
+            "I'm sorry",
+            "I'm Sorry",
+            "My Apologies, Lady Monika",
+            "I Cannot Go Back",
+            "I'm sorry, I cannot help you. Please leave the village.",
+            "I can't help it, Kyoka. Apples are my weakness.",
+            long_chapter.as_str(),
+        ] {
+            assert!(!is_refusal(reply), "should not be a refusal: {reply}");
+        }
+    }
 
     #[test]
     fn test_strip_chapter_number() {

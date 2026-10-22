@@ -40,6 +40,11 @@ pub struct Config {
 
     /// File paths.
     pub paths: PathsConfig,
+
+    /// Keys present in the config file that no setting reads, such as a misspelled
+    /// section. Filled by [`Config::load_from`]; never written back to disk.
+    #[serde(skip)]
+    pub ignored_keys: Vec<String>,
 }
 
 impl Default for Config {
@@ -52,6 +57,7 @@ impl Default for Config {
             scraping: ScrapingConfig::default(),
             prompts: PromptsConfig::default(),
             paths: PathsConfig::default(),
+            ignored_keys: Vec::new(),
         }
     }
 }
@@ -264,8 +270,14 @@ impl Config {
         }
 
         let content = std::fs::read_to_string(path)?;
-        let config: Config =
-            toml::from_str(&content).map_err(|e| ConfigError::ParseError(e.to_string()))?;
+        let deserializer =
+            toml::Deserializer::parse(&content).map_err(|e| ConfigError::ParseError(e.to_string()))?;
+        let mut ignored_keys = Vec::new();
+        let mut config: Config = serde_ignored::deserialize(deserializer, |key| {
+            ignored_keys.push(key.to_string());
+        })
+        .map_err(|e| ConfigError::ParseError(e.to_string()))?;
+        config.ignored_keys = ignored_keys;
 
         Ok(config)
     }
@@ -416,6 +428,29 @@ mod tests {
             loaded.translation.chunk_size_chars,
             config.translation.chunk_size_chars
         );
+    }
+
+    #[test]
+    fn test_unknown_config_keys_are_reported_and_known_ones_are_not() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            "[prompts]\ncontent_translation = \"Custom\"\n\n[Prompts]\ncontent_translation_prompt = \"Lost\"\n\n[translation]\nworkres = 4\n",
+        )
+        .unwrap();
+
+        let loaded = Config::load_from(file.path()).unwrap();
+
+        assert_eq!(loaded.prompts.content_translation, "Custom");
+        assert_eq!(loaded.ignored_keys, ["Prompts", "translation.workres"]);
+    }
+
+    #[test]
+    fn test_saved_default_config_has_no_unknown_keys() {
+        let file = NamedTempFile::new().unwrap();
+        Config::default().save_to(file.path()).unwrap();
+
+        assert!(Config::load_from(file.path()).unwrap().ignored_keys.is_empty());
     }
 
     #[test]

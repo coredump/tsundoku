@@ -11,25 +11,11 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
-use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Rule appended to every content translation prompt.
 const ENGLISH_ONLY_RULE: &str = "Write the translation entirely in English. Never output Chinese or Japanese characters; translate every word, including terms you would otherwise gloss in parentheses.";
-
-/// Refusal phrases that indicate the model declined to translate.
-static REFUSAL_PHRASES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-    vec![
-        "i'm sorry",
-        "i cannot",
-        "i am unable",
-        "as an ai",
-        "my apologies",
-        "i am not programmed",
-        "i do not have the ability",
-    ]
-});
 
 /// Progress information for display during translation.
 #[derive(Debug, Clone)]
@@ -543,15 +529,10 @@ impl Translator {
             return Err(TranslationError::Refused("Empty response".to_string()));
         }
 
-        // Check for refusal phrases
-        let lower = trimmed.to_lowercase();
-        for phrase in REFUSAL_PHRASES.iter() {
-            if lower.starts_with(phrase) {
-                return Err(TranslationError::Refused(format!(
-                    "Response starts with refusal phrase: {}",
-                    phrase
-                )));
-            }
+        if crate::utils::is_refusal(&trimmed) {
+            return Err(TranslationError::Refused(
+                "Response is a refusal instead of a translation".to_string(),
+            ));
         }
 
         let count = crate::utils::count_cjk_chars(&trimmed);
@@ -788,36 +769,6 @@ mod tests {
         for chunk in &chunks {
             // Each chunk should be at most chunk_size_chars (approximately, due to line boundaries)
             assert!(chunk.len() <= 30); // Allow some leeway for line-based splitting
-        }
-    }
-
-    #[test]
-    fn test_refusal_detection() {
-        let phrases = vec![
-            "I'm sorry, but I cannot",
-            "As an AI, I must decline",
-            "I cannot assist with that",
-        ];
-
-        for phrase in phrases {
-            let lower = phrase.to_lowercase();
-            let is_refusal = REFUSAL_PHRASES.iter().any(|p| lower.starts_with(p));
-            assert!(is_refusal, "Should detect refusal: {}", phrase);
-        }
-    }
-
-    #[test]
-    fn test_non_refusal() {
-        let phrases = vec![
-            "The translation is...",
-            "Here is the translated text",
-            "私は学生です means I am a student",
-        ];
-
-        for phrase in phrases {
-            let lower = phrase.to_lowercase();
-            let is_refusal = REFUSAL_PHRASES.iter().any(|p| lower.starts_with(p));
-            assert!(!is_refusal, "Should not detect refusal: {}", phrase);
         }
     }
 
