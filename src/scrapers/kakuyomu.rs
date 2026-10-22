@@ -134,7 +134,9 @@ impl KakuyomuScraper {
     /// Extracts chapter text from an episode page.
     ///
     /// Ruby is kept as `｜base《reading》`, and blank paragraphs
-    /// (`<p class="blank">`) are kept as empty lines so scene breaks survive.
+    /// (`<p class="blank">`) are kept as empty lines. Authors use a single one as
+    /// paragraph spacing; a run of three or more becomes a scene break through
+    /// `mark_scene_breaks`.
     fn extract_content(&self, doc: &Html) -> Result<String, ScraperError> {
         let content_elem = doc
             .select(&self.selectors.content)

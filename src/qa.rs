@@ -3,6 +3,7 @@
 //! Issues are recorded per chunk in the chapter record and drive targeted
 //! retries and `--recheck`.
 
+use crate::honorifics::HonorificPolicy;
 use crate::name_mapping::{TermEntry, near_miss_names_in};
 use crate::output_rules::{OutputRules, honorific_on_non_name};
 use crate::utils::count_cjk_chars;
@@ -359,8 +360,14 @@ pub fn check_chunk(ctx: &ChunkContext<'_>, output: &str, cfg: &QaConfig) -> Vec<
 
 /// Flag honorifics attached to something other than a known name (`cat-san`).
 ///
+/// Only under the `keep` policy: `names-only` and `drop` strip exactly these
+/// suffixes from the `.txt`, so recording them would leave chunks flagged (and
+/// selected by `--recheck honorifics`) after the visible text is already fixed.
 /// One issue per distinct occurrence text, in order of first appearance.
 pub fn check_honorifics(output: &str, rules: &OutputRules) -> Vec<Issue> {
+    if rules.policy() != HonorificPolicy::Keep {
+        return Vec::new();
+    }
     let mut seen = BTreeSet::new();
     honorific_on_non_name(output, rules)
         .into_iter()
@@ -889,5 +896,13 @@ mod tests {
                 .iter()
                 .all(|issue| issue.kind == IssueKind::HonorificOnNoun)
         );
+    }
+
+    #[test]
+    fn test_check_honorifics_is_silent_when_the_output_rule_strips_them() {
+        for policy in [HonorificPolicy::NamesOnly, HonorificPolicy::Drop] {
+            let rules = OutputRules::new(policy, ["Ruri"], &[]).unwrap();
+            assert!(check_honorifics("Ruri-chan fed the cat-san.", &rules).is_empty());
+        }
     }
 }

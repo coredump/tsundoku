@@ -472,8 +472,9 @@ no migration):
   name known before the strip. Regexes are compiled when `book.json` is loaded; an
   invalid one is a load error naming `replacements[i]`.
 - Always applied to the record's raw text, never to an already processed `.txt`, so
-  re-applying never compounds. QA: `qa::check_honorifics` flags the names-only strip
-  matches as `honorific_on_noun` (record-only, never retried).
+  re-applying never compounds. QA: under `keep` only, `qa::check_honorifics` flags the
+  names-only strip matches as `honorific_on_noun` (record-only, never retried); under
+  `names-only` and `drop` the output rule removes them, so nothing is recorded.
 
 ## Translation System
 

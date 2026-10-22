@@ -1657,8 +1657,11 @@ mod tests {
                 ..QaConfig::default()
             },
         );
+        // Under `keep` the suffix reaches the .txt, so it is recorded.
         let ctx = PromptContext {
-            output_rules: Some(Arc::new(names_only_rules())),
+            output_rules: Some(Arc::new(
+                OutputRules::new(HonorificPolicy::Keep, ["Ruri"], &[]).unwrap(),
+            )),
             ..PromptContext::default()
         };
 

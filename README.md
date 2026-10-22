@@ -126,7 +126,7 @@ Every translated chunk is checked against the text that was sent:
 | `paragraphs` | `paragraph_mismatch` | non-empty line count outside `paragraph_ratio` of the source's and off by at least 3 |
 | `length` | `length_ratio` | output characters ÷ source characters outside `length_ratio` |
 | `repetition` | `repetition` | a 4-word phrase more than 8 times, or the same line 4 times in a row |
-| `honorifics` | `honorific_on_noun` | `-san`, `-chan`, `-kun`, `-sama`, `-dono`, `-senpai` or `-sensei` on something that is not a known name (`cat-san`, `Village Chief-san`); recorded only, never retried |
+| `honorifics` | `honorific_on_noun` | `-san`, `-chan`, `-kun`, `-sama`, `-dono`, `-senpai` or `-sensei` on something that is not a known name (`cat-san`, `Village Chief-san`); only with `honorifics = "keep"` (the other policies strip these from the `.txt`); recorded only, never retried |
 
 When an issue in `retry_on` is found, the chunk is translated again (up to `max_retries` times, separate from `translation.retries`) with a note naming what to fix, such as `render 魔石 as "Magic Stone"`; the attempt with the fewest and least serious issues is kept. Issues that remain are printed after each chapter and saved in its chunk record, where `--recheck` can find them later.
 
