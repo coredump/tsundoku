@@ -118,6 +118,26 @@ pub enum NameMappingError {
     WriteError(String),
 }
 
+/// Error type for the per-novel chapter summary file.
+#[derive(Error, Debug)]
+pub enum SummaryError {
+    /// Failed to read the summary file.
+    #[error("Failed to read chapter summaries: {0}")]
+    ReadError(#[from] std::io::Error),
+
+    /// Failed to parse the summary JSON.
+    #[error("Failed to parse chapter summaries JSON: {0}")]
+    ParseError(#[from] serde_json::Error),
+
+    /// The file was written by a newer, incompatible version.
+    #[error("Unsupported chapter summaries version {0} (expected {expected})", expected = crate::summaries::SUMMARIES_VERSION)]
+    UnsupportedVersion(u32),
+
+    /// Failed to write the summary file.
+    #[error("Failed to save chapter summaries: {0}")]
+    WriteError(String),
+}
+
 /// Error type for `book.json` metadata.
 #[derive(Error, Debug)]
 pub enum BookMetadataError {

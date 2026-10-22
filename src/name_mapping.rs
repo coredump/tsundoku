@@ -1042,6 +1042,52 @@ impl NameMappingStore {
             .collect()
     }
 
+    /// Replace losing name renderings in English text with the selected ones.
+    ///
+    /// Every vote rendering of a name that is not its selected `english` is rewritten
+    /// to the selected rendering where it stands as a whole word, so summaries written
+    /// before a vote shift or override use today's names. A losing rendering that is
+    /// another name's selected rendering is left alone. Longer renderings win when
+    /// several match at the same place.
+    pub fn normalize_renderings(&self, text: &str) -> String {
+        let selected: HashSet<&str> = self
+            .data
+            .names
+            .values()
+            .filter_map(|info| info.english.as_deref())
+            .collect();
+        let mut replacements: HashMap<&str, &str> = HashMap::new();
+        for info in self.data.names.values() {
+            let Some(english) = info.english.as_deref() else {
+                continue;
+            };
+            for loser in info.votes.keys().map(String::as_str) {
+                if !selected.contains(loser) {
+                    replacements.entry(loser).or_insert(english);
+                }
+            }
+        }
+        if replacements.is_empty() {
+            return text.to_string();
+        }
+
+        let mut losers: Vec<&str> = replacements.keys().copied().collect();
+        losers.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+        let alternation = losers
+            .iter()
+            .map(|loser| regex::escape(loser))
+            .collect::<Vec<_>>()
+            .join("|");
+        let Ok(pattern) = Regex::new(&format!(r"\b(?:{alternation})\b")) else {
+            return text.to_string();
+        };
+        pattern
+            .replace_all(text, |captures: &regex::Captures| {
+                replacements[&captures[0]].to_string()
+            })
+            .into_owned()
+    }
+
     /// Save the mapping to disk.
     pub fn save(&self) -> Result<(), NameMappingError> {
         // Ensure parent directory exists
@@ -2217,5 +2263,44 @@ mod tests {
             .collect();
         assert_eq!(capped, ["Tatsuya", "Ruri"]);
         assert!(store.cast_for_text(text, 0).is_empty());
+    }
+
+    #[test]
+    fn test_novel_file_name_has_windows_variant() {
+        assert_eq!(
+            novel_file_name("syosetu", "n1234ab", ".summaries.json", false),
+            "syosetu: n1234ab.summaries.json"
+        );
+        assert_eq!(
+            novel_file_name("syosetu", "n1234ab", ".json", true),
+            "syosetu - n1234ab.json"
+        );
+    }
+
+    #[test]
+    fn test_normalize_renderings_replaces_losing_votes_at_word_boundaries() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut store = NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
+        store.record_votes(&[
+            name("タツヤ", "Tatsuya"),
+            name("タツヤ", "Tatsuya"),
+            name("タツヤ", "Tatuya"),
+            name("ケン", "Ken"),
+            name("ケンジ", "Kenji"),
+            name("ケンジ", "Kenji"),
+            name("ケンジ", "Ken"),
+        ]);
+
+        assert_eq!(
+            store.normalize_renderings("Tatuya met Tatuyas and Tatuya-san; Ken saw Kenji."),
+            "Tatsuya met Tatuyas and Tatsuya-san; Ken saw Kenji."
+        );
+
+        store.data.names.get_mut("タツヤ").unwrap().r#override = Some("Tatuya".to_string());
+        store.data.names.get_mut("タツヤ").unwrap().recalculate_best();
+        assert_eq!(
+            store.normalize_renderings("Tatsuya waved."),
+            "Tatuya waved."
+        );
     }
 }

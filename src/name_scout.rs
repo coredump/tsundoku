@@ -7,6 +7,7 @@ use crate::config::{ApiConfig, NameScoutConfig};
 use crate::console::Console;
 use crate::error::TranslationError;
 use crate::name_mapping::{Gender, KnownMappings, NameEntry, NamePart, TermEntry};
+use crate::summaries::{MAX_CHUNK_SUMMARY_WORDS, cap_words};
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,14 @@ const MAPPING_RESPONSE_CONTRACT: &str = r#"Return ONLY JSON with both arrays:
 Use empty arrays when no names or terms are found. Do not omit either key or add explanations.
 "gender", "evidence" and "note" are optional. Give a gender only when the text itself shows it, and copy the words that show it into "evidence" exactly as written (for example 彼, 彼女, 兄, 姉, 息子, 娘, お嬢さん, 王子, 王女); otherwise use "unknown" or omit it. "note" is a short role or relationship such as "Ruri's older brother" or "guild receptionist".
 `｜X《Y》` is ruby meaning X is read Y. Report `original` as X only and romanise from Y."#;
+
+/// Extra instruction appended to the mapping contract when summaries are enabled.
+const SUMMARY_REQUEST: &str = r#"Also add a "summary" key: at most 40 English words on what happens in this text (who does what to whom), using the listed English renderings for names."#;
+
+/// System prompt for summary-only requests on chapters already scouted for mappings.
+const SUMMARY_ONLY_PROMPT: &str = r#"You summarize passages of a Japanese web novel for its English translator.
+Return ONLY JSON: {"summary":"<at most 40 English words on what happens in this text: who does what to whom>"}
+Use the listed English renderings for names and terms. No explanations."#;
 
 fn format_translation_error(error: &TranslationError) -> String {
     match error {
@@ -153,6 +162,12 @@ struct ParsedMappingsResponse {
     terms: Vec<ParsedTermEntry>,
 }
 
+/// Parsed summary-only response from an LLM.
+#[derive(Debug, Deserialize)]
+struct ParsedSummaryResponse {
+    summary: String,
+}
+
 /// Names and terminology identified in one successfully processed text chunk.
 #[derive(Debug, Default)]
 pub struct ScoutChunk {
@@ -160,6 +175,16 @@ pub struct ScoutChunk {
     pub names: Vec<NameEntry>,
     /// Terminology entries.
     pub terms: Vec<TermEntry>,
+    /// Short English summary of the chunk, when summaries are enabled and the model
+    /// gave one; capped at [`MAX_CHUNK_SUMMARY_WORDS`] words.
+    pub summary: Option<String>,
+}
+
+impl ScoutChunk {
+    /// Returns whether the chunk found nothing at all.
+    fn is_empty(&self) -> bool {
+        self.names.is_empty() && self.terms.is_empty() && self.summary.is_none()
+    }
 }
 
 /// Mapping scout for extracting character names and terminology from Japanese text.
@@ -172,6 +197,8 @@ pub struct NameScout {
     scout_config: NameScoutConfig,
     /// System prompt for name and terminology extraction.
     prompt: String,
+    /// Whether mapping requests also ask for a chunk summary.
+    summaries: bool,
     /// Console for output.
     console: Console,
 }
@@ -249,8 +276,34 @@ impl NameScout {
             api_config,
             scout_config,
             prompt: format!("{prompt}\n\n{MAPPING_RESPONSE_CONTRACT}"),
+            summaries: false,
             console: Console::new(),
         }
+    }
+
+    /// Enable or disable chunk summaries in mapping requests (`name_scout.summaries`).
+    ///
+    /// When enabled, the response contract asks for a `summary` with every chunk and
+    /// [`ScoutChunk::summary`] carries it; when disabled, summaries are never requested
+    /// and any the model sends anyway are dropped.
+    pub fn with_summaries(mut self, enabled: bool) -> Self {
+        if enabled != self.summaries {
+            self.prompt = if enabled {
+                format!("{}\n{SUMMARY_REQUEST}", self.prompt)
+            } else {
+                self.prompt
+                    .strip_suffix(&format!("\n{SUMMARY_REQUEST}"))
+                    .unwrap_or(&self.prompt)
+                    .to_string()
+            };
+            self.summaries = enabled;
+        }
+        self
+    }
+
+    /// Returns whether mapping requests ask for chunk summaries.
+    pub fn summaries_enabled(&self) -> bool {
+        self.summaries
     }
 
     /// Collect names and terminology from text, processing in chunks.
@@ -271,12 +324,83 @@ impl NameScout {
         known: &KnownMappings,
         progress_info: Option<ScoutProgressInfo>,
     ) -> Result<Vec<ScoutChunk>, TranslationError> {
+        let chunks = self
+            .scout_chunks(
+                text,
+                progress_info,
+                &self.prompt,
+                |chunk| {
+                    build_scout_user_message(chunk, &known.present_in(chunk), MAPPINGS_HEADER)
+                },
+                |raw, chunk| self.parse_response(raw, chunk),
+                |entries: &ScoutChunk, chunk_num| {
+                    (!entries.names.is_empty() || !entries.terms.is_empty()).then(|| {
+                        format!(
+                            "Found {} names and {} terms in chunk {}",
+                            entries.names.len(),
+                            entries.terms.len(),
+                            chunk_num
+                        )
+                    })
+                },
+            )
+            .await?;
+
+        Ok(chunks.into_iter().filter(|chunk| !chunk.is_empty()).collect())
+    }
+
+    /// Summarize text chunk by chunk without extracting names or terms.
+    ///
+    /// Used to back-fill summaries for chapters already scouted for mappings. Each
+    /// chunk is sent with a summary-only prompt and the known renderings found in it;
+    /// the response must be `{"summary": "…"}`. Returns the non-empty chunk summaries
+    /// in text order, each capped at [`MAX_CHUNK_SUMMARY_WORDS`] words; join them with
+    /// [`chapter_synopsis`](crate::summaries::chapter_synopsis).
+    pub async fn collect_summaries_with_progress(
+        &self,
+        text: &str,
+        known: &KnownMappings,
+        progress_info: Option<ScoutProgressInfo>,
+    ) -> Result<Vec<String>, TranslationError> {
+        let summaries = self
+            .scout_chunks(
+                text,
+                progress_info,
+                SUMMARY_ONLY_PROMPT,
+                |chunk| build_scout_user_message(chunk, &known.present_in(chunk), SUMMARY_HEADER),
+                |raw, _| parse_summary_response(raw),
+                |summary: &Option<String>, chunk_num| {
+                    summary
+                        .as_ref()
+                        .map(|_| format!("Summarized chunk {}", chunk_num))
+                },
+            )
+            .await?;
+
+        Ok(summaries.into_iter().flatten().collect())
+    }
+
+    /// Send every chunk of `text` to the model and parse each response.
+    ///
+    /// Refusals and parse failures use the JSON retry budget, API failures the request
+    /// retry budget; exhausting either aborts. Returns one parsed value per chunk, in
+    /// order. `found` describes a parsed value for the console when no progress
+    /// reporter is attached.
+    async fn scout_chunks<T>(
+        &self,
+        text: &str,
+        progress_info: Option<ScoutProgressInfo>,
+        system_prompt: &str,
+        build_request: impl Fn(&str) -> String,
+        parse: impl Fn(&str, &str) -> Result<T, TranslationError>,
+        found: impl Fn(&T, usize) -> Option<String>,
+    ) -> Result<Vec<T>, TranslationError> {
         let chunks = self.split_into_chunks(text);
         let total_chunks = chunks.len();
         let mut results = Vec::new();
 
         for (i, chunk) in chunks.iter().enumerate() {
-            let request_text = build_scout_user_message(chunk, &known.present_in(chunk));
+            let request_text = build_request(chunk);
             let chunk_num = i + 1;
             let chunk_started = Instant::now();
             self.report_progress(
@@ -314,7 +438,7 @@ impl NameScout {
                         progress_info.as_ref(),
                     );
 
-                    match self.call_model(&request_text).await {
+                    match self.call_model(system_prompt, &request_text).await {
                         Ok(raw_response) => break raw_response,
                         Err(e) => {
                             api_attempt += 1;
@@ -430,19 +554,14 @@ impl NameScout {
                 );
 
                 // Parse the response
-                match self.parse_response(&raw_response, chunk) {
+                match parse(&raw_response, chunk) {
                     Ok(entries) => {
-                        if !entries.names.is_empty() || !entries.terms.is_empty() {
-                            if progress_info.is_none() {
-                                self.console.success(&format!(
-                                    "Found {} names and {} terms in chunk {}",
-                                    entries.names.len(),
-                                    entries.terms.len(),
-                                    chunk_num
-                                ));
-                            }
-                            results.push(entries);
+                        if progress_info.is_none()
+                            && let Some(message) = found(&entries, chunk_num)
+                        {
+                            self.console.success(&message);
                         }
+                        results.push(entries);
                         success = true;
                     }
                     Err(e) => {
@@ -556,14 +675,18 @@ impl NameScout {
         crate::utils::split_into_scene_chunks(text, self.scout_config.chunk_size_chars)
     }
 
-    /// Call the LLM model to extract names.
-    async fn call_model(&self, user_message: &str) -> Result<String, TranslationError> {
+    /// Send one chat request with `system_prompt` and `user_message`.
+    async fn call_model(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+    ) -> Result<String, TranslationError> {
         let request = ChatRequest {
             model: self.api_config.model.clone(),
             messages: vec![
                 Message {
                     role: "system".to_string(),
-                    content: self.prompt.clone(),
+                    content: system_prompt.to_string(),
                 },
                 Message {
                     role: "user".to_string(),
@@ -639,43 +762,30 @@ impl NameScout {
     ///
     /// `chunk` is the scouted text. A name's gender is kept only when it is not
     /// `unknown` and its evidence is non-empty and occurs verbatim in `chunk`.
+    /// With summaries enabled, a response holding only a `summary` means no new names
+    /// or terms, like `{}`.
     fn parse_response(&self, raw: &str, chunk: &str) -> Result<ScoutChunk, TranslationError> {
-        let trimmed = raw.trim();
-
-        // Remove markdown code fence if present
-        let json_str = if trimmed.starts_with("```") {
-            if let Some(captures) = CODE_FENCE_REGEX.captures(trimmed) {
-                captures.get(1).map(|m| m.as_str()).unwrap_or(trimmed)
-            } else {
-                // Try to manually strip
-                let without_start = trimmed
-                    .trim_start_matches("```json")
-                    .trim_start_matches("```");
-                without_start.trim_end_matches("```").trim()
-            }
+        let mut value = extract_json_object(raw)?;
+        let summary = if self.summaries {
+            value
+                .as_object_mut()
+                .and_then(|object| object.remove("summary"))
+                .and_then(|summary| summary.as_str().and_then(clean_chunk_summary))
         } else {
-            trimmed
+            None
         };
-
-        // Parse the first complete JSON object; models sometimes append prose or a stray `}`.
-        let start = json_str.find('{').ok_or_else(|| {
-            TranslationError::ParseError("No valid JSON object found".to_string())
-        })?;
-        let value: serde_json::Value = serde_json::Deserializer::from_str(&json_str[start..])
-            .into_iter()
-            .next()
-            .ok_or_else(|| TranslationError::ParseError("No valid JSON object found".to_string()))?
-            .map_err(|e| TranslationError::ParseError(format!("JSON parse error: {}", e)))?;
 
         // When every name and term in a chunk is already known, models answer `{}`.
         // A response with only one of the two keys is still rejected as incomplete.
         if value.as_object().is_some_and(serde_json::Map::is_empty) {
-            return Ok(ScoutChunk::default());
+            return Ok(ScoutChunk {
+                summary,
+                ..ScoutChunk::default()
+            });
         }
 
         let parsed: ParsedMappingsResponse = serde_json::from_value(value)
             .map_err(|e| TranslationError::ParseError(format!("JSON parse error: {}", e)))?;
-
         let names = parsed
             .names
             .into_iter()
@@ -731,19 +841,76 @@ impl NameScout {
             })
             .collect();
 
-        Ok(ScoutChunk { names, terms })
+        Ok(ScoutChunk {
+            names,
+            terms,
+            summary,
+        })
     }
 }
 
-/// Build the scout user message: known renderings for this chunk, then the text.
-fn build_scout_user_message(chunk: &str, known: &KnownMappings) -> String {
+/// Strip a markdown code fence and parse the first complete JSON object in `raw`.
+///
+/// Models sometimes wrap the JSON in prose or append a stray `}`.
+fn extract_json_object(raw: &str) -> Result<serde_json::Value, TranslationError> {
+    let trimmed = raw.trim();
+
+    // Remove markdown code fence if present
+    let json_str = if trimmed.starts_with("```") {
+        if let Some(captures) = CODE_FENCE_REGEX.captures(trimmed) {
+            captures.get(1).map(|m| m.as_str()).unwrap_or(trimmed)
+        } else {
+            // Try to manually strip
+            let without_start = trimmed
+                .trim_start_matches("```json")
+                .trim_start_matches("```");
+            without_start.trim_end_matches("```").trim()
+        }
+    } else {
+        trimmed
+    };
+
+    let start = json_str
+        .find('{')
+        .ok_or_else(|| TranslationError::ParseError("No valid JSON object found".to_string()))?;
+    serde_json::Deserializer::from_str(&json_str[start..])
+        .into_iter()
+        .next()
+        .ok_or_else(|| TranslationError::ParseError("No valid JSON object found".to_string()))?
+        .map_err(|e| TranslationError::ParseError(format!("JSON parse error: {}", e)))
+}
+
+/// Parse a summary-only response: `{"summary": "…"}`.
+///
+/// A missing `summary` key is an error (the request is retried); an empty summary
+/// yields `None`.
+fn parse_summary_response(raw: &str) -> Result<Option<String>, TranslationError> {
+    let parsed: ParsedSummaryResponse = serde_json::from_value(extract_json_object(raw)?)
+        .map_err(|e| TranslationError::ParseError(format!("JSON parse error: {}", e)))?;
+    Ok(clean_chunk_summary(&parsed.summary))
+}
+
+/// Normalize whitespace and cap a chunk summary at [`MAX_CHUNK_SUMMARY_WORDS`] words.
+fn clean_chunk_summary(summary: &str) -> Option<String> {
+    let summary = cap_words(summary, MAX_CHUNK_SUMMARY_WORDS);
+    (!summary.is_empty()).then_some(summary)
+}
+
+/// Instruction heading the known renderings in a mapping request.
+const MAPPINGS_HEADER: &str = "Renderings already chosen in earlier chapters. Whenever you report one of these originals, use exactly the listed English. Still report new names and terms; if there are none, return both keys with empty arrays.\n";
+
+/// Instruction heading the known renderings in a summary-only request.
+const SUMMARY_HEADER: &str =
+    "English renderings to use for these names and terms in the summary.\n";
+
+/// Build a scout user message: `header` and the known renderings for this chunk, then
+/// the text. Without known renderings the message is the text alone.
+fn build_scout_user_message(chunk: &str, known: &KnownMappings, header: &str) -> String {
     if known.is_empty() {
         return chunk.to_string();
     }
 
-    let mut message = String::from(
-        "Renderings already chosen in earlier chapters. Whenever you report one of these originals, use exactly the listed English. Still report new names and terms; if there are none, return both keys with empty arrays.\n",
-    );
+    let mut message = String::from(header);
     for (heading, entries) in [("Names", &known.names), ("Terms", &known.terms)] {
         if entries.is_empty() {
             continue;
@@ -905,6 +1072,129 @@ mod tests {
             result,
             Err(TranslationError::RetriesExhausted { attempts: 1 })
         ));
+    }
+
+    #[test]
+    fn test_parse_summary_with_and_without_summaries_enabled() {
+        let with_summary =
+            r#"{"names":[],"terms":[],"summary":"  Tatsuya   meets\nRuri at the inn. "}"#;
+
+        let enabled = make_scout().with_summaries(true);
+        assert!(enabled.summaries_enabled());
+        assert!(enabled.prompt.ends_with(SUMMARY_REQUEST));
+        assert_eq!(
+            enabled.parse_response(with_summary, "").unwrap().summary.as_deref(),
+            Some("Tatsuya meets Ruri at the inn.")
+        );
+        assert_eq!(
+            enabled
+                .parse_response(r#"{"names":[],"terms":[]}"#, "")
+                .unwrap()
+                .summary,
+            None
+        );
+        assert!(enabled.parse_response("{}", "").unwrap().is_empty());
+        let summary_only = enabled
+            .parse_response(r#"{"summary":"Ruri sleeps."}"#, "")
+            .unwrap();
+        assert!(summary_only.names.is_empty() && summary_only.terms.is_empty());
+        assert_eq!(summary_only.summary.as_deref(), Some("Ruri sleeps."));
+        let long = format!(r#"{{"names":[],"terms":[],"summary":"{}"}}"#, "word ".repeat(60));
+        let capped = enabled.parse_response(&long, "").unwrap().summary.unwrap();
+        assert_eq!(capped.split_whitespace().count(), MAX_CHUNK_SUMMARY_WORDS);
+
+        let disabled = enabled.with_summaries(false);
+        assert!(!disabled.prompt.contains(SUMMARY_REQUEST));
+        assert_eq!(disabled.parse_response(with_summary, "").unwrap().summary, None);
+        assert!(
+            disabled
+                .parse_response(r#"{"summary":"Ruri sleeps."}"#, "")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_parse_summary_only_response() {
+        assert_eq!(
+            parse_summary_response("```json\n{\"summary\":\"Ruri sleeps.\"}\n```").unwrap(),
+            Some("Ruri sleeps.".to_string())
+        );
+        assert_eq!(parse_summary_response(r#"{"summary":" "}"#).unwrap(), None);
+        assert!(parse_summary_response("{}").is_err());
+        assert!(parse_summary_response(r#"{"names":[],"terms":[]}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_summary_only_request_sends_one_summary_prompt_per_chunk() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let mut content_length = 0;
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap();
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut body = vec![0; content_length];
+            std::io::Read::read_exact(&mut reader, &mut body).unwrap();
+
+            let response_body = r#"{"choices":[{"message":{"content":"{\"summary\":\"Tatsuya shows Ruri the magic stone.\"}"}}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )
+            .unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            // A second request would block on `accept`; the scout must send only one.
+            (listener, request)
+        });
+
+        let scout = NameScout::new(
+            ApiConfig {
+                key: "test-key".to_string(),
+                base_url: format!("http://{address}/v1"),
+                model: "test-model".to_string(),
+            },
+            NameScoutConfig {
+                retries: 1,
+                json_retries: 1,
+                delay_between_requests_sec: 0.0,
+                ..Default::default()
+            },
+            "Extract mappings".to_string(),
+        )
+        .with_summaries(true);
+        let known = KnownMappings {
+            names: vec![TermEntry {
+                original: "タツヤ".to_string(),
+                english: "Tatsuya".to_string(),
+            }],
+            terms: Vec::new(),
+        };
+
+        let result = scout
+            .collect_summaries_with_progress("タツヤは魔石を見せた。", &known, None)
+            .await;
+        let (listener, request) = server.join().unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        assert_eq!(result.unwrap(), ["Tatsuya shows Ruri the magic stone."]);
+        assert!(listener.accept().is_err(), "only one request expected");
+        assert_eq!(request["messages"][0]["content"], SUMMARY_ONLY_PROMPT);
+        let user = request["messages"][1]["content"].as_str().unwrap();
+        assert!(user.starts_with(SUMMARY_HEADER));
+        assert!(user.contains("タツヤ → Tatsuya"));
+        assert!(user.ends_with("Text:\nタツヤは魔石を見せた。"));
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub mod output_rules;
 pub mod qa;
 pub mod ruby;
 pub mod scrapers;
+pub mod summaries;
 pub mod translator;
 pub mod utils;
 
