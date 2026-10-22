@@ -147,6 +147,27 @@ pub enum BookMetadataError {
         /// Underlying I/O error.
         source: std::io::Error,
     },
+
+    /// A `replacements` entry in the metadata file is invalid.
+    #[error("Invalid {}: {source}", path.display())]
+    Replacement {
+        /// Path of `book.json`.
+        path: std::path::PathBuf,
+        /// The offending entry.
+        source: ReplacementError,
+    },
+}
+
+/// Error type for a `book.json` replacement entry that does not compile.
+#[derive(Error, Debug)]
+#[error("replacements[{index}] ({find:?}) is not a valid regex: {source}")]
+pub struct ReplacementError {
+    /// Zero-based index of the entry in `replacements`.
+    pub index: usize,
+    /// The entry's `find` pattern.
+    pub find: String,
+    /// Underlying regex error.
+    pub source: regex::Error,
 }
 
 /// Error type for EPUB generation.

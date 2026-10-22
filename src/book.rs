@@ -6,6 +6,7 @@
 //! edits (`title`, `author`) are never overwritten once set.
 
 use crate::error::BookMetadataError;
+use crate::honorifics::HonorificPolicy;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,25 @@ pub struct BookMetadata {
     /// Translated chapters by chapter number.
     #[serde(default)]
     pub chapters: BTreeMap<u32, ChapterMetadata>,
+    /// Per-novel honorific policy; overrides `[translation] honorifics`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub honorifics: Option<HonorificPolicy>,
+    /// Find/replace rules applied in order to translated text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replacements: Vec<Replacement>,
+}
+
+/// One find/replace rule from `book.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Replacement {
+    /// Text to find; a regex when `regex` is true, otherwise a case-sensitive
+    /// literal matched as a whole word at each word-character end.
+    pub find: String,
+    /// Replacement text; `$1`-style groups expand only for regexes.
+    pub replace: String,
+    /// Treat `find` as a regular expression.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub regex: bool,
 }
 
 /// Metadata for one translated chapter.
@@ -56,17 +76,25 @@ impl BookMetadata {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(source) => return Err(BookMetadataError::Read { path, source }),
         };
-        serde_json::from_str(&content)
-            .map(Some)
-            .map_err(|source| BookMetadataError::Parse { path, source })
+        let book: Self =
+            serde_json::from_str(&content).map_err(|source| BookMetadataError::Parse {
+                path: path.clone(),
+                source,
+            })?;
+        crate::output_rules::compile_replacements(&book.replacements)
+            .map_err(|source| BookMetadataError::Replacement { path, source })?;
+        Ok(Some(book))
     }
 
     /// Write `book.json` to `novel_dir`, replacing the previous file atomically.
     pub fn save(&self, novel_dir: &Path) -> Result<(), BookMetadataError> {
         let path = Self::path(novel_dir);
         let partial = path.with_extension("json.part");
-        let content = serde_json::to_string_pretty(self)
-            .map_err(|source| BookMetadataError::Parse { path: path.clone(), source })?;
+        let content =
+            serde_json::to_string_pretty(self).map_err(|source| BookMetadataError::Parse {
+                path: path.clone(),
+                source,
+            })?;
         std::fs::write(&partial, content)
             .and_then(|()| std::fs::rename(&partial, &path))
             .map_err(|source| BookMetadataError::Write { path, source })
@@ -115,5 +143,55 @@ mod tests {
         assert_eq!(book.author.as_deref(), Some("Someone"));
         assert_eq!(book.chapters[&3].title, "T");
         assert!(book.title.is_empty());
+    }
+
+    #[test]
+    fn test_legacy_file_loads_and_saves_without_new_keys() {
+        let dir = TempDir::new().unwrap();
+        let legacy = r#"{ "title": "T", "original_title": "O", "author": null, "source_url": "u", "chapters": {} }"#;
+        std::fs::write(BookMetadata::path(dir.path()), legacy).unwrap();
+
+        let book = BookMetadata::load(dir.path()).unwrap().unwrap();
+        assert_eq!(book.honorifics, None);
+        assert!(book.replacements.is_empty());
+
+        book.save(dir.path()).unwrap();
+        let raw = std::fs::read_to_string(BookMetadata::path(dir.path())).unwrap();
+        assert!(!raw.contains("honorifics"));
+        assert!(!raw.contains("replacements"));
+    }
+
+    #[test]
+    fn test_honorifics_and_replacements_load() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            BookMetadata::path(dir.path()),
+            r#"{ "honorifics": "names-only", "replacements": [
+                { "find": "Tatyuya", "replace": "Tatsuya" },
+                { "find": "\\bChief Inspector\\b", "replace": "Section Chief", "regex": true } ] }"#,
+        )
+        .unwrap();
+
+        let book = BookMetadata::load(dir.path()).unwrap().unwrap();
+        assert_eq!(book.honorifics, Some(HonorificPolicy::NamesOnly));
+        assert_eq!(book.replacements.len(), 2);
+        assert!(!book.replacements[0].regex);
+        assert!(book.replacements[1].regex);
+    }
+
+    #[test]
+    fn test_invalid_regex_is_load_error_naming_entry() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            BookMetadata::path(dir.path()),
+            r#"{ "replacements": [ { "find": "a", "replace": "b" }, { "find": "(x", "replace": "y", "regex": true } ] }"#,
+        )
+        .unwrap();
+
+        let error = BookMetadata::load(dir.path()).unwrap_err();
+        assert!(
+            matches!(error, BookMetadataError::Replacement { ref source, .. } if source.index == 1)
+        );
+        assert!(error.to_string().contains("replacements[1]"));
     }
 }
