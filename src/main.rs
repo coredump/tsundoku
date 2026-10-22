@@ -21,6 +21,7 @@ use tsundoku::name_scout::{
 };
 use tsundoku::ruby;
 use tsundoku::scrapers::{ChapterInfo, ChapterList, ScraperRegistry};
+use tsundoku::summaries::{SummaryStore, chapter_synopsis};
 use tsundoku::translator::{
     ChunkResult, ProgressInfo, PromptContext, TranslationProgress, TranslationStage, Translator,
 };
@@ -96,6 +97,7 @@ struct ProcessParams<'a> {
     translator: &'a Translator,
     name_scout: &'a NameScout,
     name_mapping: &'a mut NameMappingStore,
+    summary_store: &'a mut SummaryStore,
     no_name_pause: bool,
     no_name_scout: bool,
     scout_only: bool,
@@ -211,11 +213,14 @@ async fn main() -> Result<()> {
     let names_dir = config.names_dir()?;
     let mut name_mapping = NameMappingStore::new(&names_dir, scraper.id(), &novel_info.novel_id)
         .context("Failed to initialize name mapping store")?;
+    let mut summary_store = SummaryStore::new(&names_dir, scraper.id(), &novel_info.novel_id)
+        .context("Failed to load chapter summaries")?;
 
     console.info(&format!(
-        "Name mapping: {} names and {} glossary terms loaded",
+        "Name mapping: {} names and {} glossary terms loaded; {} chapter summaries",
         name_mapping.len(),
-        name_mapping.term_len()
+        name_mapping.term_len(),
+        summary_store.len()
     ));
 
     // Initialize translator
@@ -239,7 +244,8 @@ async fn main() -> Result<()> {
         scout_api,
         config.name_scout.clone(),
         config.prompts.name_scout.clone(),
-    );
+    )
+    .with_summaries(config.name_scout.summaries);
 
     // Get output directory
     let output_dir = expand_path(&config.paths.output_directory);
@@ -253,6 +259,7 @@ async fn main() -> Result<()> {
         translator: &translator,
         name_scout: &name_scout,
         name_mapping: &mut name_mapping,
+        summary_store: &mut summary_store,
         no_name_pause: args.no_name_pause,
         no_name_scout: args.no_name_scout,
         scout_only: args.scout_only,
@@ -330,6 +337,7 @@ async fn process_oneshot(params: &mut ProcessParams<'_>) -> Result<()> {
             params.console,
             params.name_scout,
             params.name_mapping,
+            params.summary_store,
             &[(1, &params.novel_info.title, &content)],
             params.config.name_scout.workers,
             params.name_scout_limit,
@@ -364,7 +372,9 @@ async fn process_oneshot(params: &mut ProcessParams<'_>) -> Result<()> {
         let mapped_content = mark_scene_breaks(params.name_mapping.apply_to_text(&rendered));
         let prompt = chapter_prompt_context(
             params.name_mapping,
+            params.summary_store,
             &params.config.translation,
+            1,
             &rendered,
             &mapped_content,
         );
@@ -517,6 +527,7 @@ async fn process_chapters(
             params.console,
             params.name_scout,
             params.name_mapping,
+            params.summary_store,
             &scout_data,
             params.config.name_scout.workers,
             params.name_scout_limit,
@@ -543,11 +554,11 @@ async fn process_chapters(
         params.console,
         params.translator,
         params.name_mapping,
+        params.summary_store,
         &downloaded_chapters,
         &story_dir,
         &mut book,
         padding,
-        params.config.translation.workers,
         &params.config.translation,
     )
     .await?;
@@ -559,13 +570,14 @@ async fn translate_chapters(
     console: &Console,
     translator: &Translator,
     name_mapping: &NameMappingStore,
+    summary_store: &SummaryStore,
     downloaded_chapters: &[ChapterData],
     story_dir: &Path,
     book: &mut BookMetadata,
     padding: usize,
-    workers: usize,
     translation_config: &TranslationConfig,
 ) -> Result<()> {
+    let workers = translation_config.workers;
     console.info(&format!(
         "Translating with {} chapter worker{}",
         workers,
@@ -592,8 +604,14 @@ async fn translate_chapters(
 
         let rendered = ruby::for_translation(&chapter_data.content);
         let mapped_content = mark_scene_breaks(name_mapping.apply_to_text(&rendered));
-        let prompt =
-            chapter_prompt_context(name_mapping, translation_config, &rendered, &mapped_content);
+        let prompt = chapter_prompt_context(
+            name_mapping,
+            summary_store,
+            translation_config,
+            chapter_data.number,
+            &rendered,
+            &mapped_content,
+        );
         jobs.push(TranslationJob {
             number: chapter_data.number,
             title: chapter_data.title.clone(),
@@ -689,11 +707,15 @@ async fn translate_chapters(
 }
 
 /// Build a chapter's prompt context: the canonical terms present in the
-/// name-substituted `mapped_content`, and the cast whose original names occur in
-/// `rendered`, the ruby-rendered chapter text before name substitution.
+/// name-substituted `mapped_content`, the cast whose original names occur in
+/// `rendered` (the ruby-rendered chapter text before name substitution), and the
+/// synopses of the chapters before `chapter`, with names normalised to their
+/// selected renderings.
 fn chapter_prompt_context(
     name_mapping: &NameMappingStore,
+    summary_store: &SummaryStore,
     translation_config: &TranslationConfig,
+    chapter: u32,
     rendered: &str,
     mapped_content: &str,
 ) -> PromptContext {
@@ -701,6 +723,11 @@ fn chapter_prompt_context(
         glossary: name_mapping
             .glossary_for_text(mapped_content, translation_config.glossary_max_entries),
         cast: name_mapping.cast_for_text(rendered, translation_config.cast_max_entries),
+        previously: summary_store
+            .previous(chapter, translation_config.summary_chapters)
+            .into_iter()
+            .map(|(number, synopsis)| (number, name_mapping.normalize_renderings(&synopsis)))
+            .collect(),
     }
 }
 
@@ -959,43 +986,87 @@ fn render_translation_stats(console: &Console, stats: &HashMap<usize, WorkerStat
     let _ = io::stdout().flush();
 }
 
-/// Runs the mapping scout on chapters missing either names or terminology coverage.
-/// Returns true if any scouting was performed, false if all chapters were covered.
+/// What a chapter still needs from the scout.
+#[derive(Debug, Clone, Copy)]
+struct ScoutNeeds {
+    /// Record name votes and name coverage.
+    names: bool,
+    /// Record term votes and term coverage.
+    terms: bool,
+    /// Store a chapter synopsis.
+    summary: bool,
+}
+
+impl ScoutNeeds {
+    /// Returns whether the chapter needs a mapping request (names or terms).
+    fn mappings(self) -> bool {
+        self.names || self.terms
+    }
+}
+
+/// Runs the mapping scout on chapters missing names or terminology coverage and,
+/// when summaries are enabled, on chapters without a stored synopsis. Chapters that
+/// only lack a synopsis get summary-only requests.
+///
+/// Returns true if any chapter was scouted for names or terms, false if only
+/// summaries were back-filled or nothing was needed.
 async fn run_name_scout(
     console: &Console,
     name_scout: &NameScout,
     name_mapping: &mut NameMappingStore,
+    summary_store: &mut SummaryStore,
     chapters: &[(u32, &str, &str)], // (number, title, content)
     workers: usize,
     limit: Option<u32>,
 ) -> Result<bool> {
     console.section("Mapping Scout Phase");
 
+    let summaries = name_scout.summaries_enabled();
     let uncovered: Vec<_> = chapters
         .iter()
         .filter(|(number, _, _)| limit.is_none_or(|limit| *number <= limit))
         .map(|(number, title, content)| {
-            (
-                *number,
-                *title,
-                *content,
-                !name_mapping.is_chapter_covered(*number),
-                !name_mapping.is_chapter_terms_covered(*number),
-            )
+            let needs = ScoutNeeds {
+                names: !name_mapping.is_chapter_covered(*number),
+                terms: !name_mapping.is_chapter_terms_covered(*number),
+                summary: summaries && !summary_store.has(*number),
+            };
+            (*number, *title, *content, needs)
         })
-        .filter(|(_, _, _, missing_names, missing_terms)| *missing_names || *missing_terms)
+        .filter(|(_, _, _, needs)| needs.mappings() || needs.summary)
         .collect();
 
     if uncovered.is_empty() {
-        console.info("All chapters already scouted for names and terminology");
+        console.info(if summaries {
+            "All chapters already scouted for names, terminology and summaries"
+        } else {
+            "All chapters already scouted for names and terminology"
+        });
         return Ok(false);
     }
 
+    let mapping_chapters = uncovered
+        .iter()
+        .filter(|(_, _, _, needs)| needs.mappings())
+        .count();
+    let summary_only_chapters = uncovered.len() - mapping_chapters;
+    let plural = |count: usize| if count == 1 { "" } else { "s" };
+    let mut plan = format!(
+        "Scouting {} chapter{} for character names and terminology",
+        mapping_chapters,
+        plural(mapping_chapters)
+    );
+    if summary_only_chapters > 0 {
+        plan.push_str(&format!(
+            " and summarizing {} more chapter{}",
+            summary_only_chapters,
+            plural(summary_only_chapters)
+        ));
+    }
     console.info(&format!(
-        "Scouting {} chapters for character names and terminology with {} chapter worker{}",
-        uncovered.len(),
+        "{plan} with {} chapter worker{}",
         workers,
-        if workers == 1 { "" } else { "s" }
+        plural(workers)
     ));
 
     let (progress_tx, progress_rx) = mpsc::unbounded_channel();
@@ -1010,7 +1081,7 @@ async fn run_name_scout(
 
     {
         let scouted = stream::iter(uncovered)
-            .map(|(number, title, content, record_names, record_terms)| {
+            .map(|(number, title, content, needs)| {
                 let worker_ids = Arc::clone(&worker_ids);
                 let progress_tx = progress_tx.clone();
 
@@ -1028,8 +1099,7 @@ async fn run_name_scout(
                         title,
                         content,
                         &snapshot.present_in(content),
-                        record_names,
-                        record_terms,
+                        needs,
                         worker,
                         progress_tx.clone(),
                     )
@@ -1062,30 +1132,40 @@ async fn run_name_scout(
             };
 
             for entries in &chapter.mapping_chunks {
-                if chapter.record_names {
+                if chapter.needs.names {
                     name_mapping.record_votes(&entries.names);
                 }
-                if chapter.record_terms {
+                if chapter.needs.terms {
                     name_mapping.record_term_votes(&entries.terms);
                 }
                 name_mapping.save()?;
             }
 
-            if chapter.record_names {
+            if chapter.needs.names {
                 name_mapping.add_coverage(&[chapter.number]);
             }
-            if chapter.record_terms {
+            if chapter.needs.terms {
                 name_mapping.add_term_coverage(&[chapter.number]);
             }
-            name_mapping.save()?;
-            *known.write().unwrap_or_else(PoisonError::into_inner) =
-                Arc::new(name_mapping.known_mappings());
+            if chapter.needs.mappings() {
+                name_mapping.save()?;
+                *known.write().unwrap_or_else(PoisonError::into_inner) =
+                    Arc::new(name_mapping.known_mappings());
+            }
+            if let Some(synopsis) = chapter.synopsis {
+                summary_store.set(chapter.number, synopsis);
+                summary_store.save()?;
+            }
 
             clear_status_line();
-            console.success(&format!(
-                "Scouted chapter {}: found {} names and {} terms",
-                chapter.number, chapter.total_names, chapter.total_terms
-            ));
+            console.success(&if chapter.needs.mappings() {
+                format!(
+                    "Scouted chapter {}: found {} names and {} terms",
+                    chapter.number, chapter.total_names, chapter.total_terms
+                )
+            } else {
+                format!("Summarized chapter {}", chapter.number)
+            });
         }
     }
 
@@ -1104,16 +1184,18 @@ async fn run_name_scout(
         name_mapping.term_len()
     ));
 
-    Ok(true)
+    Ok(mapping_chapters > 0)
 }
 
 struct ScoutedChapter {
     number: u32,
-    record_names: bool,
-    record_terms: bool,
+    needs: ScoutNeeds,
     total_names: usize,
     total_terms: usize,
     mapping_chunks: Vec<ScoutChunk>,
+    /// The chapter synopsis to store (empty when the scout gave none); `None` when
+    /// the chapter did not need one.
+    synopsis: Option<String>,
 }
 
 async fn scout_chapter_job(
@@ -1122,8 +1204,7 @@ async fn scout_chapter_job(
     title: &str,
     content: &str,
     known: &KnownMappings,
-    record_names: bool,
-    record_terms: bool,
+    needs: ScoutNeeds,
     worker: usize,
     progress_tx: mpsc::UnboundedSender<NameScoutEvent>,
 ) -> Result<ScoutedChapter> {
@@ -1134,21 +1215,37 @@ async fn scout_chapter_job(
         worker,
         reporter: Some(progress_tx),
     };
-    let mapping_chunks = name_scout
-        .collect_mappings_with_progress(&payload, known, Some(progress))
-        .await
-        .with_context(|| format!("Failed to scout mappings for chapter {}", number))?;
+    let (mapping_chunks, chunk_summaries) = if needs.mappings() {
+        let mut mapping_chunks = name_scout
+            .collect_mappings_with_progress(&payload, known, Some(progress))
+            .await
+            .with_context(|| format!("Failed to scout mappings for chapter {}", number))?;
+        let chunk_summaries: Vec<String> = mapping_chunks
+            .iter_mut()
+            .filter_map(|chunk| chunk.summary.take())
+            .collect();
+        (mapping_chunks, chunk_summaries)
+    } else {
+        let chunk_summaries = name_scout
+            .collect_summaries_with_progress(&payload, known, Some(progress))
+            .await
+            .with_context(|| format!("Failed to summarize chapter {}", number))?;
+        (Vec::new(), chunk_summaries)
+    };
 
     let total_names = mapping_chunks.iter().map(|chunk| chunk.names.len()).sum();
     let total_terms = mapping_chunks.iter().map(|chunk| chunk.terms.len()).sum();
+    let synopsis = needs
+        .summary
+        .then(|| chapter_synopsis(&chunk_summaries).unwrap_or_default());
 
     Ok(ScoutedChapter {
         number,
-        record_names,
-        record_terms,
+        needs,
         total_names,
         total_terms,
         mapping_chunks,
+        synopsis,
     })
 }
 
@@ -1629,6 +1726,156 @@ mod tests {
         ]);
 
         assert!(args.is_err());
+    }
+
+    fn name_vote(original: &str, english: &str) -> tsundoku::name_mapping::NameEntry {
+        tsundoku::name_mapping::NameEntry {
+            original: original.to_string(),
+            english: english.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn prompt_context_carries_normalized_previous_synopses() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut name_mapping =
+            NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
+        name_mapping.record_votes(&[
+            name_vote("タツヤ", "Tatsuya"),
+            name_vote("タツヤ", "Tatsuya"),
+            name_vote("タツヤ", "Tatuya"),
+        ]);
+        let mut summaries = SummaryStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
+        summaries.set(3, "Tatuya meets Ruri.".to_string());
+        summaries.set(4, "Ruri leaves.".to_string());
+        let config = TranslationConfig::default();
+        let previously = |chapter, config: &TranslationConfig| {
+            chapter_prompt_context(&name_mapping, &summaries, config, chapter, "", "")
+                .system_prompt("Base")
+                .split_once("\n\nStory so far (context only; do not translate):\n")
+                .map(|(_, section)| section.to_string())
+        };
+
+        assert_eq!(previously(1, &config), None);
+        assert_eq!(
+            previously(5, &config).as_deref(),
+            Some("- Ch 3: Tatsuya meets Ruri.\n- Ch 4: Ruri leaves.")
+        );
+        // Chapter 5 has no synopsis, so chapter 6 sees only chapter 4.
+        assert_eq!(
+            previously(6, &config).as_deref(),
+            Some("- Ch 4: Ruri leaves.")
+        );
+        let disabled = TranslationConfig {
+            summary_chapters: 0,
+            ..TranslationConfig::default()
+        };
+        assert_eq!(previously(5, &disabled), None);
+    }
+
+    #[tokio::test]
+    async fn scout_backfills_summary_for_mapped_chapter_with_one_summary_request() {
+        use std::io::{BufRead, BufReader, Read};
+        use std::net::TcpListener;
+        use tsundoku::config::{ApiConfig, NameScoutConfig};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let mut content_length = 0;
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap();
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+
+            // Names in the reply must be ignored: the chapter is already covered.
+            let response_body = r#"{"choices":[{"message":{"content":"{\"summary\":\"Tatsuya shows Ruri the magic stone.\",\"names\":[{\"original\":\"ルリ\",\"part\":\"given\",\"english\":\"Ruri\"}]}"}}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )
+            .unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            // A second request would block on `accept`; the scout must send only one.
+            (listener, request)
+        });
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut name_mapping =
+            NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
+        name_mapping.record_votes(&[name_vote("タツヤ", "Tatsuya")]);
+        name_mapping.add_coverage(&[1]);
+        name_mapping.add_term_coverage(&[1]);
+        let mut summaries = SummaryStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
+        let scout = NameScout::new(
+            ApiConfig {
+                key: "test-key".to_string(),
+                base_url: format!("http://{address}/v1"),
+                model: "test-model".to_string(),
+            },
+            NameScoutConfig {
+                retries: 1,
+                json_retries: 1,
+                delay_between_requests_sec: 0.0,
+                ..Default::default()
+            },
+            "Extract mappings".to_string(),
+        )
+        .with_summaries(true);
+
+        let mapping_scouted = run_name_scout(
+            &Console::new(),
+            &scout,
+            &mut name_mapping,
+            &mut summaries,
+            &[(1, "第一話", "タツヤは魔石を見せた。")],
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+        let (listener, request) = server.join().unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        assert!(!mapping_scouted);
+        assert!(listener.accept().is_err(), "only one request expected");
+        assert!(
+            request["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("You summarize passages")
+        );
+        assert_eq!(summaries.get(1), Some("Tatsuya shows Ruri the magic stone."));
+        assert!(
+            SummaryStore::new(temp_dir.path(), "syosetu", "n1234ab")
+                .unwrap()
+                .has(1)
+        );
+        let names: Vec<_> = name_mapping
+            .names()
+            .map(|(original, info)| (original.to_string(), info.votes.clone()))
+            .collect();
+        assert_eq!(
+            names,
+            [(
+                "タツヤ".to_string(),
+                HashMap::from([("Tatsuya".to_string(), 1)])
+            )]
+        );
     }
 
     #[test]

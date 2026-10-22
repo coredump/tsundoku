@@ -90,6 +90,7 @@ Translation behavior configuration:
 - `history_length`: Number of message pairs to retain in conversation history (default: "5", integer)
 - `glossary_max_entries`: Maximum canonical glossary entries injected into a chapter translation prompt; `0` disables injection (default: "100", integer)
 - `cast_max_entries`: Maximum characters (with gender and note) listed in a chapter translation prompt; `0` disables the cast block (default: "30", integer)
+- `summary_chapters`: Number of previous chapters whose scout synopses are added to a chapter translation prompt; `0` disables (default: "2", integer)
 - `max_tokens_per_char`: Reply token limit per source character; each request sends `max_tokens = max(512, ceil(max_tokens_per_char × characters))` and `0` sends none. Must be finite and at least 0 (default: "2.0", float)
 
 #### [NameScout] Section
@@ -98,6 +99,7 @@ Name and terminology extraction configuration:
 - `retries`: Number of retry attempts (default: "3", integer)
 - `delay_between_requests_sec`: Delay between requests (default: "1", float)
 - `json_retries`: Number of JSON parsing retry attempts (default: "3", integer)
+- `summaries`: Also collect a short synopsis of each chapter into the summaries file; chapters lacking one are back-filled with summary-only requests (default: "false", bool)
 
 #### [Scraping] Section
 Web scraping behavior:
@@ -472,8 +474,9 @@ const REFUSAL_PHRASES: &[&str] = &[
 
 **Content Translation** (`translate_content(text: &str, ctx: &PromptContext, progress_info: Option<ProgressInfo>) -> Result<Vec<ChunkResult>>`):
    - If the text is blank → return no chunks
-   - Render the system prompt once per chapter with `PromptContext::system_prompt(content_translation_prompt)`, so it is byte-identical for every chunk. Sections, in fixed order and separated by a blank line: the configured prompt; the English-only and ruby rules; the cast; the canonical glossary entries present in the name-substituted text (overrides first, then by vote count, capped at `glossary_max_entries`). Empty sections are omitted
+   - Render the system prompt once per chapter with `PromptContext::system_prompt(content_translation_prompt)`, so it is byte-identical for every chunk. Sections, in fixed order and separated by a blank line: the configured prompt; the English-only and ruby rules; the cast; the canonical glossary entries present in the name-substituted text (overrides first, then by vote count, capped at `glossary_max_entries`); the previous chapters' synopses. Empty sections are omitted
    - The cast is `NameMappingStore::cast_for_text(ruby::for_translation(raw_content), cast_max_entries)`: names whose original occurs in the chapter text before name substitution and that have a gender or a note, ordered by `count` descending then English name. It renders as `Characters in this chapter (use matching pronouns even where the Japanese omits the subject):` followed by one `- {english}: {gender}; {note}` line per entry (`- {english}: {gender}` or `- {english}: {note}` when one is missing)
+   - The synopses are `SummaryStore::previous(chapter, summary_chapters)` (chapters `chapter - k` … `chapter - 1` that have a non-empty synopsis, oldest first), each passed through `NameMappingStore::normalize_renderings` so losing renderings of a name become the selected one. They render as `Story so far (context only; do not translate):` followed by one `- Ch {number}: {synopsis}` line per chapter
    - Split text into chunks using `split_text_into_chunks`
    - For each chunk, with the shared retry logic:
      - Display preparing status before API call
@@ -784,19 +787,35 @@ Returns an iterator (or async stream) that yields parsed name lists per chunk:
 
 4. Return normalized list
 
-**Integration with Main Flow**:
-Called after chapter download but before translation:
+**Integration with Main Flow** (`run_name_scout`):
+Called after chapter download but before translation. A chapter is scouted when it lacks name coverage, term coverage, or (with `name_scout.summaries`) a key in the summaries file. Chapters run on `name_scout.workers` workers and are recorded as each finishes:
 ```rust
-for ch in missing_chapters {
-    let chapter_payload = build_name_scout_payload(&[ch]);
-    for parsed in name_scout.collect_names_stream(&chapter_payload) {
-        name_mapping.record_votes(&parsed);
+for ch in chapters_needing_scout {
+    let chunks = if ch.needs_names || ch.needs_terms {
+        name_scout.collect_mappings_with_progress(&payload, &known, progress)  // may carry chunk summaries
+    } else {
+        name_scout.collect_summaries_with_progress(&payload, &known, progress) // summary-only requests
+    };
+    for chunk in chunks {
+        if ch.needs_names { name_mapping.record_votes(&chunk.names); }
+        if ch.needs_terms { name_mapping.record_term_votes(&chunk.terms); }
         name_mapping.save()?;  // persist after every successful API call
     }
-    name_mapping.add_coverage(&[ch.number]);
-    name_mapping.save()?;
+    if ch.needs_names { name_mapping.add_coverage(&[ch.number]); }
+    if ch.needs_terms { name_mapping.add_term_coverage(&[ch.number]); }
+    if ch.needs_summary {
+        summary_store.set(ch.number, chapter_synopsis(&chunk_summaries).unwrap_or_default());
+        summary_store.save()?;
+    }
 }
 ```
+It returns true (and the manual review pause runs) only when some chapter was scouted for names or terms; a summary-only back-fill skips the pause.
+
+**Summaries File**: `SummaryStore` at `names_dir/"{module}: {novel_id}.summaries.json"` (Windows: `{module} - {novel_id}.summaries.json`):
+```json
+{ "version": 1, "chapters": { "12": "Tatsuya brings Ruri to the village; Monika audits the inn." } }
+```
+A chapter is covered once its key exists (possibly with an empty synopsis). Chunk summaries are capped at 40 words and the chapter synopsis (chunk summaries joined in order) at 120.
 
 **Chapter Payload Format**:
 ```

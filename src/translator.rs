@@ -11,6 +11,7 @@ use crate::qa::{Issue, IssueKind};
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
@@ -41,11 +42,19 @@ enum PromptSection {
     Cast,
     /// Canonical terminology renderings.
     Glossary,
+    /// Synopses of the previous chapters.
+    Previously,
 }
 
 impl PromptSection {
     /// Rendering order of the system prompt sections.
-    const ORDER: [PromptSection; 4] = [Self::Base, Self::Rules, Self::Cast, Self::Glossary];
+    const ORDER: [PromptSection; 5] = [
+        Self::Base,
+        Self::Rules,
+        Self::Cast,
+        Self::Glossary,
+        Self::Previously,
+    ];
 }
 
 /// Chapter-level context rendered into the content translation system prompt.
@@ -60,12 +69,15 @@ pub struct PromptContext {
     /// Characters present in the chapter that have a gender or a note, already
     /// capped at `translation.cast_max_entries`.
     pub cast: Vec<CastEntry>,
+    /// Synopses of the previous chapters as `(chapter number, synopsis)`, oldest
+    /// first, with names already normalised to their selected renderings.
+    pub previously: Vec<(u32, String)>,
 }
 
 impl PromptContext {
     /// Render the content system prompt: `base`, the English-only and ruby rules,
-    /// the cast, then the glossary. Sections are separated by a blank line; empty
-    /// ones are left out.
+    /// the cast, the glossary, then the previous chapters' synopses. Sections are
+    /// separated by a blank line; empty ones are left out.
     pub fn system_prompt(&self, base: &str) -> String {
         let mut prompt = String::new();
         for section in PromptSection::ORDER {
@@ -118,14 +130,23 @@ impl PromptContext {
                     return;
                 }
                 out.push_str(
-                    "Use these canonical terminology renderings exactly when the Japanese term appears:\n",
+                    "Use these canonical terminology renderings exactly when the Japanese term appears:",
                 );
                 for entry in &self.glossary {
-                    out.push_str("- ");
+                    out.push_str("\n- ");
                     out.push_str(&entry.original);
                     out.push_str(" → ");
                     out.push_str(&entry.english);
-                    out.push('\n');
+                }
+            }
+            PromptSection::Previously => {
+                if self.previously.is_empty() {
+                    return;
+                }
+                out.push_str("Story so far (context only; do not translate):");
+                for (chapter, synopsis) in &self.previously {
+                    // Writing to a String cannot fail.
+                    let _ = write!(out, "\n- Ch {chapter}: {synopsis}");
                 }
             }
         }
@@ -887,6 +908,10 @@ mod tests {
                 gender: Some(Gender::Male),
                 note: Some("Timer Association liaison".to_string()),
             }],
+            previously: vec![
+                (3, "Ruri arrives.".to_string()),
+                (4, "Tatsuya leaves.".to_string()),
+            ],
         };
 
         let prompt = ctx.system_prompt("Translate this content");
@@ -897,9 +922,13 @@ mod tests {
         let glossary = prompt
             .find("Use these canonical terminology renderings exactly")
             .unwrap();
+        let previously = prompt.find("Story so far").unwrap();
         assert!(prompt.starts_with("Translate this content\n\n"));
-        assert!(rules < ruby && ruby < cast && cast < glossary);
-        assert!(prompt.ends_with("- 魔石 → Magic Stone\n"));
+        assert!(rules < ruby && ruby < cast && cast < glossary && glossary < previously);
+        assert!(prompt.contains("- 魔石 → Magic Stone\n\nStory so far"));
+        assert!(prompt.ends_with(
+            "Story so far (context only; do not translate):\n- Ch 3: Ruri arrives.\n- Ch 4: Tatsuya leaves."
+        ));
     }
 
     #[test]
@@ -1285,6 +1314,7 @@ mod tests {
                 gender: Some(Gender::Male),
                 note: None,
             }],
+            previously: vec![(1, "Kirigaya meets Ruri.".to_string())],
         };
 
         let chunks = translator

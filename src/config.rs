@@ -121,6 +121,12 @@ pub struct TranslationConfig {
     /// Set to zero to disable the cast block.
     pub cast_max_entries: usize,
 
+    /// Number of previous chapters whose scout synopses are added to a chapter's
+    /// translation prompt as context.
+    ///
+    /// Set to zero to disable.
+    pub summary_chapters: usize,
+
     /// Reply token limit per source character: each request sends
     /// `max_tokens = max(512, ceil(max_tokens_per_char × characters))`.
     ///
@@ -140,6 +146,7 @@ impl Default for TranslationConfig {
             history_length: 5,
             glossary_max_entries: 100,
             cast_max_entries: 30,
+            summary_chapters: 2,
             max_tokens_per_char: 2.0,
             workers: 1,
         }
@@ -168,6 +175,11 @@ pub struct NameScoutConfig {
 
     /// Number of chapters to scout concurrently.
     pub workers: usize,
+
+    /// Ask the scout for a short synopsis of every chapter, stored next to the
+    /// mapping and used as cross-chapter context during translation. Off by default
+    /// because it adds scout output.
+    pub summaries: bool,
 }
 
 impl Default for NameScoutConfig {
@@ -179,6 +191,7 @@ impl Default for NameScoutConfig {
             request_timeout_sec: 300,
             json_retries: 3,
             workers: 1,
+            summaries: false,
         }
     }
 }
