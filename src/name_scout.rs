@@ -3,7 +3,7 @@
 //! Uses a secondary LLM pass to identify character names and recurring
 //! story-specific terms with canonical English renderings.
 
-use crate::config::{ApiConfig, NameScoutConfig};
+use crate::config::{ApiConfig, NameScoutConfig, SamplingParams};
 use crate::console::Console;
 use crate::error::TranslationError;
 use crate::name_mapping::{CastEntry, Gender, KnownMappings, NameEntry, NamePart, TermEntry};
@@ -112,9 +112,12 @@ fn preview_text(text: &str, max_chars: usize) -> String {
 
 /// Request body for the chat completions API.
 #[derive(Debug, Serialize)]
-struct ChatRequest {
+struct ChatRequest<'a> {
     model: String,
     messages: Vec<Message>,
+    /// Configured sampling settings; unset ones are omitted.
+    #[serde(flatten)]
+    sampling: &'a SamplingParams,
 }
 
 /// A message in the conversation.
@@ -761,6 +764,7 @@ impl NameScout {
                     content: user_message.to_string(),
                 },
             ],
+            sampling: &self.api_config.sampling,
         };
 
         // Apply rate limiting delay
@@ -1154,6 +1158,7 @@ mod tests {
                 key: "test-key".to_string(),
                 base_url: format!("http://{address}/v1"),
                 model: "test-model".to_string(),
+                ..Default::default()
             },
             NameScoutConfig {
                 retries: 1,

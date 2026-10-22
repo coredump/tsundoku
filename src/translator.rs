@@ -3,7 +3,7 @@
 //! Provides text translation with streaming progress display,
 //! message history management, and retry logic.
 
-use crate::config::{ApiConfig, TranslationConfig};
+use crate::config::{ApiConfig, SamplingParams, TranslationConfig};
 use crate::console::Console;
 use crate::error::TranslationError;
 use crate::honorifics;
@@ -303,13 +303,16 @@ pub struct Message {
 
 /// Request body for the chat completions API.
 #[derive(Debug, Serialize)]
-struct ChatRequest {
+struct ChatRequest<'a> {
     model: String,
     messages: Vec<Message>,
     stream: bool,
     /// Reply token limit; omitted when `translation.max_tokens_per_char` is 0.
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    /// Configured sampling settings; unset ones are omitted.
+    #[serde(flatten)]
+    sampling: &'a SamplingParams,
 }
 
 /// Response from the chat completions API (non-streaming).
@@ -774,6 +777,7 @@ impl Translator {
             messages,
             stream: true,
             max_tokens,
+            sampling: &self.api_config.sampling,
         };
 
         // Make streaming request

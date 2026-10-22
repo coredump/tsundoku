@@ -80,6 +80,10 @@ pub struct ApiConfig {
 
     /// Model identifier.
     pub model: String,
+
+    /// Sampling settings sent with every request (`[api.sampling]`); unset fields
+    /// are left to the server's defaults.
+    pub sampling: SamplingParams,
 }
 
 impl Default for ApiConfig {
@@ -88,6 +92,7 @@ impl Default for ApiConfig {
             key: API_KEY_PLACEHOLDER.to_string(),
             base_url: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
+            sampling: SamplingParams::default(),
         }
     }
 }
@@ -96,6 +101,71 @@ impl ApiConfig {
     /// Checks if the API key is configured (not placeholder).
     pub fn is_configured(&self) -> bool {
         !self.key.is_empty() && self.key != API_KEY_PLACEHOLDER
+    }
+}
+
+/// Optional sampling parameters added to chat completion requests.
+///
+/// Each field is sent only when set. `top_k`, `min_p` and `repeat_penalty` are
+/// llama.cpp server extensions; OpenAI's API rejects or ignores them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SamplingParams {
+    /// Sampling temperature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Nucleus sampling probability mass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Keep only the `top_k` most likely tokens (llama.cpp).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    /// Drop tokens below `min_p` × the top token's probability (llama.cpp).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f32>,
+    /// Penalty for recently repeated tokens; 1.0 disables (llama.cpp).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeat_penalty: Option<f32>,
+    /// Penalty for tokens already present in the output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    /// Penalty proportional to how often a token already appeared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    /// Fixed sampling seed for reproducible output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+}
+
+impl SamplingParams {
+    /// Check that every set value is in range; `section` names the config table.
+    pub fn validate(&self, section: &str) -> Result<(), ConfigError> {
+        let invalid = |key: &str, message: &str| ConfigError::InvalidValue {
+            key: format!("{section}.sampling.{key}"),
+            message: message.to_string(),
+        };
+        let finite_in = |value: Option<f32>, low: f32, high: f32| {
+            value.is_none_or(|v| v.is_finite() && (low..=high).contains(&v))
+        };
+        if !finite_in(self.temperature, 0.0, 5.0) {
+            return Err(invalid("temperature", "must be between 0 and 5"));
+        }
+        if !finite_in(self.top_p, 0.0, 1.0) {
+            return Err(invalid("top_p", "must be between 0 and 1"));
+        }
+        if !finite_in(self.min_p, 0.0, 1.0) {
+            return Err(invalid("min_p", "must be between 0 and 1"));
+        }
+        if !finite_in(self.repeat_penalty, 0.5, 2.0) {
+            return Err(invalid("repeat_penalty", "must be between 0.5 and 2 (1 disables)"));
+        }
+        if !finite_in(self.presence_penalty, -2.0, 2.0) {
+            return Err(invalid("presence_penalty", "must be between -2 and 2"));
+        }
+        if !finite_in(self.frequency_penalty, -2.0, 2.0) {
+            return Err(invalid("frequency_penalty", "must be between -2 and 2"));
+        }
+        Ok(())
     }
 }
 
@@ -372,6 +442,11 @@ impl Config {
                     ));
                 }
             }
+        }
+
+        self.api.sampling.validate("api")?;
+        if let Some(scout_api) = &self.scout_api {
+            scout_api.sampling.validate("scout_api")?;
         }
 
         if self.translation.chunk_size_chars == 0 {

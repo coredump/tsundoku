@@ -80,6 +80,21 @@ base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"
 ```
 
+#### Sampling
+
+Tsundoku sends no sampling settings unless you set them, so the server's defaults apply (llama-server takes them from the model file when it has them; check `/props`). Set them per API, so the scout can run cooler than the translator:
+
+```toml
+[api.sampling]
+temperature = 0.5
+repeat_penalty = 1.05   # llama.cpp only
+
+[scout_api.sampling]
+temperature = 0.2
+```
+
+Available keys: `temperature`, `top_p`, `top_k`, `min_p`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`, `seed`. Unset keys are not sent. `top_k`, `min_p` and `repeat_penalty` are llama.cpp extensions that OpenAI's API does not accept.
+
 #### Editor for Name Review
 
 Specify which editor to use when reviewing name mappings:

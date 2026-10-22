@@ -2435,6 +2435,7 @@ mod tests {
                 key: "test-key".to_string(),
                 base_url,
                 model: "test-model".to_string(),
+                ..Default::default()
             },
             NameScoutConfig {
                 retries: 1,

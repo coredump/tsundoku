@@ -82,6 +82,11 @@ Optional separate API for name scouting (falls back to [API] if not set):
 - `base_url`: API base URL (string)
 - `model`: Model identifier (string)
 
+#### [api.sampling] / [scout_api.sampling] Sections
+Optional sampling parameters (`SamplingParams`), each sent in the chat request body only when set; otherwise the server default applies:
+- `temperature` (0–5), `top_p` (0–1), `top_k` (integer), `min_p` (0–1), `repeat_penalty` (0.5–2, 1 disables), `presence_penalty` and `frequency_penalty` (−2–2), `seed` (integer)
+- Ranges are checked in `validate_for_workflow`; `top_k`, `min_p` and `repeat_penalty` are llama.cpp extensions
+
 #### [Translation] Section
 Translation behavior configuration:
 - `chunk_size_chars`: Maximum characters (not bytes) per source chunk; chunks end at scene breaks where possible (default: "1500", integer)
