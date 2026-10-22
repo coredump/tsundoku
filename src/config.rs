@@ -115,6 +115,12 @@ pub struct TranslationConfig {
     /// Set to zero to disable glossary injection.
     pub glossary_max_entries: usize,
 
+    /// Maximum number of characters listed (with gender and note) in one chapter
+    /// translation prompt.
+    ///
+    /// Set to zero to disable the cast block.
+    pub cast_max_entries: usize,
+
     /// Reply token limit per source character: each request sends
     /// `max_tokens = max(512, ceil(max_tokens_per_char × characters))`.
     ///
@@ -133,6 +139,7 @@ impl Default for TranslationConfig {
             delay_between_requests_sec: 1.0,
             history_length: 5,
             glossary_max_entries: 100,
+            cast_max_entries: 30,
             max_tokens_per_char: 2.0,
             workers: 1,
         }
@@ -215,8 +222,6 @@ impl Default for PromptsConfig {
             title_translation: "You are a Japanese to English translator. Translate the following Japanese novel title to English. Provide only the translated title, nothing else.".to_string(),
             content_translation: "You are a Japanese to English translator specializing in web novels. Translate the following Japanese text to natural English, preserving the author's style and tone. Character names have already been converted to English - do not change them.".to_string(),
             name_scout: r#"You read Japanese fiction text and extract character name parts and recurring story-specific terminology.
-Return ONLY JSON with this shape:
-{"names":[{"original":"<exact name characters>","part":"family|given|unknown","english":"<best English rendering>"}],"terms":[{"original":"<exact Japanese term>","english":"<canonical English rendering>"}]}
 Treat given and family names separately and report bare names without suffixes such as 家, 王, or 国. Names are personal names only; never list titles, ranks, kinship terms, or common nouns (such as 父, 帝, 将軍, 公爵) as names. For terms, include distinctive items, skills, magic systems, ranks, organizations, places, and fictional concepts; exclude person names, ordinary vocabulary, and prose. Preserve each original exactly and use concise canonical English renderings. No explanations."#.to_string(),
         }
     }

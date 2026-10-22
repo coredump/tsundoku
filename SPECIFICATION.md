@@ -89,6 +89,7 @@ Translation behavior configuration:
 - `delay_between_requests_sec`: Delay between API requests (default: "1", float)
 - `history_length`: Number of message pairs to retain in conversation history (default: "5", integer)
 - `glossary_max_entries`: Maximum canonical glossary entries injected into a chapter translation prompt; `0` disables injection (default: "100", integer)
+- `cast_max_entries`: Maximum characters (with gender and note) listed in a chapter translation prompt; `0` disables the cast block (default: "30", integer)
 - `max_tokens_per_char`: Reply token limit per source character; each request sends `max_tokens = max(512, ceil(max_tokens_per_char × characters))` and `0` sends none. Must be finite and at least 0 (default: "2.0", float)
 
 #### [NameScout] Section
@@ -471,7 +472,8 @@ const REFUSAL_PHRASES: &[&str] = &[
 
 **Content Translation** (`translate_content(text: &str, ctx: &PromptContext, progress_info: Option<ProgressInfo>) -> Result<Vec<ChunkResult>>`):
    - If the text is blank → return no chunks
-   - Render the system prompt once per chapter with `PromptContext::system_prompt(content_translation_prompt)`, so it is byte-identical for every chunk. Sections, in fixed order and separated by a blank line: the configured prompt; the English-only and ruby rules; the canonical glossary entries present in the name-substituted text (overrides first, then by vote count, capped at `glossary_max_entries`), omitted when empty
+   - Render the system prompt once per chapter with `PromptContext::system_prompt(content_translation_prompt)`, so it is byte-identical for every chunk. Sections, in fixed order and separated by a blank line: the configured prompt; the English-only and ruby rules; the cast; the canonical glossary entries present in the name-substituted text (overrides first, then by vote count, capped at `glossary_max_entries`). Empty sections are omitted
+   - The cast is `NameMappingStore::cast_for_text(ruby::for_translation(raw_content), cast_max_entries)`: names whose original occurs in the chapter text before name substitution and that have a gender or a note, ordered by `count` descending then English name. It renders as `Characters in this chapter (use matching pronouns even where the Japanese omits the subject):` followed by one `- {english}: {gender}; {note}` line per entry (`- {english}: {gender}` or `- {english}: {note}` when one is missing)
    - Split text into chunks using `split_text_into_chunks`
    - For each chunk, with the shared retry logic:
      - Display preparing status before API call
@@ -558,7 +560,11 @@ Sizes are counted in characters (`chars().count()`); a chunk's size includes the
       "votes": {"{english_name}": "count_int"},
       "override": "optional_manual_rendering",
       "english": "selected_english_name",
-      "count": "selected_vote_count_int"
+      "count": "selected_vote_count_int",
+      "gender_votes": {"male|female": "count_int"},
+      "gender_override": "optional male|female|unknown",
+      "gender": "selected male|female",
+      "note": "optional short role or relationship"
     }
   },
   "terms": {
@@ -573,6 +579,12 @@ Sizes are counted in characters (`chars().count()`); a chunk's size includes the
   "term_coverage": ["term_coverage_chapter_number_int"]
 }
 ```
+
+**Gender and note** (all four keys optional, omitted when empty, so files without them load and save unchanged; an older binary ignores them on load but drops them on save):
+- `gender_votes`: scout votes per gender. A vote is recorded only when the scout's `gender` is not `unknown` and its `evidence` (exact Japanese words) is non-empty and occurs in the scouted chunk. Kana variants pool their votes.
+- `gender_override`: manual gender. `unknown` means "never state a gender"; it is accepted only here. Any other value (e.g. `"Male "`) is a load error.
+- `gender`: recalculated. The override wins (`unknown` gives none); otherwise the leading gender needs at least 2 votes and at least 75% of the gender votes; otherwise absent.
+- `note`: at most 80 characters, no control characters. The scout fills it only while it is absent, so hand edits are never overwritten; an invalid note is dropped at load.
 
 **Initialization** (`__init__`):
 1. Build filepath from module name and novel ID
@@ -722,8 +734,9 @@ pub struct NameInfo {
 **Prompt Format**:
 System prompt requests a JSON response:
 ```
-{"names":[{"original":"<exact name characters>","part":"family|given|unknown","english":"<best English rendering>"}],"terms":[{"original":"<exact Japanese term>","english":"<canonical English rendering>"}]}
+{"names":[{"original":"<exact name characters>","part":"family|given|unknown","english":"<best English rendering>","gender":"male|female|unknown","evidence":"<exact Japanese words from the text showing the gender>","note":"<at most 8 English words on who this is>"}],"terms":[{"original":"<exact Japanese term>","english":"<canonical English rendering>"}]}
 ```
+This response contract is appended by the scout to the configured `name_scout` prompt, so the prompt itself describes only what to extract.
 Terms include distinctive items, skills, magic systems, ranks, organizations, places, and fictional concepts, but exclude person names and ordinary vocabulary.
 
 **Name Collection** (`collect_names_stream(text: &str) -> impl Iterator<Item = Vec<NameEntry>>`):

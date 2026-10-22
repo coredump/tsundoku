@@ -6,7 +6,7 @@
 use crate::config::{ApiConfig, TranslationConfig};
 use crate::console::Console;
 use crate::error::TranslationError;
-use crate::name_mapping::TermEntry;
+use crate::name_mapping::{CastEntry, TermEntry};
 use crate::qa::{Issue, IssueKind};
 use futures::StreamExt;
 use reqwest::Client;
@@ -37,13 +37,15 @@ enum PromptSection {
     Base,
     /// The English-only and ruby rules.
     Rules,
+    /// Characters present in the chapter, with gender and note.
+    Cast,
     /// Canonical terminology renderings.
     Glossary,
 }
 
 impl PromptSection {
     /// Rendering order of the system prompt sections.
-    const ORDER: [PromptSection; 3] = [Self::Base, Self::Rules, Self::Glossary];
+    const ORDER: [PromptSection; 4] = [Self::Base, Self::Rules, Self::Cast, Self::Glossary];
 }
 
 /// Chapter-level context rendered into the content translation system prompt.
@@ -55,12 +57,15 @@ pub struct PromptContext {
     /// Canonical terminology present in the chapter, already capped at
     /// `translation.glossary_max_entries`.
     pub glossary: Vec<TermEntry>,
+    /// Characters present in the chapter that have a gender or a note, already
+    /// capped at `translation.cast_max_entries`.
+    pub cast: Vec<CastEntry>,
 }
 
 impl PromptContext {
     /// Render the content system prompt: `base`, the English-only and ruby rules,
-    /// then the glossary. Sections are separated by a blank line; empty ones are
-    /// left out.
+    /// the cast, then the glossary. Sections are separated by a blank line; empty
+    /// ones are left out.
     pub fn system_prompt(&self, base: &str) -> String {
         let mut prompt = String::new();
         for section in PromptSection::ORDER {
@@ -85,6 +90,28 @@ impl PromptContext {
                 out.push_str(ENGLISH_ONLY_RULE);
                 out.push('\n');
                 out.push_str(RUBY_RULE);
+            }
+            PromptSection::Cast => {
+                if self.cast.is_empty() {
+                    return;
+                }
+                out.push_str(
+                    "Characters in this chapter (use matching pronouns even where the Japanese omits the subject):",
+                );
+                for entry in &self.cast {
+                    out.push_str("\n- ");
+                    out.push_str(&entry.english);
+                    out.push_str(": ");
+                    if let Some(gender) = entry.gender {
+                        out.push_str(gender.as_str());
+                        if entry.note.is_some() {
+                            out.push_str("; ");
+                        }
+                    }
+                    if let Some(note) = &entry.note {
+                        out.push_str(note);
+                    }
+                }
             }
             PromptSection::Glossary => {
                 if self.glossary.is_empty() {
@@ -828,6 +855,7 @@ impl Translator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::name_mapping::Gender;
 
     fn make_translator() -> Translator {
         Translator::new(
@@ -854,18 +882,52 @@ mod tests {
                 original: "魔石".to_string(),
                 english: "Magic Stone".to_string(),
             }],
+            cast: vec![CastEntry {
+                english: "Kirigaya".to_string(),
+                gender: Some(Gender::Male),
+                note: Some("Timer Association liaison".to_string()),
+            }],
         };
 
         let prompt = ctx.system_prompt("Translate this content");
 
         let rules = prompt.find(ENGLISH_ONLY_RULE).unwrap();
         let ruby = prompt.find(RUBY_RULE).unwrap();
+        let cast = prompt.find("Characters in this chapter").unwrap();
         let glossary = prompt
             .find("Use these canonical terminology renderings exactly")
             .unwrap();
         assert!(prompt.starts_with("Translate this content\n\n"));
-        assert!(rules < ruby && ruby < glossary);
+        assert!(rules < ruby && ruby < cast && cast < glossary);
         assert!(prompt.ends_with("- 魔石 → Magic Stone\n"));
+    }
+
+    #[test]
+    fn test_system_prompt_renders_cast_entries_in_order() {
+        let entry = |english: &str, gender, note: Option<&str>| CastEntry {
+            english: english.to_string(),
+            gender,
+            note: note.map(str::to_string),
+        };
+        let ctx = PromptContext {
+            cast: vec![
+                entry("Kirigaya", Some(Gender::Male), Some("Timer Association liaison")),
+                entry("Ruri", Some(Gender::Female), None),
+                entry("Monika", None, Some("village auditor")),
+            ],
+            ..PromptContext::default()
+        };
+
+        assert_eq!(
+            ctx.system_prompt("Base"),
+            format!(
+                "Base\n\n{ENGLISH_ONLY_RULE}\n{RUBY_RULE}\n\n\
+                 Characters in this chapter (use matching pronouns even where the Japanese omits the subject):\n\
+                 - Kirigaya: male; Timer Association liaison\n\
+                 - Ruri: female\n\
+                 - Monika: village auditor"
+            )
+        );
     }
 
     #[test]
@@ -1217,6 +1279,11 @@ mod tests {
             glossary: vec![TermEntry {
                 original: "魔石".to_string(),
                 english: "Magic Stone".to_string(),
+            }],
+            cast: vec![CastEntry {
+                english: "Kirigaya".to_string(),
+                gender: Some(Gender::Male),
+                note: None,
             }],
         };
 

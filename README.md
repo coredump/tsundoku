@@ -275,7 +275,14 @@ The default mapping file format is:
       },
       "override": "Tarou",
       "english": "Tarou",
-      "count": 2
+      "count": 2,
+      "gender_votes": {
+        "male": 3,
+        "female": 1
+      },
+      "gender_override": "male",
+      "gender": "male",
+      "note": "Ruri's older brother"
     }
   },
   "terms": {
@@ -294,6 +301,17 @@ The default mapping file format is:
 ```
 
 `override` is optional for both names and terms and wins over all vote totals. It may name a valid rendering absent from `votes`; in that case the recalculated `count` is omitted. `english` and `count` are recalculated fields, not manual controls. Delete `override` or set it to `null` to resume vote-based selection. Scouting continues to tally every valid vote while an override is active, so removing it immediately uses all accumulated votes.
+
+Each name can also carry a gender and a short note. The scout votes for a gender only when it quotes Japanese words from the text that show it (彼, 彼女, 兄, 娘, …), and fills `note` (a role or relationship, at most 80 characters) only while it is empty, so a hand-written note is never overwritten; delete it to let the scout refill it. `gender` is recalculated like `english`: `gender_override` wins; otherwise the leading gender needs at least two votes and at least 75% of `gender_votes`, so relatives sharing a family name stay genderless. Set `"gender_override": "unknown"` to never state a gender for a character; `unknown` is valid only as an override. All four keys are optional and omitted when empty, so older files load unchanged. An older Tsundoku binary reads such a file but drops these keys when it saves it.
+
+Before each chapter is translated, the names whose Japanese occurs in the chapter and that have a gender or a note are listed in its translation prompt, most frequent first, so the model uses the right pronouns even where the Japanese omits the subject:
+
+```
+Characters in this chapter (use matching pronouns even where the Japanese omits the subject):
+- Kirigaya: male; Timer Association liaison
+```
+
+By default at most 30 characters are listed; set `translation.cast_max_entries` to `0` to disable the list.
 
 Terms are automatically collected by the scout and vote-consolidated across chapters. Only canonical terms present in the chapter being translated, after name substitution, are added to its translation prompt; overridden terms come first, then the most-voted. By default, at most 100 terms are included; set `translation.glossary_max_entries` to `0` to disable glossary injection. Existing mapping files without `terms` or `term_coverage` remain valid; Tsundoku scouts terminology for their covered chapters without recording duplicate name votes.
 

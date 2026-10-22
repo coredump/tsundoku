@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 use tokio::sync::{Mutex, mpsc};
 use tsundoku::book::{BookMetadata, ChapterMetadata};
-use tsundoku::config::Config;
+use tsundoku::config::{Config, TranslationConfig};
 use tsundoku::console::{Console, Style};
 use tsundoku::epub::BookInfo;
 use tsundoku::name_mapping::{KnownMappings, NameMappingStore};
@@ -359,18 +359,15 @@ async fn process_oneshot(params: &mut ProcessParams<'_>) -> Result<()> {
         params.console.step("Translating content...");
 
         // Render ruby, apply name mapping, mark blank-line scene breaks, and
-        // collect canonical terms for this story.
-        let mapped_content = mark_scene_breaks(
-            params
-                .name_mapping
-                .apply_to_text(&ruby::for_translation(&content)),
+        // collect canonical terms and the cast for this story.
+        let rendered = ruby::for_translation(&content);
+        let mapped_content = mark_scene_breaks(params.name_mapping.apply_to_text(&rendered));
+        let prompt = chapter_prompt_context(
+            params.name_mapping,
+            &params.config.translation,
+            &rendered,
+            &mapped_content,
         );
-        let prompt = PromptContext {
-            glossary: params.name_mapping.glossary_for_text(
-                &mapped_content,
-                params.config.translation.glossary_max_entries,
-            ),
-        };
 
         let progress = ProgressInfo {
             chapter: 1,
@@ -551,7 +548,7 @@ async fn process_chapters(
         &mut book,
         padding,
         params.config.translation.workers,
-        params.config.translation.glossary_max_entries,
+        &params.config.translation,
     )
     .await?;
 
@@ -567,7 +564,7 @@ async fn translate_chapters(
     book: &mut BookMetadata,
     padding: usize,
     workers: usize,
-    glossary_max_entries: usize,
+    translation_config: &TranslationConfig,
 ) -> Result<()> {
     console.info(&format!(
         "Translating with {} chapter worker{}",
@@ -593,12 +590,10 @@ async fn translate_chapters(
             continue;
         }
 
-        let mapped_content = mark_scene_breaks(
-            name_mapping.apply_to_text(&ruby::for_translation(&chapter_data.content)),
-        );
-        let prompt = PromptContext {
-            glossary: name_mapping.glossary_for_text(&mapped_content, glossary_max_entries),
-        };
+        let rendered = ruby::for_translation(&chapter_data.content);
+        let mapped_content = mark_scene_breaks(name_mapping.apply_to_text(&rendered));
+        let prompt =
+            chapter_prompt_context(name_mapping, translation_config, &rendered, &mapped_content);
         jobs.push(TranslationJob {
             number: chapter_data.number,
             title: chapter_data.title.clone(),
@@ -691,6 +686,22 @@ async fn translate_chapters(
     let _ = progress_display.await;
 
     Ok(())
+}
+
+/// Build a chapter's prompt context: the canonical terms present in the
+/// name-substituted `mapped_content`, and the cast whose original names occur in
+/// `rendered`, the ruby-rendered chapter text before name substitution.
+fn chapter_prompt_context(
+    name_mapping: &NameMappingStore,
+    translation_config: &TranslationConfig,
+    rendered: &str,
+    mapped_content: &str,
+) -> PromptContext {
+    PromptContext {
+        glossary: name_mapping
+            .glossary_for_text(mapped_content, translation_config.glossary_max_entries),
+        cast: name_mapping.cast_for_text(rendered, translation_config.cast_max_entries),
+    }
 }
 
 fn report_chapter_ranges(console: &Console, chapters: &mut Vec<u32>, suffix: &str) {
