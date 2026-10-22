@@ -6,7 +6,7 @@
 use crate::config::{ApiConfig, NameScoutConfig};
 use crate::console::Console;
 use crate::error::TranslationError;
-use crate::name_mapping::{KnownMappings, NameEntry, NamePart, TermEntry};
+use crate::name_mapping::{Gender, KnownMappings, NameEntry, NamePart, TermEntry};
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -22,8 +22,9 @@ static CODE_FENCE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Response shape appended to every custom mapping scout prompt.
 const MAPPING_RESPONSE_CONTRACT: &str = r#"Return ONLY JSON with both arrays:
-{"names":[{"original":"<exact name characters>","part":"family|given|unknown","english":"<best English rendering>"}],"terms":[{"original":"<exact Japanese term>","english":"<canonical English rendering>"}]}
+{"names":[{"original":"<exact name characters>","part":"family|given|unknown","english":"<best English rendering>","gender":"male|female|unknown","evidence":"<exact Japanese words from the text showing the gender>","note":"<at most 8 English words on who this is>"}],"terms":[{"original":"<exact Japanese term>","english":"<canonical English rendering>"}]}
 Use empty arrays when no names or terms are found. Do not omit either key or add explanations.
+"gender", "evidence" and "note" are optional. Give a gender only when the text itself shows it, and copy the words that show it into "evidence" exactly as written (for example 彼, 彼女, 兄, 姉, 息子, 娘, お嬢さん, 王子, 王女); otherwise use "unknown" or omit it. "note" is a short role or relationship such as "Ruri's older brother" or "guild receptionist".
 `｜X《Y》` is ruby meaning X is read Y. Report `original` as X only and romanise from Y."#;
 
 fn format_translation_error(error: &TranslationError) -> String {
@@ -130,6 +131,12 @@ struct ParsedNameEntry {
     original: Option<String>,
     english: Option<String>,
     part: Option<String>,
+    #[serde(default)]
+    gender: Option<String>,
+    #[serde(default)]
+    evidence: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
 }
 
 /// Parsed terminology entry from an LLM response.
@@ -423,7 +430,7 @@ impl NameScout {
                 );
 
                 // Parse the response
-                match self.parse_response(&raw_response) {
+                match self.parse_response(&raw_response, chunk) {
                     Ok(entries) => {
                         if !entries.names.is_empty() || !entries.terms.is_empty() {
                             if progress_info.is_none() {
@@ -629,7 +636,10 @@ impl NameScout {
     }
 
     /// Parse the LLM response into name and terminology entries.
-    fn parse_response(&self, raw: &str) -> Result<ScoutChunk, TranslationError> {
+    ///
+    /// `chunk` is the scouted text. A name's gender is kept only when it is not
+    /// `unknown` and its evidence is non-empty and occurs verbatim in `chunk`.
+    fn parse_response(&self, raw: &str, chunk: &str) -> Result<ScoutChunk, TranslationError> {
         let trimmed = raw.trim();
 
         // Remove markdown code fence if present
@@ -683,10 +693,25 @@ impl NameScout {
                     .and_then(|part| part.parse().ok())
                     .unwrap_or(NamePart::Unknown);
 
+                let evidence = entry.evidence.as_deref().map(str::trim).unwrap_or_default();
+                let gender = entry
+                    .gender
+                    .as_deref()
+                    .and_then(|gender| gender.parse::<Gender>().ok())
+                    .filter(|gender| {
+                        *gender != Gender::Unknown && !evidence.is_empty() && chunk.contains(evidence)
+                    });
+                let note = entry
+                    .note
+                    .map(|note| note.trim().to_string())
+                    .filter(|note| !note.is_empty());
+
                 Some(NameEntry {
                     original,
                     english,
                     part,
+                    gender,
+                    note,
                 })
             })
             .collect();
@@ -770,7 +795,7 @@ mod tests {
         let json =
             r#"{"names":[{"original":"田中","english":"Tanaka","part":"family"}],"terms":[]}"#;
 
-        let result = scout.parse_response(json).unwrap();
+        let result = scout.parse_response(json, "").unwrap();
         assert_eq!(result.names.len(), 1);
         assert!(result.terms.is_empty());
         assert_eq!(result.names[0].original, "田中");
@@ -779,10 +804,45 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_gender_needs_evidence_from_the_chunk() {
+        let scout = make_scout();
+        let json = r#"{"names":[
+            {"original":"タツヤ","english":"Tatsuya","part":"given","gender":"male","evidence":"兄のタツヤ","note":" Ruri's older brother "},
+            {"original":"ルリ","english":"Ruri","part":"given","gender":"female","evidence":"彼女"},
+            {"original":"モニカ","english":"Monika","part":"given","gender":"female","evidence":""},
+            {"original":"ミナト","english":"Minato","part":"given","gender":"unknown","evidence":"ミナト"},
+            {"original":"田中","english":"Tanaka","part":"family","gender":"Male ","evidence":"田中君"}
+        ],"terms":[]}"#;
+
+        let result = scout
+            .parse_response(json, "兄のタツヤとルリ、モニカ、ミナト、田中君が来た。")
+            .unwrap();
+
+        let genders: Vec<_> = result
+            .names
+            .iter()
+            .map(|entry| (entry.english.as_str(), entry.gender))
+            .collect();
+        assert_eq!(
+            genders,
+            [
+                ("Tatsuya", Some(Gender::Male)),
+                ("Ruri", None),
+                ("Monika", None),
+                ("Minato", None),
+                ("Tanaka", Some(Gender::Male)),
+            ]
+        );
+        assert_eq!(result.names[0].note.as_deref(), Some("Ruri's older brother"));
+        assert_eq!(result.names[1].note, None);
+    }
+
+    #[test]
     fn test_parse_names_only_response_fails() {
         let scout = make_scout();
         let result = scout.parse_response(
             r#"{"names":[{"original":"田中","english":"Tanaka","part":"family"}]}"#,
+            "",
         );
 
         assert!(result.is_err());
@@ -791,7 +851,7 @@ mod tests {
     #[test]
     fn test_parse_empty_object_means_nothing_new() {
         let scout = make_scout();
-        let result = scout.parse_response("{}").unwrap();
+        let result = scout.parse_response("{}", "").unwrap();
 
         assert!(result.names.is_empty());
         assert!(result.terms.is_empty());
@@ -855,7 +915,7 @@ mod tests {
             "terms": [{"original":"魔石","english":"Magic Stone"}]
         }"#;
 
-        let result = scout.parse_response(json).unwrap();
+        let result = scout.parse_response(json, "").unwrap();
         assert!(result.names.is_empty());
         assert_eq!(result.terms.len(), 1);
         assert_eq!(result.terms[0].original, "魔石");
@@ -869,7 +929,7 @@ mod tests {
 {"names":[{"original":"太郎","english":"Taro","part":"given"}],"terms":[]}
 ```"#;
 
-        let result = scout.parse_response(json).unwrap();
+        let result = scout.parse_response(json, "").unwrap();
         assert_eq!(result.names.len(), 1);
         assert_eq!(result.names[0].original, "太郎");
         assert_eq!(result.names[0].english, "Taro");
@@ -882,7 +942,7 @@ mod tests {
 {"names":[{"original":"花子","english":"Hanako","part":"given"}],"terms":[]}
 I hope this helps!"#;
 
-        let result = scout.parse_response(json).unwrap();
+        let result = scout.parse_response(json, "").unwrap();
         assert_eq!(result.names.len(), 1);
         assert_eq!(result.names[0].original, "花子");
     }
@@ -892,7 +952,7 @@ I hope this helps!"#;
         let scout = make_scout();
         let json = r#"{"names":[{"original":"ペーリス","part":"given","english":"Peris"}],"terms":[]}}"#;
 
-        let result = scout.parse_response(json).unwrap();
+        let result = scout.parse_response(json, "").unwrap();
         assert_eq!(result.names.len(), 1);
         assert_eq!(result.names[0].english, "Peris");
     }
@@ -902,7 +962,7 @@ I hope this helps!"#;
         let scout = make_scout();
         let json = r#"{"names":[],"terms":[]}"#;
 
-        let result = scout.parse_response(json).unwrap();
+        let result = scout.parse_response(json, "").unwrap();
         assert!(result.names.is_empty());
         assert!(result.terms.is_empty());
     }
@@ -913,7 +973,7 @@ I hope this helps!"#;
         let json =
             r#"{"names":[{"original":"田中"},{"english":"Smith"}],"terms":[{"original":"魔石"}]}"#;
 
-        let result = scout.parse_response(json).unwrap();
+        let result = scout.parse_response(json, "").unwrap();
         assert!(result.names.is_empty());
         assert!(result.terms.is_empty());
     }
@@ -923,7 +983,7 @@ I hope this helps!"#;
         let scout = make_scout();
         let json = "This is not JSON at all";
 
-        let result = scout.parse_response(json);
+        let result = scout.parse_response(json, "");
         assert!(result.is_err());
     }
 

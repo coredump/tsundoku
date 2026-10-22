@@ -142,9 +142,10 @@ fn name_variant_key(original: &str) -> String {
         .collect()
 }
 
-/// Give every kana variant of a name the same rendering.
+/// Give every kana variant of a name the same rendering and gender.
 ///
-/// Votes are pooled across variants; the first manual override (by key order) wins.
+/// Votes and gender votes are pooled across variants; the first manual override and
+/// gender override (by key order) win. Variants without a note get the first note.
 fn unify_name_variants(names: &mut HashMap<String, NameInfo>) {
     let mut groups: HashMap<String, Vec<String>> = HashMap::new();
     for original in names.keys() {
@@ -157,22 +158,35 @@ fn unify_name_variants(names: &mut HashMap<String, NameInfo>) {
     for mut members in groups.into_values().filter(|members| members.len() > 1) {
         members.sort_unstable();
         let mut pooled: HashMap<String, u32> = HashMap::new();
+        let mut pooled_genders: BTreeMap<Gender, u32> = BTreeMap::new();
         for member in &members {
             for (english, count) in &names[member].votes {
                 *pooled.entry(english.clone()).or_insert(0) += count;
+            }
+            for (gender, count) in &names[member].gender_votes {
+                *pooled_genders.entry(*gender).or_insert(0) += count;
             }
         }
         let r#override = members
             .iter()
             .find_map(|member| names[member].r#override.clone());
+        let gender_override = members
+            .iter()
+            .find_map(|member| names[member].gender_override);
+        let note = members.iter().find_map(|member| names[member].note.clone());
         let mut english = names[&members[0]].english.clone();
         let mut count = None;
         recalculate_selection(&pooled, r#override.as_ref(), &mut english, &mut count);
+        let gender = select_gender(&pooled_genders, gender_override);
 
         for member in &members {
             if let Some(info) = names.get_mut(member) {
                 info.english = english.clone();
                 info.count = count;
+                info.gender = gender;
+                if info.note.is_none() {
+                    info.note = note.clone();
+                }
             }
         }
     }
@@ -375,8 +389,84 @@ impl std::str::FromStr for NamePart {
     }
 }
 
+/// A character's gender, as voted by the scout or set by the user.
+///
+/// `Unknown` is meaningful only as a manual override: it means "never state a gender
+/// for this character". The scout's `unknown` answers are not counted as votes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Gender {
+    /// Male; rendered with he/him.
+    Male,
+    /// Female; rendered with she/her.
+    Female,
+    /// Deliberately unspecified.
+    Unknown,
+}
+
+impl Gender {
+    /// Lowercase name as used in the mapping JSON and prompts.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Male => "male",
+            Self::Female => "female",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for Gender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Gender {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "male" => Ok(Self::Male),
+            "female" => Ok(Self::Female),
+            "unknown" => Ok(Self::Unknown),
+            other => Err(format!("unknown gender '{other}'")),
+        }
+    }
+}
+
+/// Longest character note kept in the mapping, in characters.
+pub const MAX_NOTE_CHARS: usize = 80;
+
+/// Returns whether a character note may be stored and shown to the translator.
+fn is_valid_note(note: &str) -> bool {
+    !note.is_empty()
+        && note.trim() == note
+        && note.chars().count() <= MAX_NOTE_CHARS
+        && !note.chars().any(char::is_control)
+}
+
+/// Gender selected from a manual override or gender votes.
+///
+/// The override wins (`unknown` suppresses any gender). Otherwise the leading gender
+/// needs at least two votes and at least 75% of all gender votes, so relatives who
+/// share a family name split the vote and the name stays genderless.
+fn select_gender(votes: &BTreeMap<Gender, u32>, gender_override: Option<Gender>) -> Option<Gender> {
+    if let Some(gender) = gender_override {
+        return (gender != Gender::Unknown).then_some(gender);
+    }
+
+    let counted = || {
+        votes
+            .iter()
+            .filter(|(gender, _)| **gender != Gender::Unknown)
+    };
+    let total: u32 = counted().map(|(_, count)| *count).sum();
+    let (leader, leader_count) = counted().max_by_key(|(_, count)| **count)?;
+    (*leader_count >= 2 && u64::from(*leader_count) * 4 >= u64::from(total) * 3).then_some(*leader)
+}
+
 /// A name entry for recording votes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NameEntry {
     /// Original Japanese name.
     pub original: String,
@@ -384,6 +474,10 @@ pub struct NameEntry {
     pub english: String,
     /// Which part of the name this is.
     pub part: NamePart,
+    /// Gender vote, already checked against the scouted text; `Unknown` is ignored.
+    pub gender: Option<Gender>,
+    /// Short description of the character, used only when the name has no note yet.
+    pub note: Option<String>,
 }
 
 /// A glossary entry for recording terminology votes.
@@ -429,6 +523,17 @@ fn edit_distance(left: &[char], right: &[char]) -> usize {
         std::mem::swap(&mut previous, &mut current);
     }
     previous[right.len()]
+}
+
+/// A character to describe to the translator: selected rendering, gender and note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CastEntry {
+    /// Selected English rendering of the name.
+    pub english: String,
+    /// Selected gender; `None` when undecided or suppressed by an `unknown` override.
+    pub gender: Option<Gender>,
+    /// Short description of the character.
+    pub note: Option<String>,
 }
 
 /// Renderings already selected for names and terms, used to steer the scout.
@@ -522,6 +627,20 @@ pub struct NameInfo {
     /// Recalculated vote count of the selected English rendering.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count: Option<u32>,
+    /// Scout votes for the character's gender.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub gender_votes: BTreeMap<Gender, u32>,
+    /// Manually selected gender; `unknown` means never state one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gender_override: Option<Gender>,
+    /// Recalculated gender from the override or gender votes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gender: Option<Gender>,
+    /// Short description of the character (at most [`MAX_NOTE_CHARS`] characters).
+    ///
+    /// The scout fills it only while it is empty, so hand edits are never overwritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 impl NameInfo {
@@ -533,10 +652,14 @@ impl NameInfo {
             r#override: None,
             english: None,
             count: None,
+            gender_votes: BTreeMap::new(),
+            gender_override: None,
+            gender: None,
+            note: None,
         }
     }
 
-    /// Recalculate the selected translation from the override or votes.
+    /// Recalculate the selected translation and gender from overrides or votes.
     pub fn recalculate_best(&mut self) {
         recalculate_selection(
             &self.votes,
@@ -544,6 +667,7 @@ impl NameInfo {
             &mut self.english,
             &mut self.count,
         );
+        self.gender = select_gender(&self.gender_votes, self.gender_override);
     }
 }
 
@@ -602,6 +726,21 @@ pub struct NameMappingData {
     pub term_coverage: Vec<u32>,
 }
 
+/// Per-novel data file name: `"{module}: {id}{suffix}"`, or `"{module} - {id}{suffix}"`
+/// when `windows` is true because Windows forbids `:` in file names.
+fn novel_file_name(module_name: &str, novel_id: &str, suffix: &str, windows: bool) -> String {
+    let separator = if windows { " - " } else { ": " };
+    format!("{module_name}{separator}{novel_id}{suffix}")
+}
+
+/// Path of a per-novel data file in the names directory.
+///
+/// `suffix` follows the novel ID, e.g. `".json"` for the name mapping or
+/// `".summaries.json"` for chapter summaries.
+pub fn novel_file_path(names_dir: &Path, module_name: &str, novel_id: &str, suffix: &str) -> PathBuf {
+    names_dir.join(novel_file_name(module_name, novel_id, suffix, cfg!(windows)))
+}
+
 /// Name mapping store for a specific novel.
 pub struct NameMappingStore {
     /// Path to the JSON file.
@@ -622,15 +761,7 @@ impl NameMappingStore {
         module_name: &str,
         novel_id: &str,
     ) -> Result<Self, NameMappingError> {
-        // Build filename: "{module_name}: {novel_id}.json"
-        // On Windows, replace : with - since colons aren't allowed in filenames
-        let filename = if cfg!(windows) {
-            format!("{} - {}.json", module_name, novel_id)
-        } else {
-            format!("{}: {}.json", module_name, novel_id)
-        };
-
-        let filepath = names_dir.join(&filename);
+        let filepath = novel_file_path(names_dir, module_name, novel_id, ".json");
 
         let mut store = Self {
             filepath,
@@ -677,6 +808,17 @@ impl NameMappingStore {
 
             // Increment vote count
             *name_info.votes.entry(entry.english.clone()).or_insert(0) += 1;
+
+            if let Some(gender) = entry.gender.filter(|gender| *gender != Gender::Unknown) {
+                *name_info.gender_votes.entry(gender).or_insert(0) += 1;
+            }
+            if name_info.note.is_none()
+                && let Some(note) = entry.note.as_deref().map(str::trim)
+                && is_valid_note(note)
+                && !contains_japanese_script(note)
+            {
+                name_info.note = Some(note.to_string());
+            }
 
             // Recalculate best
             name_info.recalculate_best();
@@ -733,6 +875,11 @@ impl NameMappingStore {
             // Filter out invalid votes.
             info.votes
                 .retain(|english, _| is_valid_english_rendering(english));
+            info.gender_votes
+                .retain(|gender, count| *gender != Gender::Unknown && *count > 0);
+            if info.note.as_deref().is_some_and(|note| !is_valid_note(note)) {
+                info.note = None;
+            }
 
             // Recalculate best after filtering.
             info.recalculate_best();
@@ -849,6 +996,48 @@ impl NameMappingStore {
             .map(|(original, english, _)| TermEntry {
                 original: original.clone(),
                 english: english.clone(),
+            })
+            .collect()
+    }
+
+    /// Return the characters to describe for a chapter.
+    ///
+    /// `raw_text` is the chapter text **before** name substitution. A name is included
+    /// when its original occurs in it (same katakana word-boundary rule as
+    /// substitution), it has a selected rendering, and it has a gender or a note. Kana
+    /// variants sharing a rendering appear once. Entries are ordered by vote count
+    /// (descending), then English name, and capped at `max` (0 returns nothing).
+    pub fn cast_for_text(&self, raw_text: &str, max: usize) -> Vec<CastEntry> {
+        if max == 0 {
+            return Vec::new();
+        }
+
+        let mut present: Vec<(&str, &NameInfo)> = self
+            .data
+            .names
+            .iter()
+            .filter(|(_, info)| info.gender.is_some() || info.note.is_some())
+            .filter(|(original, _)| name_match_offsets(raw_text, original).next().is_some())
+            .filter_map(|(_, info)| Some((info.english.as_deref()?, info)))
+            .collect();
+        present.sort_by(|(left, left_info), (right, right_info)| {
+            right_info
+                .count
+                .cmp(&left_info.count)
+                .then_with(|| left.cmp(right))
+                .then_with(|| right_info.note.is_some().cmp(&left_info.note.is_some()))
+                .then_with(|| left_info.note.cmp(&right_info.note))
+        });
+
+        let mut seen = HashSet::new();
+        present
+            .into_iter()
+            .filter(|(english, _)| seen.insert(*english))
+            .take(max)
+            .map(|(english, info)| CastEntry {
+                english: english.to_string(),
+                gender: info.gender,
+                note: info.note.clone(),
             })
             .collect()
     }
@@ -1034,16 +1223,19 @@ mod tests {
                 original: "田中".to_string(),
                 english: "Tanaka".to_string(),
                 part: NamePart::Family,
+                ..Default::default()
             },
             NameEntry {
                 original: "田中".to_string(),
                 english: "Tanaka".to_string(),
                 part: NamePart::Family,
+                ..Default::default()
             },
             NameEntry {
                 original: "太郎".to_string(),
                 english: "Taro".to_string(),
                 part: NamePart::Given,
+                ..Default::default()
             },
         ]);
 
@@ -1066,21 +1258,25 @@ mod tests {
                 original: "田中 太郎".to_string(), // Contains space
                 english: "TanakaTaro".to_string(),
                 part: NamePart::Unknown,
+                ..Default::default()
             },
             NameEntry {
                 original: "田中・太郎".to_string(), // Contains ・
                 english: "TanakaTaro".to_string(),
                 part: NamePart::Unknown,
+                ..Default::default()
             },
             NameEntry {
                 original: "山田《やまだ》".to_string(), // Contains ruby markup
                 english: "Yamada".to_string(),
                 part: NamePart::Family,
+                ..Default::default()
             },
             NameEntry {
                 original: "｜山田".to_string(), // Contains ruby markup
                 english: "Yamada".to_string(),
                 part: NamePart::Family,
+                ..Default::default()
             },
         ]);
 
@@ -1098,11 +1294,13 @@ mod tests {
                 original: "田中さん".to_string(), // Contains -san
                 english: "Tanaka".to_string(),
                 part: NamePart::Family,
+                ..Default::default()
             },
             NameEntry {
                 original: "田中".to_string(),
                 english: "Tanaka-san".to_string(), // English has honorific
                 part: NamePart::Family,
+                ..Default::default()
             },
         ]);
 
@@ -1118,6 +1316,7 @@ mod tests {
             original: "田中".to_string(),
             english: "Tanaka San".to_string(), // Contains space
             part: NamePart::Family,
+            ..Default::default()
         }]);
 
         assert!(store.is_empty());
@@ -1133,11 +1332,13 @@ mod tests {
                 original: "彼女".to_string(),
                 english: "Kanojo".to_string(),
                 part: NamePart::Unknown,
+                ..Default::default()
             },
             NameEntry {
                 original: "俺".to_string(),
                 english: "Ore".to_string(),
                 part: NamePart::Unknown,
+                ..Default::default()
             },
         ]);
 
@@ -1154,11 +1355,13 @@ mod tests {
                 original: "田中".to_string(),
                 english: "Tanaka".to_string(),
                 part: NamePart::Family,
+                ..Default::default()
             },
             NameEntry {
                 original: "太郎".to_string(),
                 english: "Taro".to_string(),
                 part: NamePart::Given,
+                ..Default::default()
             },
         ]);
 
@@ -1187,11 +1390,13 @@ mod tests {
                 original: "田中".to_string(),
                 english: "Tanaka".to_string(),
                 part: NamePart::Family,
+                ..Default::default()
             },
             NameEntry {
                 original: "田中島".to_string(),
                 english: "Tanakajima".to_string(),
                 part: NamePart::Family,
+                ..Default::default()
             },
         ]);
 
@@ -1228,6 +1433,7 @@ mod tests {
             original: "田中".to_string(),
             english: "Tanaka".to_string(),
             part: NamePart::Family,
+            ..Default::default()
         }]);
         store.add_coverage(&[1, 2, 3]);
         store.save().unwrap();
@@ -1249,16 +1455,19 @@ mod tests {
                 original: "優子".to_string(),
                 english: "Yuko".to_string(),
                 part: NamePart::Given,
+                ..Default::default()
             },
             NameEntry {
                 original: "優子".to_string(),
                 english: "Yuuko".to_string(),
                 part: NamePart::Given,
+                ..Default::default()
             },
             NameEntry {
                 original: "優子".to_string(),
                 english: "Yuko".to_string(),
                 part: NamePart::Given,
+                ..Default::default()
             },
         ]);
 
@@ -1296,16 +1505,19 @@ mod tests {
                 original: "優子".to_string(),
                 english: "Yuko".to_string(),
                 part: NamePart::Given,
+                ..Default::default()
             },
             NameEntry {
                 original: "優子".to_string(),
                 english: "Yuko".to_string(),
                 part: NamePart::Given,
+                ..Default::default()
             },
             NameEntry {
                 original: "優子".to_string(),
                 english: "Yuko".to_string(),
                 part: NamePart::Given,
+                ..Default::default()
             },
         ]);
         store.save().unwrap();
@@ -1541,6 +1753,7 @@ mod tests {
             original: original.to_string(),
             english: english.to_string(),
             part: NamePart::Given,
+            ..Default::default()
         }
     }
 
@@ -1790,5 +2003,219 @@ mod tests {
         kept.sort_unstable();
         assert_eq!(kept, ["シュン太郎", "バーサーム", "宮城"]);
         assert_eq!(store.apply_to_text("バーサーム家の当主"), "Barsam家の当主");
+    }
+
+    fn gendered(original: &str, english: &str, gender: Gender, note: Option<&str>) -> NameEntry {
+        NameEntry {
+            gender: Some(gender),
+            note: note.map(str::to_string),
+            ..name(original, english)
+        }
+    }
+
+    #[test]
+    fn test_legacy_name_entry_round_trips_without_new_keys() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut store = NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
+        std::fs::write(
+            store.filepath(),
+            r#"{
+                "names": {
+                    "優子": {
+                        "part": "given",
+                        "votes": { "Yuuko": 1, "Yuko": 2 },
+                        "override": "Yuuko",
+                        "english": "Yuuko",
+                        "count": 1
+                    }
+                },
+                "coverage": []
+            }"#,
+        )
+        .unwrap();
+        store.reload_from_disk().unwrap();
+        store.save().unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(store.filepath()).unwrap()).unwrap();
+        let mut keys: Vec<&str> = saved["names"]["優子"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["count", "english", "override", "part", "votes"]);
+    }
+
+    #[test]
+    fn test_gender_needs_two_votes_and_a_clear_majority() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut store = NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
+        store.record_votes(&[gendered("タツヤ", "Tatsuya", Gender::Male, None)]);
+        assert_eq!(store.data.names["タツヤ"].gender, None);
+
+        store.record_votes(&[
+            gendered("タツヤ", "Tatsuya", Gender::Male, None),
+            gendered("タツヤ", "Tatsuya", Gender::Female, None),
+            gendered("タツヤ", "Tatsuya", Gender::Male, None),
+        ]);
+        assert_eq!(store.data.names["タツヤ"].gender, Some(Gender::Male));
+
+        store.record_votes(&[
+            gendered("キリガヤ", "Kirigaya", Gender::Male, None),
+            gendered("キリガヤ", "Kirigaya", Gender::Male, None),
+            gendered("キリガヤ", "Kirigaya", Gender::Female, None),
+            gendered("キリガヤ", "Kirigaya", Gender::Female, None),
+            gendered("キリガヤ", "Kirigaya", Gender::Unknown, None),
+        ]);
+        let info = &store.data.names["キリガヤ"];
+        assert_eq!(info.gender, None);
+        assert!(!info.gender_votes.contains_key(&Gender::Unknown));
+    }
+
+    #[test]
+    fn test_gender_override_beats_votes_and_unknown_suppresses() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut store = NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
+        std::fs::write(
+            store.filepath(),
+            r#"{
+                "names": {
+                    "ルリ": {
+                        "part": "given",
+                        "votes": { "Ruri": 3 },
+                        "gender_votes": { "male": 3 },
+                        "gender_override": "female"
+                    },
+                    "ミナト": {
+                        "part": "given",
+                        "votes": { "Minato": 3 },
+                        "gender_votes": { "male": 3 },
+                        "gender_override": "unknown"
+                    }
+                },
+                "coverage": []
+            }"#,
+        )
+        .unwrap();
+        store.reload_from_disk().unwrap();
+        store.record_votes(&[gendered("ルリ", "Ruri", Gender::Male, None)]);
+
+        assert_eq!(store.data.names["ルリ"].gender, Some(Gender::Female));
+        assert_eq!(store.data.names["ミナト"].gender, None);
+        assert!(
+            store
+                .cast_for_text("ミナトが来た", 10)
+                .iter()
+                .all(|entry| entry.english != "Minato")
+        );
+    }
+
+    #[test]
+    fn test_invalid_gender_override_is_a_load_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut store = NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
+        std::fs::write(
+            store.filepath(),
+            r#"{"names":{"ルリ":{"part":"given","votes":{"Ruri":1},"gender_override":"Male "}},"coverage":[]}"#,
+        )
+        .unwrap();
+
+        assert!(store.reload_from_disk().is_err());
+    }
+
+    #[test]
+    fn test_kana_variants_pool_gender_votes() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut store = NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
+        store.record_votes(&[
+            gendered("ぺーリス", "Peris", Gender::Female, Some("Innkeeper")),
+            gendered("ペーリス", "Peris", Gender::Female, None),
+        ]);
+
+        for original in ["ぺーリス", "ペーリス"] {
+            let info = &store.data.names[original];
+            assert_eq!(info.gender, Some(Gender::Female), "{original}");
+            assert_eq!(info.note.as_deref(), Some("Innkeeper"), "{original}");
+        }
+    }
+
+    #[test]
+    fn test_scout_note_fills_only_empty_notes_and_bad_notes_are_purged() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut store = NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
+        store.record_votes(&[
+            gendered("ルリ", "Ruri", Gender::Unknown, Some("村の娘")),
+            gendered("ルリ", "Ruri", Gender::Unknown, Some(" Tatsuya's sister ")),
+            gendered("ルリ", "Ruri", Gender::Unknown, Some("Village girl")),
+        ]);
+        assert_eq!(
+            store.data.names["ルリ"].note.as_deref(),
+            Some("Tatsuya's sister")
+        );
+        assert!(store.data.names["ルリ"].gender_votes.is_empty());
+
+        let long_note = "x".repeat(MAX_NOTE_CHARS + 1);
+        std::fs::write(
+            store.filepath(),
+            format!(
+                r#"{{"names":{{"ルリ":{{"part":"given","votes":{{"Ruri":1}},"note":"Hand edit"}},"モニカ":{{"part":"given","votes":{{"Monika":1}},"note":"{long_note}"}}}},"coverage":[]}}"#
+            ),
+        )
+        .unwrap();
+        store.reload_from_disk().unwrap();
+        store.record_votes(&[
+            gendered("ルリ", "Ruri", Gender::Unknown, Some("Scout note")),
+        ]);
+
+        assert_eq!(store.data.names["ルリ"].note.as_deref(), Some("Hand edit"));
+        assert_eq!(store.data.names["モニカ"].note, None);
+    }
+
+    #[test]
+    fn test_cast_is_filtered_to_chapter_ordered_and_capped() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut store = NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
+        store.record_votes(&[
+            gendered("タツヤ", "Tatsuya", Gender::Male, None),
+            gendered("タツヤ", "Tatsuya", Gender::Male, None),
+            gendered("タツヤ", "Tatsuya", Gender::Male, None),
+            gendered("ルリ", "Ruri", Gender::Female, Some("Tatsuya's sister")),
+            gendered("ルリ", "Ruri", Gender::Female, None),
+            gendered("モニカ", "Monika", Gender::Unknown, Some("Auditor")),
+            name("田中", "Tanaka"),
+            gendered("キリガヤ", "Kirigaya", Gender::Male, None),
+            gendered("キリガヤ", "Kirigaya", Gender::Male, None),
+        ]);
+        let text = "タツヤとルリとモニカと田中。";
+
+        assert_eq!(
+            store.cast_for_text(text, 10),
+            [
+                CastEntry {
+                    english: "Tatsuya".to_string(),
+                    gender: Some(Gender::Male),
+                    note: None,
+                },
+                CastEntry {
+                    english: "Ruri".to_string(),
+                    gender: Some(Gender::Female),
+                    note: Some("Tatsuya's sister".to_string()),
+                },
+                CastEntry {
+                    english: "Monika".to_string(),
+                    gender: None,
+                    note: Some("Auditor".to_string()),
+                },
+            ]
+        );
+        let capped: Vec<_> = store
+            .cast_for_text(text, 2)
+            .into_iter()
+            .map(|entry| entry.english)
+            .collect();
+        assert_eq!(capped, ["Tatsuya", "Ruri"]);
+        assert!(store.cast_for_text(text, 0).is_empty());
     }
 }
