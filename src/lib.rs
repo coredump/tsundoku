@@ -16,6 +16,7 @@ pub mod honorifics;
 pub mod name_mapping;
 pub mod name_scout;
 pub mod output_rules;
+pub mod qa;
 pub mod ruby;
 pub mod scrapers;
 pub mod translator;
