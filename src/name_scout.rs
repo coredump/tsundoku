@@ -6,12 +6,13 @@
 use crate::config::{ApiConfig, NameScoutConfig};
 use crate::console::Console;
 use crate::error::TranslationError;
-use crate::name_mapping::{Gender, KnownMappings, NameEntry, NamePart, TermEntry};
-use crate::summaries::{MAX_CHUNK_SUMMARY_WORDS, cap_words};
+use crate::name_mapping::{CastEntry, Gender, KnownMappings, NameEntry, NamePart, TermEntry};
+use crate::summaries::{MAX_SYNOPSIS_WORDS, SYNOPSIS_WORDS, cap_words, chapter_synopsis};
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use std::fmt::Write as _;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
@@ -28,13 +29,22 @@ Use empty arrays when no names or terms are found. Do not omit either key or add
 "gender", "evidence" and "note" are optional. Give a gender only when the text itself shows it, and copy the words that show it into "evidence" exactly as written (for example 彼, 彼女, 兄, 姉, 息子, 娘, お嬢さん, 王子, 王女); otherwise use "unknown" or omit it. "note" is a short role or relationship such as "Ruri's older brother" or "guild receptionist".
 `｜X《Y》` is ruby meaning X is read Y. Report `original` as X only and romanise from Y."#;
 
-/// Extra instruction appended to the mapping contract when summaries are enabled.
-const SUMMARY_REQUEST: &str = r#"Also add a "summary" key: at most 40 English words on what happens in this text (who does what to whom), using the listed English renderings for names."#;
+/// Longest chapter payload, in characters, summarised in a single request. Longer
+/// chapters are split at scene breaks and summarised piece by piece.
+pub const SUMMARY_SPLIT_CHARS: usize = 12000;
 
-/// System prompt for summary-only requests on chapters already scouted for mappings.
-const SUMMARY_ONLY_PROMPT: &str = r#"You summarize passages of a Japanese web novel for its English translator.
-Return ONLY JSON: {"summary":"<at most 40 English words on what happens in this text: who does what to whom>"}
-Use the listed English renderings for names and terms. No explanations."#;
+/// System prompt for chapter summary requests; `{words}` is the word budget.
+const SUMMARY_PROMPT: &str = r#"You summarize one chapter of a Japanese web novel for the novel's English translator. Your summary is the translator's only memory of this chapter when translating later chapters, so it must be accurate.
+- Write at most {words} English words of plain prose: who does what to whom, and how things stand at the end.
+- Write names exactly as given under "Characters" (`original → English: gender; note`) and use the English given under "Terms".
+- The story may be narrated in first person (俺, 僕, 私, あたし, わたし, うち…). Work out who the narrator is from the character list, the previous chapter and the text, and call them by name; say "the narrator" only if their name is never given.
+- Do not swap characters' roles or attributes: keep who says, does and is what exactly as in the text, and use the character notes to tell characters apart.
+- The previous chapter and "Earlier in this chapter" are context only; summarize only the text under "Text".
+- `｜X《Y》` is ruby: X is read Y.
+Return ONLY JSON: {"summary":"<summary>"}. No explanations."#;
+
+/// Characters listed in a summary request when the chapter mentions many.
+pub const SUMMARY_CAST_MAX_ENTRIES: usize = 100;
 
 fn format_translation_error(error: &TranslationError) -> String {
     match error {
@@ -162,7 +172,7 @@ struct ParsedMappingsResponse {
     terms: Vec<ParsedTermEntry>,
 }
 
-/// Parsed summary-only response from an LLM.
+/// Parsed chapter summary response from an LLM.
 #[derive(Debug, Deserialize)]
 struct ParsedSummaryResponse {
     summary: String,
@@ -175,15 +185,80 @@ pub struct ScoutChunk {
     pub names: Vec<NameEntry>,
     /// Terminology entries.
     pub terms: Vec<TermEntry>,
-    /// Short English summary of the chunk, when summaries are enabled and the model
-    /// gave one; capped at [`MAX_CHUNK_SUMMARY_WORDS`] words.
-    pub summary: Option<String>,
 }
 
 impl ScoutChunk {
     /// Returns whether the chunk found nothing at all.
     fn is_empty(&self) -> bool {
-        self.names.is_empty() && self.terms.is_empty() && self.summary.is_none()
+        self.names.is_empty() && self.terms.is_empty()
+    }
+}
+
+/// A character listed in a chapter summary request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryCharacter {
+    /// The name as written in the Japanese text.
+    pub original: String,
+    /// Selected English rendering.
+    pub english: String,
+    /// Selected gender, if any.
+    pub gender: Option<Gender>,
+    /// Short description of the character, if any.
+    pub note: Option<String>,
+}
+
+/// What the scout knows when summarising a chapter.
+#[derive(Debug, Clone, Default)]
+pub struct SummaryContext {
+    /// Characters whose originals occur in the chapter: those with a gender or note
+    /// first, in cast order, then the rest by original.
+    pub characters: Vec<SummaryCharacter>,
+    /// Glossary renderings whose originals occur in the chapter.
+    pub terms: Vec<TermEntry>,
+    /// Number and synopsis of the previous chapter, names already normalised.
+    pub previous: Option<(u32, String)>,
+}
+
+impl SummaryContext {
+    /// Combine the known renderings present in a chapter with its cast (from
+    /// [`NameMappingStore::cast_for_text`](crate::name_mapping::NameMappingStore::cast_for_text))
+    /// and the previous chapter's synopsis.
+    ///
+    /// A name gets the gender and note of the cast entry with the same English
+    /// rendering, so every kana variant of a character carries its description.
+    pub fn new(
+        present: KnownMappings,
+        cast: &[CastEntry],
+        previous: Option<(u32, String)>,
+    ) -> Self {
+        let mut characters: Vec<(usize, SummaryCharacter)> = present
+            .names
+            .into_iter()
+            .map(|name| {
+                let described = cast.iter().position(|entry| entry.english == name.english);
+                let entry = described.map(|index| &cast[index]);
+                (
+                    described.unwrap_or(usize::MAX),
+                    SummaryCharacter {
+                        gender: entry.and_then(|entry| entry.gender),
+                        note: entry.and_then(|entry| entry.note.clone()),
+                        original: name.original,
+                        english: name.english,
+                    },
+                )
+            })
+            .collect();
+        // Stable: names keep their order by original within the same cast position.
+        characters.sort_by_key(|(position, _)| *position);
+
+        Self {
+            characters: characters
+                .into_iter()
+                .map(|(_, character)| character)
+                .collect(),
+            terms: present.terms,
+            previous,
+        }
     }
 }
 
@@ -197,7 +272,7 @@ pub struct NameScout {
     scout_config: NameScoutConfig,
     /// System prompt for name and terminology extraction.
     prompt: String,
-    /// Whether mapping requests also ask for a chunk summary.
+    /// Whether the chapter summary pass is enabled (`name_scout.summaries`).
     summaries: bool,
     /// Console for output.
     console: Console,
@@ -281,27 +356,16 @@ impl NameScout {
         }
     }
 
-    /// Enable or disable chunk summaries in mapping requests (`name_scout.summaries`).
+    /// Enable or disable the chapter summary pass (`name_scout.summaries`).
     ///
-    /// When enabled, the response contract asks for a `summary` with every chunk and
-    /// [`ScoutChunk::summary`] carries it; when disabled, summaries are never requested
-    /// and any the model sends anyway are dropped.
+    /// The scout itself does not change; callers check [`Self::summaries_enabled`]
+    /// before calling [`Self::summarize_chapter`].
     pub fn with_summaries(mut self, enabled: bool) -> Self {
-        if enabled != self.summaries {
-            self.prompt = if enabled {
-                format!("{}\n{SUMMARY_REQUEST}", self.prompt)
-            } else {
-                self.prompt
-                    .strip_suffix(&format!("\n{SUMMARY_REQUEST}"))
-                    .unwrap_or(&self.prompt)
-                    .to_string()
-            };
-            self.summaries = enabled;
-        }
+        self.summaries = enabled;
         self
     }
 
-    /// Returns whether mapping requests ask for chunk summaries.
+    /// Returns whether the chapter summary pass is enabled.
     pub fn summaries_enabled(&self) -> bool {
         self.summaries
     }
@@ -324,306 +388,310 @@ impl NameScout {
         known: &KnownMappings,
         progress_info: Option<ScoutProgressInfo>,
     ) -> Result<Vec<ScoutChunk>, TranslationError> {
-        let chunks = self
-            .scout_chunks(
-                text,
-                progress_info,
-                &self.prompt,
-                |chunk| {
-                    build_scout_user_message(chunk, &known.present_in(chunk), MAPPINGS_HEADER)
-                },
-                |raw, chunk| self.parse_response(raw, chunk),
-                |entries: &ScoutChunk, chunk_num| {
-                    (!entries.names.is_empty() || !entries.terms.is_empty()).then(|| {
-                        format!(
-                            "Found {} names and {} terms in chunk {}",
-                            entries.names.len(),
-                            entries.terms.len(),
-                            chunk_num
-                        )
-                    })
-                },
-            )
-            .await?;
-
-        Ok(chunks.into_iter().filter(|chunk| !chunk.is_empty()).collect())
-    }
-
-    /// Summarize text chunk by chunk without extracting names or terms.
-    ///
-    /// Used to back-fill summaries for chapters already scouted for mappings. Each
-    /// chunk is sent with a summary-only prompt and the known renderings found in it;
-    /// the response must be `{"summary": "…"}`. Returns the non-empty chunk summaries
-    /// in text order, each capped at [`MAX_CHUNK_SUMMARY_WORDS`] words; join them with
-    /// [`chapter_synopsis`](crate::summaries::chapter_synopsis).
-    pub async fn collect_summaries_with_progress(
-        &self,
-        text: &str,
-        known: &KnownMappings,
-        progress_info: Option<ScoutProgressInfo>,
-    ) -> Result<Vec<String>, TranslationError> {
-        let summaries = self
-            .scout_chunks(
-                text,
-                progress_info,
-                SUMMARY_ONLY_PROMPT,
-                |chunk| build_scout_user_message(chunk, &known.present_in(chunk), SUMMARY_HEADER),
-                |raw, _| parse_summary_response(raw),
-                |summary: &Option<String>, chunk_num| {
-                    summary
-                        .as_ref()
-                        .map(|_| format!("Summarized chunk {}", chunk_num))
-                },
-            )
-            .await?;
-
-        Ok(summaries.into_iter().flatten().collect())
-    }
-
-    /// Send every chunk of `text` to the model and parse each response.
-    ///
-    /// Refusals and parse failures use the JSON retry budget, API failures the request
-    /// retry budget; exhausting either aborts. Returns one parsed value per chunk, in
-    /// order. `found` describes a parsed value for the console when no progress
-    /// reporter is attached.
-    async fn scout_chunks<T>(
-        &self,
-        text: &str,
-        progress_info: Option<ScoutProgressInfo>,
-        system_prompt: &str,
-        build_request: impl Fn(&str) -> String,
-        parse: impl Fn(&str, &str) -> Result<T, TranslationError>,
-        found: impl Fn(&T, usize) -> Option<String>,
-    ) -> Result<Vec<T>, TranslationError> {
         let chunks = self.split_into_chunks(text);
         let total_chunks = chunks.len();
         let mut results = Vec::new();
 
         for (i, chunk) in chunks.iter().enumerate() {
-            let request_text = build_request(chunk);
             let chunk_num = i + 1;
-            let chunk_started = Instant::now();
-            self.report_progress(
-                chunk_num,
-                total_chunks,
-                chunk.len(),
-                chunk_started,
-                NameScoutStatus::Scouting,
-                progress_info.as_ref(),
-            );
-
-            if progress_info.is_none() {
-                self.console.info(&format!(
-                    "Name scout chunk {}/{} ({} chars)",
+            let request_text = build_scout_user_message(chunk, &known.present_in(chunk));
+            let entries = self
+                .request_chunk(
+                    chunk,
                     chunk_num,
                     total_chunks,
-                    chunk.len()
+                    &self.prompt,
+                    &request_text,
+                    |raw| self.parse_response(raw, chunk),
+                    progress_info.as_ref(),
+                )
+                .await?;
+            if entries.is_empty() {
+                continue;
+            }
+            if progress_info.is_none() {
+                self.console.success(&format!(
+                    "Found {} names and {} terms in chunk {}",
+                    entries.names.len(),
+                    entries.terms.len(),
+                    chunk_num
                 ));
             }
+            results.push(entries);
+        }
 
-            // Refusal/JSON retry loop for this chunk.
-            let mut attempt = 0;
-            let mut success = false;
+        Ok(results)
+    }
 
-            while attempt < self.scout_config.json_retries && !success {
-                // API failures use the dedicated retry budget and abort the phase when exhausted.
-                let mut api_attempt = 0;
-                let raw_response = loop {
-                    self.report_progress(
-                        chunk_num,
-                        total_chunks,
-                        chunk.len(),
-                        chunk_started,
-                        NameScoutStatus::Waiting,
-                        progress_info.as_ref(),
-                    );
+    /// Summarize one chapter for the translator.
+    ///
+    /// `payload` is the chapter as built by [`build_chapter_payload`]. It is sent whole
+    /// with `context` (characters, terms and the previous chapter's synopsis) and the
+    /// response must be `{"summary": "…"}`. A payload longer than
+    /// [`SUMMARY_SPLIT_CHARS`] characters is split at scene breaks; its pieces are
+    /// summarised in order, each request also carrying the summaries of the earlier
+    /// pieces, and each piece gets an equal share of the word budget.
+    ///
+    /// Returns the synopsis (piece summaries joined, capped at [`MAX_SYNOPSIS_WORDS`]
+    /// words), empty when the model found nothing to summarise.
+    pub async fn summarize_chapter(
+        &self,
+        payload: &str,
+        context: &SummaryContext,
+        progress_info: Option<ScoutProgressInfo>,
+    ) -> Result<String, TranslationError> {
+        let pieces = if payload.chars().count() > SUMMARY_SPLIT_CHARS {
+            crate::utils::split_into_scene_chunks(payload, SUMMARY_SPLIT_CHARS)
+        } else {
+            vec![payload.to_string()]
+        };
+        let total_pieces = pieces.len();
+        let words = (SYNOPSIS_WORDS / total_pieces).max(1);
+        let max_words = (MAX_SYNOPSIS_WORDS / total_pieces).max(1);
+        let system_prompt = summary_prompt(words);
+        let mut summaries: Vec<String> = Vec::with_capacity(total_pieces);
 
-                    match self.call_model(system_prompt, &request_text).await {
-                        Ok(raw_response) => break raw_response,
-                        Err(e) => {
-                            api_attempt += 1;
-                            if api_attempt >= self.scout_config.retries {
-                                self.report_notice(
-                                    chunk_num,
-                                    true,
-                                    format!(
-                                        "Name scout API failed for chapter {}, chunk {} after {} attempts",
-                                        progress_info.as_ref().map_or(0, |info| info.chapter),
-                                        chunk_num,
-                                        self.scout_config.retries
-                                    ),
-                                    progress_info.as_ref(),
-                                );
-                                if progress_info.is_none() {
-                                    self.console.error(&format!(
-                                        "Name scout API failed for chunk {} after {} attempts",
-                                        chunk_num, self.scout_config.retries
-                                    ));
-                                }
-                                return Err(TranslationError::RetriesExhausted {
-                                    attempts: self.scout_config.retries,
-                                });
-                            }
+        for (i, piece) in pieces.iter().enumerate() {
+            let request_text = build_summary_user_message(piece, context, &summaries.join(" "));
+            let summary = self
+                .request_chunk(
+                    piece,
+                    i + 1,
+                    total_pieces,
+                    &system_prompt,
+                    &request_text,
+                    |raw| parse_summary_response(raw, max_words),
+                    progress_info.as_ref(),
+                )
+                .await?;
+            summaries.extend(summary);
+        }
 
-                            let delay = Duration::from_secs(2u64.pow(api_attempt));
-                            self.report_progress(
-                                chunk_num,
-                                total_chunks,
-                                chunk.len(),
-                                chunk_started,
-                                NameScoutStatus::Retrying,
-                                progress_info.as_ref(),
-                            );
-                            self.report_notice(
-                                chunk_num,
-                                false,
-                                format!(
-                                    "API error for chapter {}, chunk {}: {}; retrying in {:?} (attempt {}/{})",
-                                    progress_info.as_ref().map_or(0, |info| info.chapter),
-                                    chunk_num,
-                                    format_translation_error(&e),
-                                    delay,
-                                    api_attempt + 1,
-                                    self.scout_config.retries
-                                ),
-                                progress_info.as_ref(),
-                            );
-                            if progress_info.is_none() {
-                                self.console.warning(&format!(
-                                    "API error for chunk {}: {}, retrying in {:?} (attempt {}/{})",
-                                    chunk_num,
-                                    e,
-                                    delay,
-                                    api_attempt + 1,
-                                    self.scout_config.retries
-                                ));
-                            }
-                            tokio::time::sleep(delay).await;
-                            self.report_progress(
-                                chunk_num,
-                                total_chunks,
-                                chunk.len(),
-                                chunk_started,
-                                NameScoutStatus::Scouting,
-                                progress_info.as_ref(),
-                            );
-                        }
-                    }
-                };
+        Ok(chapter_synopsis(&summaries).unwrap_or_default())
+    }
 
-                // Check for refusal
-                if crate::utils::is_refusal(&raw_response) {
-                    self.report_progress(
-                        chunk_num,
-                        total_chunks,
-                        chunk.len(),
-                        chunk_started,
-                        NameScoutStatus::Retrying,
-                        progress_info.as_ref(),
-                    );
-                    self.report_notice(
-                        chunk_num,
-                        false,
-                        format!(
-                            "Model refused chapter {}, chunk {}; retrying",
-                            progress_info.as_ref().map_or(0, |info| info.chapter),
-                            chunk_num
-                        ),
-                        progress_info.as_ref(),
-                    );
-                    if progress_info.is_none() {
-                        self.console.warning(&format!(
-                            "Model refused to process chunk {}, retrying...",
-                            chunk_num
-                        ));
-                    }
-                    attempt += 1;
-                    if attempt < self.scout_config.json_retries {
-                        tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
-                    }
-                    continue;
-                }
+    /// Send one chunk request to the model and parse the response.
+    ///
+    /// Refusals and parse failures use the JSON retry budget, API failures the request
+    /// retry budget; exhausting either aborts.
+    #[allow(clippy::too_many_arguments)]
+    async fn request_chunk<T>(
+        &self,
+        chunk: &str,
+        chunk_num: usize,
+        total_chunks: usize,
+        system_prompt: &str,
+        request_text: &str,
+        parse: impl Fn(&str) -> Result<T, TranslationError>,
+        progress_info: Option<&ScoutProgressInfo>,
+    ) -> Result<T, TranslationError> {
+        let chunk_started = Instant::now();
+        self.report_progress(
+            chunk_num,
+            total_chunks,
+            chunk.len(),
+            chunk_started,
+            NameScoutStatus::Scouting,
+            progress_info,
+        );
 
+        if progress_info.is_none() {
+            self.console.info(&format!(
+                "Name scout chunk {}/{} ({} chars)",
+                chunk_num,
+                total_chunks,
+                chunk.len()
+            ));
+        }
+
+        // Refusal/JSON retry loop for this chunk.
+        let mut attempt = 0;
+        while attempt < self.scout_config.json_retries {
+            // API failures use the dedicated retry budget and abort the phase when exhausted.
+            let mut api_attempt = 0;
+            let raw_response = loop {
                 self.report_progress(
                     chunk_num,
                     total_chunks,
                     chunk.len(),
                     chunk_started,
-                    NameScoutStatus::Parsing,
-                    progress_info.as_ref(),
+                    NameScoutStatus::Waiting,
+                    progress_info,
                 );
 
-                // Parse the response
-                match parse(&raw_response, chunk) {
-                    Ok(entries) => {
-                        if progress_info.is_none()
-                            && let Some(message) = found(&entries, chunk_num)
-                        {
-                            self.console.success(&message);
-                        }
-                        results.push(entries);
-                        success = true;
-                    }
+                match self.call_model(system_prompt, request_text).await {
+                    Ok(raw_response) => break raw_response,
                     Err(e) => {
+                        api_attempt += 1;
+                        if api_attempt >= self.scout_config.retries {
+                            self.report_notice(
+                                chunk_num,
+                                true,
+                                format!(
+                                    "Name scout API failed for chapter {}, chunk {} after {} attempts",
+                                    progress_info.map_or(0, |info| info.chapter),
+                                    chunk_num,
+                                    self.scout_config.retries
+                                ),
+                                progress_info,
+                            );
+                            if progress_info.is_none() {
+                                self.console.error(&format!(
+                                    "Name scout API failed for chunk {} after {} attempts",
+                                    chunk_num, self.scout_config.retries
+                                ));
+                            }
+                            return Err(TranslationError::RetriesExhausted {
+                                attempts: self.scout_config.retries,
+                            });
+                        }
+
+                        let delay = Duration::from_secs(2u64.pow(api_attempt));
                         self.report_progress(
                             chunk_num,
                             total_chunks,
                             chunk.len(),
                             chunk_started,
                             NameScoutStatus::Retrying,
-                            progress_info.as_ref(),
+                            progress_info,
                         );
                         self.report_notice(
                             chunk_num,
                             false,
                             format!(
-                                "Failed to parse JSON from chapter {}, chunk {}: {}; response preview: {}; retrying",
-                                progress_info.as_ref().map_or(0, |info| info.chapter),
+                                "API error for chapter {}, chunk {}: {}; retrying in {:?} (attempt {}/{})",
+                                progress_info.map_or(0, |info| info.chapter),
                                 chunk_num,
-                                e,
-                                preview_text(&raw_response, 1200)
+                                format_translation_error(&e),
+                                delay,
+                                api_attempt + 1,
+                                self.scout_config.retries
                             ),
-                            progress_info.as_ref(),
+                            progress_info,
                         );
                         if progress_info.is_none() {
                             self.console.warning(&format!(
-                                "Failed to parse JSON from chunk {}: {}, retrying...",
-                                chunk_num, e
+                                "API error for chunk {}: {}, retrying in {:?} (attempt {}/{})",
+                                chunk_num,
+                                e,
+                                delay,
+                                api_attempt + 1,
+                                self.scout_config.retries
                             ));
                         }
-                        attempt += 1;
-                        if attempt < self.scout_config.json_retries {
-                            tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
-                        }
+                        tokio::time::sleep(delay).await;
+                        self.report_progress(
+                            chunk_num,
+                            total_chunks,
+                            chunk.len(),
+                            chunk_started,
+                            NameScoutStatus::Scouting,
+                            progress_info,
+                        );
+                    }
+                }
+            };
+
+            // Check for refusal
+            if crate::utils::is_refusal(&raw_response) {
+                self.report_progress(
+                    chunk_num,
+                    total_chunks,
+                    chunk.len(),
+                    chunk_started,
+                    NameScoutStatus::Retrying,
+                    progress_info,
+                );
+                self.report_notice(
+                    chunk_num,
+                    false,
+                    format!(
+                        "Model refused chapter {}, chunk {}; retrying",
+                        progress_info.map_or(0, |info| info.chapter),
+                        chunk_num
+                    ),
+                    progress_info,
+                );
+                if progress_info.is_none() {
+                    self.console.warning(&format!(
+                        "Model refused to process chunk {}, retrying...",
+                        chunk_num
+                    ));
+                }
+                attempt += 1;
+                if attempt < self.scout_config.json_retries {
+                    tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                }
+                continue;
+            }
+
+            self.report_progress(
+                chunk_num,
+                total_chunks,
+                chunk.len(),
+                chunk_started,
+                NameScoutStatus::Parsing,
+                progress_info,
+            );
+
+            // Parse the response
+            match parse(&raw_response) {
+                Ok(parsed) => return Ok(parsed),
+                Err(e) => {
+                    self.report_progress(
+                        chunk_num,
+                        total_chunks,
+                        chunk.len(),
+                        chunk_started,
+                        NameScoutStatus::Retrying,
+                        progress_info,
+                    );
+                    self.report_notice(
+                        chunk_num,
+                        false,
+                        format!(
+                            "Failed to parse JSON from chapter {}, chunk {}: {}; response preview: {}; retrying",
+                            progress_info.map_or(0, |info| info.chapter),
+                            chunk_num,
+                            e,
+                            preview_text(&raw_response, 1200)
+                        ),
+                        progress_info,
+                    );
+                    if progress_info.is_none() {
+                        self.console.warning(&format!(
+                            "Failed to parse JSON from chunk {}: {}, retrying...",
+                            chunk_num, e
+                        ));
+                    }
+                    attempt += 1;
+                    if attempt < self.scout_config.json_retries {
+                        tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
                     }
                 }
             }
-
-            if !success {
-                self.report_notice(
-                    chunk_num,
-                    true,
-                    format!(
-                        "Failed to process chapter {}, chunk {} after {} attempts",
-                        progress_info.as_ref().map_or(0, |info| info.chapter),
-                        chunk_num,
-                        self.scout_config.json_retries
-                    ),
-                    progress_info.as_ref(),
-                );
-                if progress_info.is_none() {
-                    self.console.error(&format!(
-                        "Failed to process chunk {} after {} attempts",
-                        chunk_num, self.scout_config.json_retries
-                    ));
-                }
-                return Err(TranslationError::RetriesExhausted {
-                    attempts: self.scout_config.json_retries,
-                });
-            }
         }
 
-        Ok(results)
+        self.report_notice(
+            chunk_num,
+            true,
+            format!(
+                "Failed to process chapter {}, chunk {} after {} attempts",
+                progress_info.map_or(0, |info| info.chapter),
+                chunk_num,
+                self.scout_config.json_retries
+            ),
+            progress_info,
+        );
+        if progress_info.is_none() {
+            self.console.error(&format!(
+                "Failed to process chunk {} after {} attempts",
+                chunk_num, self.scout_config.json_retries
+            ));
+        }
+        Err(TranslationError::RetriesExhausted {
+            attempts: self.scout_config.json_retries,
+        })
     }
 
     fn report_progress(
@@ -762,26 +830,13 @@ impl NameScout {
     ///
     /// `chunk` is the scouted text. A name's gender is kept only when it is not
     /// `unknown` and its evidence is non-empty and occurs verbatim in `chunk`.
-    /// With summaries enabled, a response holding only a `summary` means no new names
-    /// or terms, like `{}`.
     fn parse_response(&self, raw: &str, chunk: &str) -> Result<ScoutChunk, TranslationError> {
-        let mut value = extract_json_object(raw)?;
-        let summary = if self.summaries {
-            value
-                .as_object_mut()
-                .and_then(|object| object.remove("summary"))
-                .and_then(|summary| summary.as_str().and_then(clean_chunk_summary))
-        } else {
-            None
-        };
+        let value = extract_json_object(raw)?;
 
         // When every name and term in a chunk is already known, models answer `{}`.
         // A response with only one of the two keys is still rejected as incomplete.
         if value.as_object().is_some_and(serde_json::Map::is_empty) {
-            return Ok(ScoutChunk {
-                summary,
-                ..ScoutChunk::default()
-            });
+            return Ok(ScoutChunk::default());
         }
 
         let parsed: ParsedMappingsResponse = serde_json::from_value(value)
@@ -841,11 +896,7 @@ impl NameScout {
             })
             .collect();
 
-        Ok(ScoutChunk {
-            names,
-            terms,
-            summary,
-        })
+        Ok(ScoutChunk { names, terms })
     }
 }
 
@@ -880,37 +931,28 @@ fn extract_json_object(raw: &str) -> Result<serde_json::Value, TranslationError>
         .map_err(|e| TranslationError::ParseError(format!("JSON parse error: {}", e)))
 }
 
-/// Parse a summary-only response: `{"summary": "…"}`.
+/// Parse a chapter summary response: `{"summary": "…"}`.
 ///
-/// A missing `summary` key is an error (the request is retried); an empty summary
-/// yields `None`.
-fn parse_summary_response(raw: &str) -> Result<Option<String>, TranslationError> {
+/// Whitespace is collapsed and the summary capped at `max_words` words. A missing
+/// `summary` key is an error (the request is retried); an empty summary yields `None`.
+fn parse_summary_response(raw: &str, max_words: usize) -> Result<Option<String>, TranslationError> {
     let parsed: ParsedSummaryResponse = serde_json::from_value(extract_json_object(raw)?)
         .map_err(|e| TranslationError::ParseError(format!("JSON parse error: {}", e)))?;
-    Ok(clean_chunk_summary(&parsed.summary))
-}
-
-/// Normalize whitespace and cap a chunk summary at [`MAX_CHUNK_SUMMARY_WORDS`] words.
-fn clean_chunk_summary(summary: &str) -> Option<String> {
-    let summary = cap_words(summary, MAX_CHUNK_SUMMARY_WORDS);
-    (!summary.is_empty()).then_some(summary)
+    let summary = cap_words(&parsed.summary, max_words);
+    Ok((!summary.is_empty()).then_some(summary))
 }
 
 /// Instruction heading the known renderings in a mapping request.
 const MAPPINGS_HEADER: &str = "Renderings already chosen in earlier chapters. Whenever you report one of these originals, use exactly the listed English. Still report new names and terms; if there are none, return both keys with empty arrays.\n";
 
-/// Instruction heading the known renderings in a summary-only request.
-const SUMMARY_HEADER: &str =
-    "English renderings to use for these names and terms in the summary.\n";
-
-/// Build a scout user message: `header` and the known renderings for this chunk, then
-/// the text. Without known renderings the message is the text alone.
-fn build_scout_user_message(chunk: &str, known: &KnownMappings, header: &str) -> String {
+/// Build a mapping request: [`MAPPINGS_HEADER`] and the known renderings for this
+/// chunk, then the text. Without known renderings the message is the text alone.
+fn build_scout_user_message(chunk: &str, known: &KnownMappings) -> String {
     if known.is_empty() {
         return chunk.to_string();
     }
 
-    let mut message = String::from(header);
+    let mut message = String::from(MAPPINGS_HEADER);
     for (heading, entries) in [("Names", &known.names), ("Terms", &known.terms)] {
         if entries.is_empty() {
             continue;
@@ -918,15 +960,72 @@ fn build_scout_user_message(chunk: &str, known: &KnownMappings, header: &str) ->
         message.push_str(heading);
         message.push_str(":\n");
         for entry in entries {
-            message.push_str("- ");
-            message.push_str(&entry.original);
-            message.push_str(" → ");
-            message.push_str(&entry.english);
+            push_rendering(&mut message, entry);
             message.push('\n');
         }
     }
     message.push_str("\nText:\n");
     message.push_str(chunk);
+    message
+}
+
+/// Append `- {original} → {english}` to `message`.
+fn push_rendering(message: &mut String, entry: &TermEntry) {
+    message.push_str("- ");
+    message.push_str(&entry.original);
+    message.push_str(" → ");
+    message.push_str(&entry.english);
+}
+
+/// System prompt for a summary request asking for at most `words` words.
+fn summary_prompt(words: usize) -> String {
+    SUMMARY_PROMPT.replace("{words}", &words.to_string())
+}
+
+/// Build a summary request: the characters (`- {original} → {english}: {gender};
+/// {note}`), terms, previous chapter's synopsis and the summaries of earlier pieces
+/// of the same chapter, each section only when non-empty, then the text.
+fn build_summary_user_message(text: &str, context: &SummaryContext, earlier: &str) -> String {
+    let mut message = String::new();
+    if !context.characters.is_empty() {
+        message.push_str("Characters:\n");
+        for character in &context.characters {
+            message.push_str("- ");
+            message.push_str(&character.original);
+            message.push_str(" → ");
+            message.push_str(&character.english);
+            for (i, detail) in character
+                .gender
+                .map(Gender::as_str)
+                .into_iter()
+                .chain(character.note.as_deref())
+                .enumerate()
+            {
+                message.push_str(if i == 0 { ": " } else { "; " });
+                message.push_str(detail);
+            }
+            message.push('\n');
+        }
+        message.push('\n');
+    }
+    if !context.terms.is_empty() {
+        message.push_str("Terms:\n");
+        for term in &context.terms {
+            push_rendering(&mut message, term);
+            message.push('\n');
+        }
+        message.push('\n');
+    }
+    if let Some((number, synopsis)) = &context.previous {
+        let _ = write!(message, "Previous chapter ({number}): {synopsis}\n\n");
+    }
+    if !earlier.is_empty() {
+        message.push_str("Earlier in this chapter: ");
+        message.push_str(earlier);
+        message.push_str("\n\n");
+    }
+    message.push_str("Text:\n");
+    message.push_str(text);
     message
 }
 
@@ -1075,126 +1174,96 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_summary_with_and_without_summaries_enabled() {
-        let with_summary =
-            r#"{"names":[],"terms":[],"summary":"  Tatsuya   meets\nRuri at the inn. "}"#;
-
-        let enabled = make_scout().with_summaries(true);
-        assert!(enabled.summaries_enabled());
-        assert!(enabled.prompt.ends_with(SUMMARY_REQUEST));
-        assert_eq!(
-            enabled.parse_response(with_summary, "").unwrap().summary.as_deref(),
-            Some("Tatsuya meets Ruri at the inn.")
-        );
-        assert_eq!(
-            enabled
-                .parse_response(r#"{"names":[],"terms":[]}"#, "")
-                .unwrap()
-                .summary,
-            None
-        );
-        assert!(enabled.parse_response("{}", "").unwrap().is_empty());
-        let summary_only = enabled
-            .parse_response(r#"{"summary":"Ruri sleeps."}"#, "")
-            .unwrap();
-        assert!(summary_only.names.is_empty() && summary_only.terms.is_empty());
-        assert_eq!(summary_only.summary.as_deref(), Some("Ruri sleeps."));
-        let long = format!(r#"{{"names":[],"terms":[],"summary":"{}"}}"#, "word ".repeat(60));
-        let capped = enabled.parse_response(&long, "").unwrap().summary.unwrap();
-        assert_eq!(capped.split_whitespace().count(), MAX_CHUNK_SUMMARY_WORDS);
-
-        let disabled = enabled.with_summaries(false);
-        assert!(!disabled.prompt.contains(SUMMARY_REQUEST));
-        assert_eq!(disabled.parse_response(with_summary, "").unwrap().summary, None);
+    fn test_mapping_response_ignores_stray_summary() {
+        let scout = make_scout().with_summaries(true);
+        assert!(scout.summaries_enabled());
+        assert!(!scout.prompt.contains("summary"));
         assert!(
-            disabled
+            scout
+                .parse_response(r#"{"names":[],"terms":[],"summary":"Ruri sleeps."}"#, "")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            scout
                 .parse_response(r#"{"summary":"Ruri sleeps."}"#, "")
                 .is_err()
         );
     }
 
     #[test]
-    fn test_parse_summary_only_response() {
+    fn test_parse_summary_response() {
         assert_eq!(
-            parse_summary_response("```json\n{\"summary\":\"Ruri sleeps.\"}\n```").unwrap(),
+            parse_summary_response("```json\n{\"summary\":\"  Ruri\\n sleeps. \"}\n```", 10)
+                .unwrap(),
             Some("Ruri sleeps.".to_string())
         );
-        assert_eq!(parse_summary_response(r#"{"summary":" "}"#).unwrap(), None);
-        assert!(parse_summary_response("{}").is_err());
-        assert!(parse_summary_response(r#"{"names":[],"terms":[]}"#).is_err());
+        assert_eq!(
+            parse_summary_response(r#"{"summary":"one two three"}"#, 2).unwrap(),
+            Some("one two…".to_string())
+        );
+        assert_eq!(
+            parse_summary_response(r#"{"summary":" "}"#, 10).unwrap(),
+            None
+        );
+        assert!(parse_summary_response("{}", 10).is_err());
+        assert!(parse_summary_response(r#"{"names":[],"terms":[]}"#, 10).is_err());
     }
 
-    #[tokio::test]
-    async fn test_summary_only_request_sends_one_summary_prompt_per_chunk() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            let mut content_length = 0;
-            loop {
-                line.clear();
-                reader.read_line(&mut line).unwrap();
-                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    content_length = value.trim().parse().unwrap();
-                }
-                if line == "\r\n" {
-                    break;
-                }
-            }
-            let mut body = vec![0; content_length];
-            std::io::Read::read_exact(&mut reader, &mut body).unwrap();
-
-            let response_body = r#"{"choices":[{"message":{"content":"{\"summary\":\"Tatsuya shows Ruri the magic stone.\"}"}}]}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                response_body.len(),
-                response_body
-            )
-            .unwrap();
-            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            // A second request would block on `accept`; the scout must send only one.
-            (listener, request)
-        });
-
-        let scout = NameScout::new(
-            ApiConfig {
-                key: "test-key".to_string(),
-                base_url: format!("http://{address}/v1"),
-                model: "test-model".to_string(),
-            },
-            NameScoutConfig {
-                retries: 1,
-                json_retries: 1,
-                delay_between_requests_sec: 0.0,
-                ..Default::default()
-            },
-            "Extract mappings".to_string(),
-        )
-        .with_summaries(true);
-        let known = KnownMappings {
-            names: vec![TermEntry {
-                original: "タツヤ".to_string(),
-                english: "Tatsuya".to_string(),
-            }],
-            terms: Vec::new(),
+    #[test]
+    fn test_summary_user_message_lists_characters_terms_and_context() {
+        let rendering = |original: &str, english: &str| TermEntry {
+            original: original.to_string(),
+            english: english.to_string(),
         };
+        let present = KnownMappings {
+            names: vec![
+                rendering("タツヤ", "Tatsuya"),
+                rendering("モニカ", "Monika"),
+                rendering("ルリ", "Ruri"),
+                rendering("瑠璃", "Ruri"),
+            ],
+            terms: vec![rendering("魔石", "magic stone")],
+        };
+        let cast = [
+            CastEntry {
+                english: "Ruri".to_string(),
+                gender: Some(Gender::Female),
+                note: Some("homunculus Tatsuya created".to_string()),
+            },
+            CastEntry {
+                english: "Tatsuya".to_string(),
+                gender: Some(Gender::Male),
+                note: None,
+            },
+        ];
+        let context = SummaryContext::new(
+            present,
+            &cast,
+            Some((1, "Tatsuya creates Ruri.".to_string())),
+        );
 
-        let result = scout
-            .collect_summaries_with_progress("タツヤは魔石を見せた。", &known, None)
-            .await;
-        let (listener, request) = server.join().unwrap();
-        listener.set_nonblocking(true).unwrap();
-
-        assert_eq!(result.unwrap(), ["Tatsuya shows Ruri the magic stone."]);
-        assert!(listener.accept().is_err(), "only one request expected");
-        assert_eq!(request["messages"][0]["content"], SUMMARY_ONLY_PROMPT);
-        let user = request["messages"][1]["content"].as_str().unwrap();
-        assert!(user.starts_with(SUMMARY_HEADER));
-        assert!(user.contains("タツヤ → Tatsuya"));
-        assert!(user.ends_with("Text:\nタツヤは魔石を見せた。"));
+        assert_eq!(
+            build_summary_user_message("### Chapter 2 - 二\nルリは笑った。", &context, ""),
+            "Characters:\n\
+             - ルリ → Ruri: female; homunculus Tatsuya created\n\
+             - 瑠璃 → Ruri: female; homunculus Tatsuya created\n\
+             - タツヤ → Tatsuya: male\n\
+             - モニカ → Monika\n\
+             \n\
+             Terms:\n\
+             - 魔石 → magic stone\n\
+             \n\
+             Previous chapter (1): Tatsuya creates Ruri.\n\
+             \n\
+             Text:\n\
+             ### Chapter 2 - 二\nルリは笑った。"
+        );
+        assert_eq!(
+            build_summary_user_message("ルリは寝た。", &SummaryContext::default(), "Ruri laughs."),
+            "Earlier in this chapter: Ruri laughs.\n\nText:\nルリは寝た。"
+        );
+        assert!(summary_prompt(50).contains("at most 50 English words"));
     }
 
     #[test]

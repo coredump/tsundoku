@@ -187,9 +187,10 @@ pub struct NameScoutConfig {
     /// Number of chapters to scout concurrently.
     pub workers: usize,
 
-    /// Ask the scout for a short synopsis of every chapter, stored next to the
-    /// mapping and used as cross-chapter context during translation. Off by default
-    /// because it adds scout output.
+    /// After the mapping scout, summarise every chapter without a stored synopsis
+    /// (one request per chapter, in chapter order), stored next to the mapping and
+    /// used as cross-chapter context during translation. Off by default because it
+    /// adds one scout request per chapter.
     pub summaries: bool,
 }
 

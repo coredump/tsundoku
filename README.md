@@ -420,13 +420,15 @@ To apply changed mappings to already translated chapters, run `tsundoku --rechec
 
 ### Chapter Summaries
 
-With `name_scout.summaries = true`, the scout also writes a short English synopsis of each chapter (at most 40 words per chunk, 120 per chapter) to `{module}: {novel_id}.summaries.json` next to the mapping file (`{module} - {novel_id}.summaries.json` on Windows), kept separate so the mapping you review does not grow:
+With `name_scout.summaries = true`, a summary pass runs after the mapping scout and writes a short English synopsis of each chapter (about 100 words, cut at 130) to `{module}: {novel_id}.summaries.json` next to the mapping file (`{module} - {novel_id}.summaries.json` on Windows), kept separate so the mapping you review does not grow:
 
 ```json
 { "version": 1, "chapters": { "12": "Tatsuya brings Ruri to the village; Monika audits the inn." } }
 ```
 
-A chapter counts as summarized once its key exists, even with an empty synopsis. Summaries are off by default because they add scout output. When translating chapter N, the synopses of the previous `translation.summary_chapters` chapters (default 2; `0` disables) are added at the end of the prompt as context; chapters without a synopsis are skipped. Before injection, any losing rendering of a name is replaced with its selected one, so an override made after scouting also fixes older synopses:
+Chapters without a synopsis (up to `--name-scout-limit`) are summarized one at a time in chapter order, each with one scout request holding the whole chapter. Because the mapping scout has already run, the request also lists the characters named in the chapter (`ルリ → Ruri: female; homunculus Tatsuya created`, gender and note when known), the glossary terms in it, and the previous chapter's synopsis, so the scout can tell who a first-person narrator (俺, 僕, 私…) is and keep characters' roles straight. Chapters longer than 12,000 characters are split at scene breaks and summarized piece by piece, each piece seeing the summary of the earlier ones. Each synopsis is saved as soon as it is written; a chapter whose request fails is reported and retried on the next run.
+
+A chapter counts as summarized once its key exists, even with an empty synopsis. Summaries are off by default because they add one scout request per chapter. When translating chapter N, the synopses of the previous `translation.summary_chapters` chapters (default 2; `0` disables) are added at the end of the prompt as context; chapters without a synopsis are skipped. Before injection, any losing rendering of a name is replaced with its selected one, so an override made after scouting also fixes older synopses:
 
 ```
 Story so far (context only; do not translate):
@@ -472,7 +474,7 @@ cargo run -- --scout-only https://ncode.syosetu.com/n1234ab/
 
 This mode reuses existing originals from the story folder and downloads only missing chapters, including when a novel’s chapter count changes its filename padding. If no story folder exists, it creates one using the original title without calling the translation API. Use `--no-name-pause` only for unattended scouting; otherwise Tsundoku pauses after scouting so you can correct the mapping before a later translation run. `--scout-only` cannot be combined with `--no-name-scout`.
 
-Turning on `name_scout.summaries` for a novel that is already scouted back-fills the missing synopses on the next run (including `--scout-only`): chapters already covered for names and terms get one summary-only request per chunk, which records no name or term votes and does not trigger the review pause.
+Turning on `name_scout.summaries` for a novel that is already scouted writes the missing synopses on the next run (including `--scout-only`): chapters already covered for names and terms get only the summary request, which records no name or term votes and does not trigger the review pause. To rewrite synopses (for example after correcting names or notes), delete the summaries file or the chapters' keys in it.
 
 ### Creating a Release
 

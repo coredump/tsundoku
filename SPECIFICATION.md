@@ -108,7 +108,7 @@ Name and terminology extraction configuration:
 - `retries`: Number of retry attempts (default: "3", integer)
 - `delay_between_requests_sec`: Delay between requests (default: "1", float)
 - `json_retries`: Number of JSON parsing retry attempts (default: "3", integer)
-- `summaries`: Also collect a short synopsis of each chapter into the summaries file; chapters lacking one are back-filled with summary-only requests (default: "false", bool)
+- `summaries`: After the mapping scout, run the summary pass: one request per chapter without a synopsis, in chapter order, stored in the summaries file (default: "false", bool)
 
 #### [Scraping] Section
 Web scraping behavior:
@@ -827,14 +827,12 @@ Returns an iterator (or async stream) that yields parsed name lists per chunk:
 4. Return normalized list
 
 **Integration with Main Flow** (`run_name_scout`):
-Called after chapter download but before translation. A chapter is scouted when it lacks name coverage, term coverage, or (with `name_scout.summaries`) a key in the summaries file. Chapters run on `name_scout.workers` workers and are recorded as each finishes:
+Called after chapter download but before translation. It runs the mapping scout, then (with `name_scout.summaries`) the summary pass; both only look at chapters up to `--name-scout-limit`.
+
+The mapping scout takes the chapters lacking name or term coverage. They run on `name_scout.workers` workers and are recorded as each finishes:
 ```rust
-for ch in chapters_needing_scout {
-    let chunks = if ch.needs_names || ch.needs_terms {
-        name_scout.collect_mappings_with_progress(&payload, &known, progress)  // may carry chunk summaries
-    } else {
-        name_scout.collect_summaries_with_progress(&payload, &known, progress) // summary-only requests
-    };
+for ch in chapters_needing_mappings {
+    let chunks = name_scout.collect_mappings_with_progress(&payload, &known, progress);
     for chunk in chunks {
         if ch.needs_names { name_mapping.record_votes(&chunk.names); }
         if ch.needs_terms { name_mapping.record_term_votes(&chunk.terms); }
@@ -842,19 +840,65 @@ for ch in chapters_needing_scout {
     }
     if ch.needs_names { name_mapping.add_coverage(&[ch.number]); }
     if ch.needs_terms { name_mapping.add_term_coverage(&[ch.number]); }
-    if ch.needs_summary {
-        summary_store.set(ch.number, chapter_synopsis(&chunk_summaries).unwrap_or_default());
-        summary_store.save()?;
+}
+```
+A mapping response may carry extra keys (a stray `"summary"` is ignored); `{}` means nothing new.
+
+The summary pass (`run_summary_pass`) takes the chapters without a key in the summaries file and handles them one at a time in ascending chapter order, so each request can carry the previous chapter's synopsis:
+```rust
+let known = name_mapping.known_mappings();  // after the mapping scout
+for ch in chapters_without_synopsis {           // sorted by number
+    let payload = build_chapter_payload(ch.number, ch.title, &ruby::for_scout(ch.content));
+    let context = SummaryContext::new(
+        known.present_in(&payload),
+        &name_mapping.cast_for_text(&payload, SUMMARY_CAST_MAX_ENTRIES), // 100
+        summary_store.get(ch.number - 1).map(|s| (ch.number - 1, name_mapping.normalize_renderings(s))),
+    );
+    match name_scout.summarize_chapter(&payload, &context, progress).await {
+        Ok(synopsis) => { summary_store.set(ch.number, synopsis); summary_store.save()?; } // "[OK] Summarized chapter N"
+        Err(e) => warn_and_continue(e),  // the next chapter then has no previous synopsis
     }
 }
 ```
-It returns true (and the manual review pause runs) only when some chapter was scouted for names or terms; a summary-only back-fill skips the pause.
+`run_name_scout` returns true (and the manual review pause runs) only when some chapter was scouted for names or terms; a run that only writes summaries skips the pause.
+
+**Chapter Summaries** (`NameScout::summarize_chapter(payload, context, progress) -> Result<String>`):
+- A payload of at most `SUMMARY_SPLIT_CHARS` (12000) characters is sent in one request. A longer one is split with `utils::split_into_scene_chunks(payload, SUMMARY_SPLIT_CHARS)` and the pieces are summarised in order; each piece's request also carries the joined summaries of the earlier pieces as `Earlier in this chapter: …`, and each piece gets `SYNOPSIS_WORDS / pieces` words in the prompt and is cut at `MAX_SYNOPSIS_WORDS / pieces`
+- Requests use the mapping scout's retry handling (API failures: `retries`; refusals and parse failures: `json_retries`) and the scout status line labelled `Summarizing`
+- The system prompt (`{words}` = `SYNOPSIS_WORDS` = 100 for a whole chapter):
+```
+You summarize one chapter of a Japanese web novel for the novel's English translator. Your summary is the translator's only memory of this chapter when translating later chapters, so it must be accurate.
+- Write at most {words} English words of plain prose: who does what to whom, and how things stand at the end.
+- Write names exactly as given under "Characters" (`original → English: gender; note`) and use the English given under "Terms".
+- The story may be narrated in first person (俺, 僕, 私, あたし, わたし, うち…). Work out who the narrator is from the character list, the previous chapter and the text, and call them by name; say "the narrator" only if their name is never given.
+- Do not swap characters' roles or attributes: keep who says, does and is what exactly as in the text, and use the character notes to tell characters apart.
+- The previous chapter and "Earlier in this chapter" are context only; summarize only the text under "Text".
+- `｜X《Y》` is ruby: X is read Y.
+Return ONLY JSON: {"summary":"<summary>"}. No explanations.
+```
+- The user message has these sections, each left out when empty and followed by a blank line: `Characters:` with one `- {original} → {english}` line per known name whose original occurs in the payload, with `: {gender}; {note}` (or just one of them) taken from the cast entry with the same rendering; names with a gender or note come first in cast order, the rest by original. `Terms:` with one `- {original} → {english}` line per glossary term in the payload. `Previous chapter ({N-1}): {synopsis}`. `Earlier in this chapter: {summaries}`. Then `Text:` and the payload (or piece). Example:
+```
+Characters:
+- ルリ → Ruri: female; homunculus Tatsuya created
+- タツヤ → Tatsuya: male
+- モニカ → Monika
+
+Terms:
+- 魔石 → magic stone
+
+Previous chapter (1): Tatsuya creates Ruri, a homunculus, in his workshop.
+
+Text:
+### Chapter 2 - …
+…
+```
+- The response must be `{"summary": "…"}` (code fences and surrounding prose are tolerated); a missing key is a parse failure. Whitespace is collapsed and the piece summary capped; the synopsis is the non-empty piece summaries joined with spaces and capped at `MAX_SYNOPSIS_WORDS` (130), or empty when there are none
 
 **Summaries File**: `SummaryStore` at `names_dir/"{module}: {novel_id}.summaries.json"` (Windows: `{module} - {novel_id}.summaries.json`):
 ```json
 { "version": 1, "chapters": { "12": "Tatsuya brings Ruri to the village; Monika audits the inn." } }
 ```
-A chapter is covered once its key exists (possibly with an empty synopsis). Chunk summaries are capped at 40 words and the chapter synopsis (chunk summaries joined in order) at 120.
+A chapter is covered once its key exists (possibly with an empty synopsis).
 
 **Chapter Payload Format**:
 ```

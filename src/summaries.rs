@@ -1,8 +1,10 @@
-//! Per-chapter story summaries written by the mapping scout.
+//! Per-chapter story summaries written by the scout's summary pass.
 //!
-//! Each chapter gets a short English synopsis built from the scout's chunk summaries.
-//! The translator shows the synopses of the preceding chapters as context. They are
-//! stored next to the name mapping as `"{module}: {id}.summaries.json"`:
+//! After the mapping scout, each chapter gets a short English synopsis from one
+//! summary request (several for very long chapters) that also sees the chapter's
+//! characters and the previous chapter's synopsis. The translator shows the synopses
+//! of the preceding chapters as context. They are stored next to the name mapping as
+//! `"{module}: {id}.summaries.json"`:
 //!
 //! ```json
 //! { "version": 1, "chapters": { "12": "Tatsuya brings Ruri to the village." } }
@@ -17,11 +19,11 @@ use std::path::{Path, PathBuf};
 /// Version written to and accepted from the summary file.
 pub const SUMMARIES_VERSION: u32 = 1;
 
-/// Longest chunk summary kept from the scout, in words.
-pub const MAX_CHUNK_SUMMARY_WORDS: usize = 40;
+/// Words a chapter synopsis is asked to stay within.
+pub const SYNOPSIS_WORDS: usize = 100;
 
-/// Longest chapter synopsis, in words.
-pub const MAX_SYNOPSIS_WORDS: usize = 120;
+/// Longest chapter synopsis kept, in words; longer replies are cut.
+pub const MAX_SYNOPSIS_WORDS: usize = 130;
 
 /// Collapse whitespace and keep at most `max_words` words, marking a cut with `…`.
 pub(crate) fn cap_words(text: &str, max_words: usize) -> String {
@@ -33,7 +35,7 @@ pub(crate) fn cap_words(text: &str, max_words: usize) -> String {
     capped
 }
 
-/// Join a chapter's chunk summaries, in text order, into one synopsis.
+/// Join a chapter's piece summaries, in text order, into one synopsis.
 ///
 /// Blank summaries are skipped and the result is capped at [`MAX_SYNOPSIS_WORDS`]
 /// words. Returns `None` when no summary has any text.

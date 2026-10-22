@@ -18,14 +18,14 @@ use tsundoku::epub::{BookInfo, ChapterFile, collect_chapters};
 use tsundoku::honorifics::{self, HonorificPolicy};
 use tsundoku::name_mapping::{KnownMappings, NameMappingStore, TermEntry};
 use tsundoku::name_scout::{
-    NameScout, NameScoutEvent, NameScoutProgress, NameScoutStatus, ScoutChunk, ScoutProgressInfo,
-    build_chapter_payload,
+    NameScout, NameScoutEvent, NameScoutProgress, NameScoutStatus, SUMMARY_CAST_MAX_ENTRIES,
+    ScoutChunk, ScoutProgressInfo, SummaryContext, build_chapter_payload,
 };
 use tsundoku::output_rules::{OutputRules, postprocess};
 use tsundoku::qa::{self, ChunkContext, Issue, IssueClass, QaConfig};
 use tsundoku::ruby;
 use tsundoku::scrapers::{ChapterInfo, ChapterList, ScraperRegistry};
-use tsundoku::summaries::{SummaryStore, chapter_synopsis};
+use tsundoku::summaries::SummaryStore;
 use tsundoku::translator::{
     ChunkPlan, ChunkResult, ProgressInfo, PromptContext, TranslationProgress, TranslationStage,
     Translator,
@@ -1526,30 +1526,20 @@ fn render_translation_stats(console: &Console, stats: &HashMap<usize, WorkerStat
     let _ = io::stdout().flush();
 }
 
-/// What a chapter still needs from the scout.
+/// What a chapter still needs from the mapping scout.
 #[derive(Debug, Clone, Copy)]
 struct ScoutNeeds {
     /// Record name votes and name coverage.
     names: bool,
     /// Record term votes and term coverage.
     terms: bool,
-    /// Store a chapter synopsis.
-    summary: bool,
 }
 
-impl ScoutNeeds {
-    /// Returns whether the chapter needs a mapping request (names or terms).
-    fn mappings(self) -> bool {
-        self.names || self.terms
-    }
-}
-
-/// Runs the mapping scout on chapters missing names or terminology coverage and,
-/// when summaries are enabled, on chapters without a stored synopsis. Chapters that
-/// only lack a synopsis get summary-only requests.
+/// Runs the mapping scout on chapters missing names or terminology coverage, then,
+/// with `name_scout.summaries`, the summary pass on chapters without a synopsis.
 ///
 /// Returns true if any chapter was scouted for names or terms, false if only
-/// summaries were back-filled or nothing was needed.
+/// summaries were written or nothing was needed.
 async fn run_name_scout(
     console: &Console,
     name_scout: &NameScout,
@@ -1559,9 +1549,35 @@ async fn run_name_scout(
     workers: usize,
     limit: Option<u32>,
 ) -> Result<bool> {
+    let mapped =
+        run_mapping_scout(console, name_scout, name_mapping, chapters, workers, limit).await?;
+    if name_scout.summaries_enabled() {
+        run_summary_pass(
+            console,
+            name_scout,
+            name_mapping,
+            summary_store,
+            chapters,
+            limit,
+        )
+        .await?;
+    }
+    Ok(mapped)
+}
+
+/// Runs the mapping scout on chapters missing names or terminology coverage.
+///
+/// Returns true if any chapter was scouted.
+async fn run_mapping_scout(
+    console: &Console,
+    name_scout: &NameScout,
+    name_mapping: &mut NameMappingStore,
+    chapters: &[(u32, &str, &str)], // (number, title, content)
+    workers: usize,
+    limit: Option<u32>,
+) -> Result<bool> {
     console.section("Mapping Scout Phase");
 
-    let summaries = name_scout.summaries_enabled();
     let uncovered: Vec<_> = chapters
         .iter()
         .filter(|(number, _, _)| limit.is_none_or(|limit| *number <= limit))
@@ -1569,48 +1585,32 @@ async fn run_name_scout(
             let needs = ScoutNeeds {
                 names: !name_mapping.is_chapter_covered(*number),
                 terms: !name_mapping.is_chapter_terms_covered(*number),
-                summary: summaries && !summary_store.has(*number),
             };
             (*number, *title, *content, needs)
         })
-        .filter(|(_, _, _, needs)| needs.mappings() || needs.summary)
+        .filter(|(_, _, _, needs)| needs.names || needs.terms)
         .collect();
 
     if uncovered.is_empty() {
-        console.info(if summaries {
-            "All chapters already scouted for names, terminology and summaries"
-        } else {
-            "All chapters already scouted for names and terminology"
-        });
+        console.info("All chapters already scouted for names and terminology");
         return Ok(false);
     }
 
-    let mapping_chapters = uncovered
-        .iter()
-        .filter(|(_, _, _, needs)| needs.mappings())
-        .count();
-    let summary_only_chapters = uncovered.len() - mapping_chapters;
     let plural = |count: usize| if count == 1 { "" } else { "s" };
-    let mut plan = format!(
-        "Scouting {} chapter{} for character names and terminology",
-        mapping_chapters,
-        plural(mapping_chapters)
-    );
-    if summary_only_chapters > 0 {
-        plan.push_str(&format!(
-            " and summarizing {} more chapter{}",
-            summary_only_chapters,
-            plural(summary_only_chapters)
-        ));
-    }
     console.info(&format!(
-        "{plan} with {} chapter worker{}",
+        "Scouting {} chapter{} for character names and terminology with {} chapter worker{}",
+        uncovered.len(),
+        plural(uncovered.len()),
         workers,
         plural(workers)
     ));
 
     let (progress_tx, progress_rx) = mpsc::unbounded_channel();
-    let progress_display = tokio::spawn(display_name_scout_stats(progress_rx, workers));
+    let progress_display = tokio::spawn(display_name_scout_stats(
+        progress_rx,
+        workers,
+        "Name scouting",
+    ));
     let worker_ids = Arc::new(Mutex::new((1..=workers).rev().collect::<Vec<_>>()));
 
     let mut scout_error = None;
@@ -1687,25 +1687,15 @@ async fn run_name_scout(
             if chapter.needs.terms {
                 name_mapping.add_term_coverage(&[chapter.number]);
             }
-            if chapter.needs.mappings() {
-                name_mapping.save()?;
-                *known.write().unwrap_or_else(PoisonError::into_inner) =
-                    Arc::new(name_mapping.known_mappings());
-            }
-            if let Some(synopsis) = chapter.synopsis {
-                summary_store.set(chapter.number, synopsis);
-                summary_store.save()?;
-            }
+            name_mapping.save()?;
+            *known.write().unwrap_or_else(PoisonError::into_inner) =
+                Arc::new(name_mapping.known_mappings());
 
             clear_status_line();
-            console.success(&if chapter.needs.mappings() {
-                format!(
-                    "Scouted chapter {}: found {} names and {} terms",
-                    chapter.number, chapter.total_names, chapter.total_terms
-                )
-            } else {
-                format!("Summarized chapter {}", chapter.number)
-            });
+            console.success(&format!(
+                "Scouted chapter {}: found {} names and {} terms",
+                chapter.number, chapter.total_names, chapter.total_terms
+            ));
         }
     }
 
@@ -1724,7 +1714,98 @@ async fn run_name_scout(
         name_mapping.term_len()
     ));
 
-    Ok(mapping_chapters > 0)
+    Ok(true)
+}
+
+/// Summarises every chapter in range without a stored synopsis, one at a time in
+/// chapter order, so each request can carry the previous chapter's synopsis.
+///
+/// Runs after the mapping scout, so the names, genders and notes it recorded are
+/// listed with each chapter. Each synopsis is saved as soon as it is written. A
+/// chapter that fails is reported and skipped; the next chapter then goes without a
+/// previous synopsis.
+async fn run_summary_pass(
+    console: &Console,
+    name_scout: &NameScout,
+    name_mapping: &NameMappingStore,
+    summary_store: &mut SummaryStore,
+    chapters: &[(u32, &str, &str)], // (number, title, content)
+    limit: Option<u32>,
+) -> Result<()> {
+    console.section("Chapter Summary Phase");
+
+    let mut pending: Vec<_> = chapters
+        .iter()
+        .filter(|(number, _, _)| limit.is_none_or(|limit| *number <= limit))
+        .filter(|(number, _, _)| !summary_store.has(*number))
+        .collect();
+    if pending.is_empty() {
+        console.info("All chapters already summarized");
+        return Ok(());
+    }
+    pending.sort_by_key(|(number, _, _)| *number);
+    console.info(&format!(
+        "Summarizing {} chapter{} in chapter order",
+        pending.len(),
+        if pending.len() == 1 { "" } else { "s" }
+    ));
+
+    let known = name_mapping.known_mappings();
+    let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+    let progress_display = tokio::spawn(display_name_scout_stats(progress_rx, 1, "Summarizing"));
+    let mut failed = 0;
+
+    for &&(number, title, content) in &pending {
+        // Cached originals are canonicalised here too, so ruby reaches the scout as `｜B《R》`.
+        let payload = build_chapter_payload(number, title, &ruby::for_scout(content));
+        let previous = number.checked_sub(1).and_then(|previous| {
+            summary_store
+                .get(previous)
+                .map(|synopsis| (previous, name_mapping.normalize_renderings(synopsis)))
+        });
+        let context = SummaryContext::new(
+            known.present_in(&payload),
+            &name_mapping.cast_for_text(&payload, SUMMARY_CAST_MAX_ENTRIES),
+            previous,
+        );
+        let progress = ScoutProgressInfo {
+            chapter: number,
+            worker: 1,
+            reporter: Some(progress_tx.clone()),
+        };
+
+        let result = name_scout
+            .summarize_chapter(&payload, &context, Some(progress))
+            .await;
+        clear_status_line();
+        match result {
+            Ok(synopsis) => {
+                summary_store.set(number, synopsis);
+                summary_store.save()?;
+                console.success(&format!("Summarized chapter {number}"));
+            }
+            Err(error) => {
+                failed += 1;
+                console.warning(&format!(
+                    "Failed to summarize chapter {number}: {error}; continuing with the next chapter"
+                ));
+            }
+        }
+    }
+
+    drop(progress_tx);
+    let _ = progress_display.await;
+
+    if failed > 0 {
+        console.warning(&format!(
+            "{failed} chapter(s) not summarized; the next run retries them"
+        ));
+    }
+    console.success(&format!(
+        "Chapter summaries now cover {} chapters",
+        summary_store.len()
+    ));
+    Ok(())
 }
 
 struct ScoutedChapter {
@@ -1733,9 +1814,6 @@ struct ScoutedChapter {
     total_names: usize,
     total_terms: usize,
     mapping_chunks: Vec<ScoutChunk>,
-    /// The chapter synopsis to store (empty when the scout gave none); `None` when
-    /// the chapter did not need one.
-    synopsis: Option<String>,
 }
 
 async fn scout_chapter_job(
@@ -1755,37 +1833,17 @@ async fn scout_chapter_job(
         worker,
         reporter: Some(progress_tx),
     };
-    let (mapping_chunks, chunk_summaries) = if needs.mappings() {
-        let mut mapping_chunks = name_scout
-            .collect_mappings_with_progress(&payload, known, Some(progress))
-            .await
-            .with_context(|| format!("Failed to scout mappings for chapter {}", number))?;
-        let chunk_summaries: Vec<String> = mapping_chunks
-            .iter_mut()
-            .filter_map(|chunk| chunk.summary.take())
-            .collect();
-        (mapping_chunks, chunk_summaries)
-    } else {
-        let chunk_summaries = name_scout
-            .collect_summaries_with_progress(&payload, known, Some(progress))
-            .await
-            .with_context(|| format!("Failed to summarize chapter {}", number))?;
-        (Vec::new(), chunk_summaries)
-    };
-
-    let total_names = mapping_chunks.iter().map(|chunk| chunk.names.len()).sum();
-    let total_terms = mapping_chunks.iter().map(|chunk| chunk.terms.len()).sum();
-    let synopsis = needs
-        .summary
-        .then(|| chapter_synopsis(&chunk_summaries).unwrap_or_default());
+    let mapping_chunks = name_scout
+        .collect_mappings_with_progress(&payload, known, Some(progress))
+        .await
+        .with_context(|| format!("Failed to scout mappings for chapter {}", number))?;
 
     Ok(ScoutedChapter {
         number,
         needs,
-        total_names,
-        total_terms,
+        total_names: mapping_chunks.iter().map(|chunk| chunk.names.len()).sum(),
+        total_terms: mapping_chunks.iter().map(|chunk| chunk.terms.len()).sum(),
         mapping_chunks,
-        synopsis,
     })
 }
 
@@ -1798,9 +1856,11 @@ struct ScoutWorkerStat {
     status: NameScoutStatus,
 }
 
+/// Show the scout status line; `activity` names the phase (e.g. "Name scouting").
 async fn display_name_scout_stats(
     mut progress_rx: mpsc::UnboundedReceiver<NameScoutEvent>,
     workers: usize,
+    activity: &'static str,
 ) {
     let console = Console::new();
     let mut stats: HashMap<usize, ScoutWorkerStat> = HashMap::new();
@@ -1831,10 +1891,10 @@ async fn display_name_scout_stats(
                         }
                     }
                 }
-                render_name_scout_stats(&console, &stats, workers);
+                render_name_scout_stats(&console, &stats, workers, activity);
             }
             _ = ticker.tick() => {
-                render_name_scout_stats(&console, &stats, workers);
+                render_name_scout_stats(&console, &stats, workers, activity);
             }
         }
     }
@@ -1846,6 +1906,7 @@ fn render_name_scout_stats(
     console: &Console,
     stats: &HashMap<usize, ScoutWorkerStat>,
     workers: usize,
+    activity: &str,
 ) {
     let mut worker_parts = Vec::new();
 
@@ -1889,8 +1950,9 @@ fn render_name_scout_stats(
     let info = console.label("INFO", Style::Blue);
 
     print!(
-        "\r\x1b[2K{} Name scouting: {}",
+        "\r\x1b[2K{} {}: {}",
         info,
+        activity,
         worker_parts.join(", ")
     );
     let _ = io::stdout().flush();
@@ -2325,56 +2387,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scout_backfills_summary_for_mapped_chapter_with_one_summary_request() {
-        use std::io::{BufRead, BufReader, Read};
-        use std::net::TcpListener;
-        use tsundoku::config::{ApiConfig, NameScoutConfig};
+    async fn summary_pass_runs_after_mapping_in_chapter_order_with_context() {
+        use tsundoku::config::NameScoutConfig;
+        use tsundoku::name_mapping::Gender;
+        use tsundoku::name_scout::SUMMARY_SPLIT_CHARS;
 
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            let mut content_length = 0;
-            loop {
-                line.clear();
-                reader.read_line(&mut line).unwrap();
-                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    content_length = value.trim().parse().unwrap();
-                }
-                if line == "\r\n" {
-                    break;
-                }
+        const TEXT_MARK: &str = "Text:\n### Chapter ";
+        let (base_url, bodies) = serve_chat(|body| {
+            let system = body["messages"][0]["content"].as_str().unwrap();
+            let user = body["messages"][1]["content"].as_str().unwrap();
+            if system.starts_with("Extract mappings") {
+                return r#"{"names":[],"terms":[]}"#.to_string();
             }
-            let mut body = vec![0; content_length];
-            reader.read_exact(&mut body).unwrap();
-
-            // Names in the reply must be ignored: the chapter is already covered.
-            let response_body = r#"{"choices":[{"message":{"content":"{\"summary\":\"Tatsuya shows Ruri the magic stone.\",\"names\":[{\"original\":\"ルリ\",\"part\":\"given\",\"english\":\"Ruri\"}]}"}}]}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                response_body.len(),
-                response_body
-            )
-            .unwrap();
-            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            // A second request would block on `accept`; the scout must send only one.
-            (listener, request)
+            let summary = match user.find(TEXT_MARK) {
+                Some(start) => {
+                    let number: String = user[start + TEXT_MARK.len()..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    format!("Chapter {number} happens.")
+                }
+                None => "Ruri keeps walking.".to_string(),
+            };
+            serde_json::json!({ "summary": summary }).to_string()
         });
 
         let temp_dir = TempDir::new().unwrap();
         let mut name_mapping =
             NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
-        name_mapping.record_votes(&[name_vote("タツヤ", "Tatsuya")]);
-        name_mapping.add_coverage(&[1]);
-        name_mapping.add_term_coverage(&[1]);
+        let ruri = NameEntry {
+            gender: Some(Gender::Female),
+            note: Some("homunculus Tatsuya created".to_string()),
+            ..name_vote("ルリ", "Ruri")
+        };
+        name_mapping.record_votes(&[ruri.clone(), ruri, name_vote("タツヤ", "Tatsuya")]);
+        let stone = TermEntry {
+            original: "魔石".to_string(),
+            english: "magic stone".to_string(),
+        };
+        name_mapping.record_term_votes(&[stone.clone(), stone]);
+        // Chapters 1-3 are already scouted for names and terms; chapter 4 is not.
+        name_mapping.add_coverage(&[1, 2, 3]);
+        name_mapping.add_term_coverage(&[1, 2, 3]);
         let mut summaries = SummaryStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
         let scout = NameScout::new(
             ApiConfig {
                 key: "test-key".to_string(),
-                base_url: format!("http://{address}/v1"),
+                base_url,
                 model: "test-model".to_string(),
             },
             NameScoutConfig {
@@ -2386,46 +2445,71 @@ mod tests {
             "Extract mappings".to_string(),
         )
         .with_summaries(true);
+        let long = "ルリは歩いた。\n".repeat(SUMMARY_SPLIT_CHARS / 8 + 100);
 
         let mapping_scouted = run_name_scout(
             &Console::new(),
             &scout,
             &mut name_mapping,
             &mut summaries,
-            &[(1, "第一話", "タツヤは魔石を見せた。")],
-            1,
+            &[
+                (4, "第四話", "タツヤは魔石を見せた。"),
+                (1, "第一話", "タツヤはルリを作った。"),
+                (2, "第二話", "ルリは笑った。"),
+                (3, "第三話", &long),
+            ],
+            2,
             None,
         )
         .await
         .unwrap();
-        let (listener, request) = server.join().unwrap();
-        listener.set_nonblocking(true).unwrap();
 
-        assert!(!mapping_scouted);
-        assert!(listener.accept().is_err(), "only one request expected");
-        assert!(
-            request["messages"][0]["content"]
-                .as_str()
-                .unwrap()
-                .starts_with("You summarize passages")
-        );
-        assert_eq!(summaries.get(1), Some("Tatsuya shows Ruri the magic stone."));
-        assert!(
-            SummaryStore::new(temp_dir.path(), "syosetu", "n1234ab")
-                .unwrap()
-                .has(1)
-        );
-        let names: Vec<_> = name_mapping
-            .names()
-            .map(|(original, info)| (original.to_string(), info.votes.clone()))
+        assert!(mapping_scouted);
+        let bodies = bodies.lock().unwrap();
+        let systems: Vec<&str> = bodies
+            .iter()
+            .map(|body| body["messages"][0]["content"].as_str().unwrap())
             .collect();
-        assert_eq!(
-            names,
-            [(
-                "タツヤ".to_string(),
-                HashMap::from([("Tatsuya".to_string(), 1)])
-            )]
+        let users: Vec<String> = bodies.iter().map(last_user_turn).collect();
+        assert_eq!(bodies.len(), 6, "{users:#?}");
+        // Only the uncovered chapter gets a mapping request, and before any summary.
+        assert!(systems[0].starts_with("Extract mappings"));
+        assert!(users[0].contains("### Chapter 4 - "));
+        assert!(
+            systems[1..]
+                .iter()
+                .all(|system| system.starts_with("You summarize one chapter"))
         );
+
+        assert!(users[1].contains("Text:\n### Chapter 1 - "));
+        assert!(users[1].contains("- タツヤ → Tatsuya\n"));
+        assert!(!users[1].contains("Previous chapter"));
+
+        assert!(users[2].contains("Text:\n### Chapter 2 - "));
+        assert!(users[2].contains("Previous chapter (1): Chapter 1 happens.\n"));
+        assert!(users[2].contains("- ルリ → Ruri: female; homunculus Tatsuya created\n"));
+
+        // The long chapter is split; the second piece carries the first one's summary.
+        assert!(users[3].contains("Text:\n### Chapter 3 - "));
+        assert!(users[3].contains("Previous chapter (2): Chapter 2 happens.\n"));
+        assert!(!users[3].contains("Earlier in this chapter"));
+        assert!(users[4].contains("Earlier in this chapter: Chapter 3 happens.\n"));
+        assert!(!users[4].contains("### Chapter 3"));
+        assert!(systems[3].contains("at most 50 English words"));
+
+        assert!(users[5].contains("Text:\n### Chapter 4 - "));
+        assert!(
+            users[5].contains("Previous chapter (3): Chapter 3 happens. Ruri keeps walking.\n")
+        );
+        assert!(users[5].contains("Terms:\n- 魔石 → magic stone\n"));
+
+        let reloaded = SummaryStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
+        assert_eq!(reloaded.len(), 4);
+        assert_eq!(
+            reloaded.get(3),
+            Some("Chapter 3 happens. Ruri keeps walking.")
+        );
+        assert_eq!(reloaded.get(4), Some("Chapter 4 happens."));
     }
 
     #[test]
@@ -2915,8 +2999,9 @@ mod tests {
         }
     }
 
-    /// Serve streamed chat completions on a background thread, answering each
-    /// request with `reply(body)`; returns the base URL and the request bodies seen.
+    /// Serve chat completions on a background thread, answering each request with
+    /// `reply(body)`, streamed when the request asks for it; returns the base URL and
+    /// the request bodies seen.
     fn serve_chat(
         reply: impl Fn(&serde_json::Value) -> String + Send + 'static,
     ) -> (String, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
@@ -2945,8 +3030,21 @@ mod tests {
                 reader.read_exact(&mut body).unwrap();
                 let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 let content = reply(&body);
+                let stream = body["stream"] == true;
                 seen.lock().unwrap().push(body);
 
+                if !stream {
+                    let reply =
+                        serde_json::json!({ "choices": [{ "message": { "content": content } }] })
+                            .to_string();
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    )
+                    .unwrap();
+                    continue;
+                }
                 let delta = serde_json::json!({ "choices": [{ "index": 0, "delta": { "content": content }, "finish_reason": null }] });
                 let stop = serde_json::json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] });
                 write!(
