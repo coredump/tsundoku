@@ -93,6 +93,14 @@ Translation behavior configuration:
 - `summary_chapters`: Number of previous chapters whose scout synopses are added to a chapter translation prompt; `0` disables (default: "2", integer)
 - `max_tokens_per_char`: Reply token limit per source character; each request sends `max_tokens = max(512, ceil(max_tokens_per_char × characters))` and `0` sends none. Must be finite and at least 0 (default: "2.0", float)
 
+#### [QA] Section
+Post-translation checks (`qa::check_chunk`) and QA retries:
+- `max_retries`: QA retries per chunk, separate from `translation.retries` (default: "1", integer)
+- `retry_on`: Issue classes that trigger a QA retry: `failed`, `truncated`, `foreign`, `glossary`, `names`, `paragraphs`, `length`, `repetition`, `honorifics` (default: `["truncated", "foreign", "glossary", "names", "repetition"]`). `name_missing` and `honorific_on_noun` are never retried whatever this says
+- `paragraph_ratio`: Allowed output/source non-empty line ratio `[low, high]`; a mismatch also needs a difference of at least 3 lines (default: `[0.85, 1.15]`)
+- `length_ratio`: Allowed output/source character ratio `[low, high]` (default: `[1.2, 4.0]`)
+- Both ratios must be finite with `0 < low < high` (checked in `validate_for_workflow`)
+
 #### [NameScout] Section
 Name and terminology extraction configuration:
 - `chunk_size_chars`: Maximum characters (not bytes) per mapping scout chunk; chunks end at scene breaks where possible (default: "900", integer)
@@ -472,20 +480,24 @@ const REFUSAL_PHRASES: &[&str] = &[
    - Translate once with the shared retry logic below (no chunking); empty replies and refusals are retried
    - Return result (a reply kept with issues is logged as a warning), or `Err` once retries are exhausted
 
-**Content Translation** (`translate_content(text: &str, ctx: &PromptContext, progress_info: Option<ProgressInfo>) -> Result<Vec<ChunkResult>>`):
+**Content Translation** (`translate_content(text: &str, ctx: &PromptContext, known_names: &[String], progress_info: Option<ProgressInfo>) -> Result<Vec<ChunkResult>>`):
    - If the text is blank → return no chunks
+   - Split text into chunks using `split_text_into_chunks` (public, so callers can compare chunk sources) and translate them all with `translate_chunks`
+
+**Chunk Translation** (`translate_chunks(plan: Vec<ChunkPlan>, ctx: &PromptContext, known_names: &[String], progress_info: Option<ProgressInfo>) -> Result<Vec<(usize, ChunkResult)>>`), where `ChunkPlan` is `Translate(source)` or `Keep { source, output }`:
    - Render the system prompt once per chapter with `PromptContext::system_prompt(content_translation_prompt)`, so it is byte-identical for every chunk. Sections, in fixed order and separated by a blank line: the configured prompt; the English-only and ruby rules; the cast; the canonical glossary entries present in the name-substituted text (overrides first, then by vote count, capped at `glossary_max_entries`); the previous chapters' synopses. Empty sections are omitted
    - The cast is `NameMappingStore::cast_for_text(ruby::for_translation(raw_content), cast_max_entries)`: names whose original occurs in the chapter text before name substitution and that have a gender or a note, ordered by `count` descending then English name. It renders as `Characters in this chapter (use matching pronouns even where the Japanese omits the subject):` followed by one `- {english}: {gender}; {note}` line per entry (`- {english}: {gender}` or `- {english}: {note}` when one is missing)
    - The synopses are `SummaryStore::previous(chapter, summary_chapters)` (chapters `chapter - k` … `chapter - 1` that have a non-empty synopsis, oldest first), each passed through `NameMappingStore::normalize_renderings` so losing renderings of a name become the selected one. They render as `Story so far (context only; do not translate):` followed by one `- Ch {number}: {synopsis}` line per chapter
-   - Split text into chunks using `split_text_into_chunks`
-   - For each chunk, with the shared retry logic:
+   - `Keep` chunks are not sent: they enter the history as if just translated (a kept `[TRANSLATION FAILED]` chunk clears it, as a refusal does), so a re-translated chunk sees the same preceding context as in a full run
+   - For each `Translate` chunk, with the shared retry logic:
      - Display preparing status before API call
      - Call `translate_single_chunk` with progress info
-     - On success: append `ChunkResult { source, output, issues }`, where `source` is the exact chunk sent
+     - On success: produce `ChunkResult { source, output, issues }`, where `source` is the exact chunk sent; the result is returned with the chunk's index in the plan
      - On failure: retry up to `retries` times with exponential backoff; a refusal or empty reply clears history first
      - Reply cut off at the token limit (`finish_reason == "length"`) or still containing Chinese/Japanese characters: retry at once without adding it to history; on the last attempt keep it with a `truncated` / `foreign_script` issue
      - Refused on every attempt: output "[TRANSLATION FAILED]\n{original_chunk}" with a `failed` issue; other errors fail the chapter
-   - Callers write the outputs joined with "\n\n" and print one warning per issue (`Chapter N chunk i: kind — detail`)
+     - QA: run `qa::check_chunk` with `ChunkContext { source: chunk, glossary: ctx.glossary, known_names }` and append its issues, skipping kinds the translator already reported. While the latest attempt has an issue with `qa.retries_on(kind)` and fewer than `qa.max_retries` QA retries were made, send the chunk again with `qa::requirements(..)` prepended to the user turn (`{requirements}\n\nPassage:\n{chunk}`; the plain chunk when there are none). Failed attempts and requirements never enter the history. Keep the attempt with the lowest `qa::severity` (the later one on a tie); a QA retry that fails outright keeps the best earlier attempt. The history records the plain chunk and the kept reply
+   - Callers print one warning per issue (`Chapter N chunk i: kind — detail`, kind in snake_case)
 
 **Text Chunking Algorithm** (`utils::split_into_scene_chunks`, used by both `split_text_into_chunks` and the name scout):
 
@@ -964,8 +976,8 @@ For stories where chapter_list == "ONESHOT":
 5. **Translate Content**:
    - Check if `oneshot.txt` exists
    - If not:
-     - Apply name mapping to original content
-     - Call `translator.translate_content()` with progress info and write the chunk outputs joined with "\n\n"
+     - Render the translation input with `render_translation_input` (`ruby::for_translation` → name substitution → `mark_scene_breaks`)
+     - Call `translator.translate_content()` with the known English name renderings and progress info and write the chunk outputs joined with "\n\n"
      - Save as UTF-8
    - Display success/failure message
 

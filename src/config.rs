@@ -4,6 +4,7 @@
 //! platform-specific config directories.
 
 use crate::error::ConfigError;
+use crate::qa::QaConfig;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -41,6 +42,9 @@ pub struct Config {
     /// File paths.
     pub paths: PathsConfig,
 
+    /// Post-translation quality checks and QA retries (`[qa]`).
+    pub qa: QaConfig,
+
     /// Keys present in the config file that no setting reads, such as a misspelled
     /// section. Filled by [`Config::load_from`]; never written back to disk.
     #[serde(skip)]
@@ -57,6 +61,7 @@ impl Default for Config {
             scraping: ScrapingConfig::default(),
             prompts: PromptsConfig::default(),
             paths: PathsConfig::default(),
+            qa: QaConfig::default(),
             ignored_keys: Vec::new(),
         }
     }
@@ -399,6 +404,13 @@ impl Config {
             });
         }
 
+        self.qa
+            .validate()
+            .map_err(|message| ConfigError::InvalidValue {
+                key: "qa".to_string(),
+                message,
+            })?;
+
         Ok(())
     }
 
@@ -521,6 +533,30 @@ mod tests {
             config.translation.max_tokens_per_char = invalid;
             assert!(config.validate_with_options(false).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn test_qa_section_loads_and_is_validated() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            "[api]\nkey = \"real-key\"\n\n[qa]\nmax_retries = 2\nretry_on = [\"glossary\"]\nlength_ratio = [3.0, 2.0]\n",
+        )
+        .unwrap();
+
+        let mut config = Config::load_from(file.path()).unwrap();
+
+        assert!(config.ignored_keys.is_empty(), "{:?}", config.ignored_keys);
+        assert_eq!(config.qa.max_retries, 2);
+        assert_eq!(config.qa.retry_on, [crate::qa::IssueClass::Glossary]);
+        assert_eq!(
+            config.qa.paragraph_ratio,
+            QaConfig::default().paragraph_ratio
+        );
+        assert!(config.validate_with_options(false).is_err());
+
+        config.qa.length_ratio = [1.2, 4.0];
+        assert!(config.validate_with_options(false).is_ok());
     }
 
     #[test]

@@ -227,6 +227,7 @@ async fn main() -> Result<()> {
     let translator = Translator::new(
         config.api.clone(),
         config.translation.clone(),
+        config.qa.clone(),
         config.prompts.title_translation.clone(),
         config.prompts.content_translation.clone(),
     );
@@ -366,18 +367,18 @@ async fn process_oneshot(params: &mut ProcessParams<'_>) -> Result<()> {
     } else {
         params.console.step("Translating content...");
 
-        // Render ruby, apply name mapping, mark blank-line scene breaks, and
-        // collect canonical terms and the cast for this story.
-        let rendered = ruby::for_translation(&content);
-        let mapped_content = mark_scene_breaks(params.name_mapping.apply_to_text(&rendered));
+        // Render the translation input and collect canonical terms and the cast for
+        // this story.
+        let input = render_translation_input(params.name_mapping, &content);
         let prompt = chapter_prompt_context(
             params.name_mapping,
             params.summary_store,
             &params.config.translation,
             1,
-            &rendered,
-            &mapped_content,
+            &input.rendered,
+            &input.mapped,
         );
+        let mapped_content = input.mapped;
 
         let progress = ProgressInfo {
             chapter: 1,
@@ -387,9 +388,10 @@ async fn process_oneshot(params: &mut ProcessParams<'_>) -> Result<()> {
             reporter: None,
         };
 
+        let known_names = known_name_renderings(params.name_mapping);
         let chunks = params
             .translator
-            .translate_content(&mapped_content, &prompt, Some(progress))
+            .translate_content(&mapped_content, &prompt, &known_names, Some(progress))
             .await
             .context("Failed to translate content")?;
 
@@ -602,16 +604,16 @@ async fn translate_chapters(
             continue;
         }
 
-        let rendered = ruby::for_translation(&chapter_data.content);
-        let mapped_content = mark_scene_breaks(name_mapping.apply_to_text(&rendered));
+        let input = render_translation_input(name_mapping, &chapter_data.content);
         let prompt = chapter_prompt_context(
             name_mapping,
             summary_store,
             translation_config,
             chapter_data.number,
-            &rendered,
-            &mapped_content,
+            &input.rendered,
+            &input.mapped,
         );
+        let mapped_content = input.mapped;
         jobs.push(TranslationJob {
             number: chapter_data.number,
             title: chapter_data.title.clone(),
@@ -632,6 +634,8 @@ async fn translate_chapters(
         return Ok(());
     }
 
+    let known_names = known_name_renderings(name_mapping);
+    let known_names = known_names.as_slice();
     let (progress_tx, progress_rx) = mpsc::unbounded_channel();
     let progress_display = tokio::spawn(display_translation_stats(progress_rx, workers));
     let worker_ids = Arc::new(Mutex::new((1..=workers).rev().collect::<Vec<_>>()));
@@ -652,6 +656,7 @@ async fn translate_chapters(
                     let result = translate_chapter_job(
                         console,
                         translator,
+                        known_names,
                         job,
                         worker,
                         progress_tx.clone(),
@@ -691,12 +696,6 @@ async fn translate_chapters(
             console.clear_line();
             console.success(&format!("Saved: {}", chapter.filename));
             warn_chunk_issues(console, chapter.number, &chapter.chunks);
-            for miss in name_mapping.near_miss_names(&content) {
-                console.warning(&format!(
-                    "Chapter {}: `{}` ({}x) looks like a misspelling of `{}`",
-                    chapter.number, miss.found, miss.count, miss.expected
-                ));
-            }
         }
     }
 
@@ -729,6 +728,37 @@ fn chapter_prompt_context(
             .map(|(number, synopsis)| (number, name_mapping.normalize_renderings(&synopsis)))
             .collect(),
     }
+}
+
+/// Translation input rendered from original text.
+struct TranslationInput {
+    /// Ruby rendered for translation, before name substitution (what the cast is
+    /// matched against).
+    rendered: String,
+    /// Exactly what the translator is sent: `rendered` with names substituted and
+    /// blank-line scene breaks marked.
+    mapped: String,
+}
+
+/// Render original chapter text into the translation input: ruby rendered for
+/// translation, then names substituted and blank-line scene breaks marked.
+///
+/// Translation, one-shots and the `--recheck` stale and legacy checks all use it,
+/// so recorded chunk sources stay comparable with a fresh render.
+fn render_translation_input(name_mapping: &NameMappingStore, original: &str) -> TranslationInput {
+    let rendered = ruby::for_translation(original);
+    let mapped = mark_scene_breaks(name_mapping.apply_to_text(&rendered));
+    TranslationInput { rendered, mapped }
+}
+
+/// Selected English renderings of every known name, for the QA name checks.
+fn known_name_renderings(name_mapping: &NameMappingStore) -> Vec<String> {
+    name_mapping
+        .known_mappings()
+        .names
+        .into_iter()
+        .map(|entry| entry.english)
+        .collect()
 }
 
 fn report_chapter_ranges(console: &Console, chapters: &mut Vec<u32>, suffix: &str) {
@@ -806,6 +836,7 @@ fn format_chapter_range(start: u32, end: u32) -> String {
 async fn translate_chapter_job(
     console: &Console,
     translator: &Translator,
+    known_names: &[String],
     job: TranslationJob,
     worker: usize,
     progress_tx: mpsc::UnboundedSender<TranslationProgress>,
@@ -846,7 +877,7 @@ async fn translate_chapter_job(
     };
 
     let chunks = translator
-        .translate_content(&job.mapped_content, &job.prompt, Some(progress))
+        .translate_content(&job.mapped_content, &job.prompt, known_names, Some(progress))
         .await
         .with_context(|| format!("Failed to translate chapter {}", job.number))?;
 

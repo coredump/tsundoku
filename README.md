@@ -112,6 +112,32 @@ Each translation request sends `max_tokens = max(512, ceil(max_tokens_per_char �
 max_tokens_per_char = 2.0  # default
 ```
 
+#### Quality Checks
+
+Every translated chunk is checked against the text that was sent:
+
+| Class (`retry_on`, `--recheck`) | Issue | Rule |
+|---|---|---|
+| `failed` | `failed` | the model refused every attempt; the chunk holds `[TRANSLATION FAILED]` and the Japanese |
+| `truncated` | `truncated` | the reply stopped at the token limit |
+| `foreign` | `foreign_script` | Japanese or Chinese characters remain |
+| `glossary` | `glossary_missing` | a glossary term in the chunk is missing its English rendering |
+| `names` | `name_near_miss`, `name_missing` | a misspelled known name (`Tatyuya` for `Tatsuya`) whose correct spelling is in the chunk; a name in the chunk absent from the output (never retried: pronouns are fine) |
+| `paragraphs` | `paragraph_mismatch` | non-empty line count outside `paragraph_ratio` of the source's and off by at least 3 |
+| `length` | `length_ratio` | output characters ÷ source characters outside `length_ratio` |
+| `repetition` | `repetition` | a 4-word phrase more than 8 times, or the same line 4 times in a row |
+| `honorifics` | `honorific_on_noun` | reserved for honorific checks; never retried |
+
+When an issue in `retry_on` is found, the chunk is translated again (up to `max_retries` times, separate from `translation.retries`) with a note naming what to fix, such as `render 魔石 as "Magic Stone"`; the attempt with the fewest and least serious issues is kept. Issues that remain are printed after each chapter and saved in its chunk record, where `--recheck` can find them later.
+
+```toml
+[qa]
+max_retries = 1                                                   # default
+retry_on = ["truncated", "foreign", "glossary", "names", "repetition"]  # default
+paragraph_ratio = [0.85, 1.15]                                    # default
+length_ratio = [1.2, 4.0]                                         # default
+```
+
 ## Usage
 
 Download and translate a novel:
