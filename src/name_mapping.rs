@@ -536,6 +536,69 @@ pub struct CastEntry {
     pub note: Option<String>,
 }
 
+/// Find words in translated English that look like misspellings of `names`.
+///
+/// A capitalized word is a near miss when it is not itself a word of a name or
+/// of `terms` (English term renderings), nor such a word with a plural `s` ("the
+/// Yamadas"), starts with the same letter as a name of at least
+/// [`NEAR_MISS_MIN_NAME_CHARS`] letters, and is one edit away from it (two edits
+/// for names of eight letters or more). Results are sorted by the word found.
+pub fn near_miss_names_in<N, T>(translated: &str, names: &[N], terms: &[T]) -> Vec<NearMissName>
+where
+    N: AsRef<str>,
+    T: AsRef<str>,
+{
+    let name_chars: Vec<Vec<char>> = names
+        .iter()
+        .map(|name| name.as_ref().chars().collect())
+        .collect();
+    let known_words: HashSet<&str> = names
+        .iter()
+        .map(AsRef::as_ref)
+        .chain(terms.iter().map(AsRef::as_ref))
+        .flat_map(|english| english.split(|c: char| !is_latin_letter(c)))
+        .collect();
+
+    let mut found: BTreeMap<&str, (String, usize)> = BTreeMap::new();
+    for word in translated.split(|c: char| !is_latin_letter(c)) {
+        let is_plural_name = word
+            .strip_suffix('s')
+            .is_some_and(|stem| known_words.contains(stem));
+        if !word.starts_with(|c: char| c.is_uppercase())
+            || known_words.contains(word)
+            || is_plural_name
+        {
+            continue;
+        }
+        if let Some((_, count)) = found.get_mut(word) {
+            *count += 1;
+            continue;
+        }
+        let word_chars: Vec<char> = word.chars().collect();
+        let closest = name_chars
+            .iter()
+            .filter(|name| name.len() >= NEAR_MISS_MIN_NAME_CHARS && name[0] == word_chars[0])
+            .filter_map(|name| {
+                let allowed = if name.len() >= 8 { 2 } else { 1 };
+                let distance = edit_distance(&word_chars, name);
+                (distance <= allowed).then_some((distance, name))
+            })
+            .min();
+        if let Some((_, name)) = closest {
+            found.insert(word, (name.iter().collect(), 1));
+        }
+    }
+
+    found
+        .into_iter()
+        .map(|(word, (expected, count))| NearMissName {
+            found: word.to_string(),
+            expected,
+            count,
+        })
+        .collect()
+}
+
 /// Renderings already selected for names and terms, used to steer the scout.
 #[derive(Debug, Clone, Default)]
 pub struct KnownMappings {
@@ -1177,65 +1240,22 @@ impl NameMappingStore {
 
     /// Find words in translated English that look like misspellings of a known name.
     ///
-    /// A capitalized word is a near miss when it is not itself a known name or term
-    /// word, nor a known name with a plural `s` ("the Yamadas"), starts with the same
-    /// letter as a name of at least [`NEAR_MISS_MIN_NAME_CHARS`] letters, and is one
-    /// edit away from it (two edits for names of eight letters or more). Results are
-    /// sorted by the word found.
+    /// Checks against every selected name and term rendering; see
+    /// [`near_miss_names_in`] for the rule.
     pub fn near_miss_names(&self, translated: &str) -> Vec<NearMissName> {
-        let names: Vec<Vec<char>> = self
+        let names: Vec<&str> = self
             .data
             .names
             .values()
             .filter_map(|info| info.english.as_deref())
-            .map(|english| english.chars().collect())
             .collect();
-        let name_renderings = self.data.names.values().map(|info| info.english.as_deref());
-        let term_renderings = self.data.terms.values().map(|info| info.english.as_deref());
-        let known_words: HashSet<&str> = name_renderings
-            .chain(term_renderings)
-            .flatten()
-            .flat_map(|english| english.split(|c: char| !is_latin_letter(c)))
+        let terms: Vec<&str> = self
+            .data
+            .terms
+            .values()
+            .filter_map(|info| info.english.as_deref())
             .collect();
-
-        let mut found: BTreeMap<&str, (String, usize)> = BTreeMap::new();
-        for word in translated.split(|c: char| !is_latin_letter(c)) {
-            let is_plural_name = word
-                .strip_suffix('s')
-                .is_some_and(|stem| known_words.contains(stem));
-            if !word.starts_with(|c: char| c.is_uppercase())
-                || known_words.contains(word)
-                || is_plural_name
-            {
-                continue;
-            }
-            if let Some((_, count)) = found.get_mut(word) {
-                *count += 1;
-                continue;
-            }
-            let word_chars: Vec<char> = word.chars().collect();
-            let closest = names
-                .iter()
-                .filter(|name| name.len() >= NEAR_MISS_MIN_NAME_CHARS && name[0] == word_chars[0])
-                .filter_map(|name| {
-                    let allowed = if name.len() >= 8 { 2 } else { 1 };
-                    let distance = edit_distance(&word_chars, name);
-                    (distance <= allowed).then_some((distance, name))
-                })
-                .min();
-            if let Some((_, name)) = closest {
-                found.insert(word, (name.iter().collect(), 1));
-            }
-        }
-
-        found
-            .into_iter()
-            .map(|(word, (expected, count))| NearMissName {
-                found: word.to_string(),
-                expected,
-                count,
-            })
-            .collect()
+        near_miss_names_in(translated, &names, &terms)
     }
 
     /// Get the raw data (for testing/debugging).
