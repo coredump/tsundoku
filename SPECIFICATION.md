@@ -1040,6 +1040,8 @@ For stories with chapter list:
    - Print a summary at the end: chapters checked, re-translated whole and in part (and chunk count), legacy chapters recorded, and legacy chapters skipped for `stale`
    - Must not run while another process translates the same novel (both write the same files)
 
+7. **EPUB QA counts**: `tsundoku-epub` loads the record of every chapter of a volume and prints the issue counts per kind (`Vol. 01 QA: 3 glossary_missing, 2 name_near_miss`), noting chapters without a record; volumes without any record print nothing, and unreadable records are reported without stopping the build
+
 ### Filename Sanitization
 
 **Function**: `sanitize_filename(name)`
