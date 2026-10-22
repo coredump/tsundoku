@@ -228,13 +228,12 @@ client.get(url)
 3. Find content div:
    - Primary: `.p-novel__text.js-novel-text:not(.p-novel__text--preface):not(.p-novel__text--afterword)`
    - Fallback: `#novel_honbun`
-4. Remove ruby annotations:
-   - Find all `<ruby>` tags
-   - For each, find and decompose (remove) `<rt>` child tags
+4. Extract text with ruby kept (`ruby::html_text`):
+   - Each `<ruby>` becomes `｜{<rb> or bare base text}《{<rt>}》`; `<rp>` is skipped
 5. Extract text:
    - Find all `<p>` tags in content div
-   - If found: join with "\n"
-   - Else: use `get_text()` on entire div
+   - If found: join with "\n" (empty paragraphs stay as empty lines)
+   - Else: use the text of the entire div
 6. Return stripped text
 
 ### Kakuyomu Scraper (modules/kakuyomu.py)
@@ -274,8 +273,12 @@ let client = reqwest::Client::builder()
 3. Optional: Extract chapter title from `p.widget-episodeTitle`
 4. Find content: `div.widget-episodeBody`
 5. Find all `<p>` tags within content div
-6. Join paragraph texts with "\n"
-7. Return stripped text
+6. Extract each paragraph with `ruby::html_text` (ruby as `｜base《reading》`) and trim it;
+   blank paragraphs (`<p class="blank">`) are kept as empty lines so scene breaks survive
+7. Join paragraph texts with "\n" and return stripped text
+
+Kakuyomu originals saved before ruby support contain readings inlined as `base（reading）`;
+delete those `Original/*.txt` files to re-download them.
 
 ### Pixiv Scraper (modules/pixiv.py)
 
@@ -355,7 +358,7 @@ let client = reqwest::Client::builder()
 2. Make AJAX request to individual novel endpoint
 3. Extract title and content from response body
 4. Apply Unicode unescaping to content
-5. Return unescaped content
+5. Convert Pixiv markup with `ruby::canonicalize_markup` and return the result
 
 **AJAX Request Handling** (`_make_ajax_request`):
 1. Apply rate limiting delay (time.sleep)
@@ -402,6 +405,37 @@ fn unescape_unicode(text: &str) -> String {
 - Error handling is comprehensive with logging at each failure point
 - Rate limiting is applied before every AJAX request
 - Unicode escape sequences (e.g., `\u5dfb`) are common in Pixiv API responses
+
+### Ruby and Markup Normalisation (`ruby.rs`)
+
+Every scraper stores ruby in the canonical form `｜base《reading》` in `Original/*.txt`.
+
+**`canonicalize_markup(text)`** (idempotent, matches only these exact tag shapes, also
+normalises `\r\n` to `\n`):
+- `[[rb:B > R]]` → `｜B《R》` (a blank base becomes `｜《R》`)
+- `[[jumpuri:T > U]]` → `T`
+- `[chapter:T]` → `T` on its own line
+- `[newpage]` → an empty line
+- `[jump:N]`, `[pixivimage:…]`, `[uploadedimage:…]` → removed
+
+**Use-time rendering** (it runs on cached originals too, so older Pixiv originals need
+no migration):
+- Translation input: `ruby::for_translation` → name substitution → `mark_scene_breaks`.
+  This applies to chapter content, chapter titles and one-shot content. Each `｜B《R》`
+  is rendered as:
+
+  | Ruby kind | Rule | Rendered as |
+  |---|---|---|
+  | Blank base | B is empty or whitespace | `R` |
+  | Phonetic | R == B, or R is all hiragana and B contains kanji | `B` |
+  | Emphasis | R made only of `・﹅﹆ヽ` | `B` |
+  | Gloss | anything else | `B《R》` |
+
+  Bare `《…》` without `｜` is left alone. The translation prompt adds a rule that
+  `X《Y》` means Y written with X and must be translated as Y.
+- Name scout payload: `ruby::for_scout` keeps `｜B《R》`. The scout response contract
+  says to report `original` as X only and romanise from Y; name originals containing
+  `｜`, `《` or `》` are rejected.
 
 ## Translation System
 
@@ -1156,7 +1190,7 @@ Or use the `console` crate for a more feature-rich implementation.
 - URL pattern matching
 - Novel info extraction (multiple layouts)
 - Chapter list with pagination
-- Content extraction with ruby removal
+- Content extraction with ruby kept as `｜base《reading》`
 - One-shot detection
 
 **Pixiv-Specific**:
@@ -1495,7 +1529,7 @@ Key modules used:
 - [ ] CSS selector support (critical for all scrapers)
 - [ ] Element attribute access
 - [ ] Text extraction from elements
-- [ ] Element removal (ruby annotations)
+- [ ] Ruby extraction to `｜base《reading》`
 - [ ] Relative URL resolution (`url` crate)
 
 ### OpenAI API Client
@@ -1508,7 +1542,7 @@ Key modules used:
 - [ ] Trait-based scraper interface
 - [ ] Regex-based URL matching
 - [ ] Scraper registry with dynamic dispatch
-- [ ] Syosetu: pagination, ruby removal, one-shot detection
+- [ ] Syosetu: pagination, ruby extraction, one-shot detection
 - [ ] Kakuyomu: CSS class prefix matching
 - [ ] Pixiv: AJAX requests, JSON parsing, Unicode unescaping, series pagination
 

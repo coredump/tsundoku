@@ -5,6 +5,7 @@
 use super::{ChapterInfo, ChapterList, NovelInfo, Scraper, create_http_client, rate_limit};
 use crate::config::ScrapingConfig;
 use crate::error::ScraperError;
+use crate::ruby;
 use async_trait::async_trait;
 use regex::Regex;
 use scraper::{Html, Selector};
@@ -129,6 +130,31 @@ impl KakuyomuScraper {
 
         format!("https://kakuyomu.jp{}", relative)
     }
+
+    /// Extracts chapter text from an episode page.
+    ///
+    /// Ruby is kept as `｜base《reading》`, and blank paragraphs
+    /// (`<p class="blank">`) are kept as empty lines so scene breaks survive.
+    fn extract_content(&self, doc: &Html) -> Result<String, ScraperError> {
+        let content_elem = doc
+            .select(&self.selectors.content)
+            .next()
+            .ok_or_else(|| ScraperError::ElementNotFound("chapter content".to_string()))?;
+
+        let paragraphs: Vec<String> = content_elem
+            .select(&self.selectors.paragraph)
+            .map(|p| ruby::html_text(p).trim().to_string())
+            .collect();
+
+        let text = if paragraphs.is_empty() {
+            // Fall back to all text
+            ruby::html_text(content_elem)
+        } else {
+            paragraphs.join("\n")
+        };
+
+        Ok(text.trim().to_string())
+    }
 }
 
 #[async_trait]
@@ -192,33 +218,30 @@ impl Scraper for KakuyomuScraper {
 
     async fn download_chapter(&self, chapter_url: &str) -> Result<String, ScraperError> {
         let doc = self.fetch_page(chapter_url).await?;
-
-        // Find content div
-        let content_elem = doc
-            .select(&self.selectors.content)
-            .next()
-            .ok_or_else(|| ScraperError::ElementNotFound("chapter content".to_string()))?;
-
-        // Extract text from paragraphs
-        let paragraphs: Vec<String> = content_elem
-            .select(&self.selectors.paragraph)
-            .map(|p| p.text().collect::<String>().trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        if paragraphs.is_empty() {
-            // Fall back to all text
-            let text = content_elem.text().collect::<String>().trim().to_string();
-            return Ok(text);
-        }
-
-        Ok(paragraphs.join("\n"))
+        self.extract_content(&doc)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extract_content_keeps_ruby_and_blank_lines() {
+        let scraper = KakuyomuScraper::new(ScrapingConfig::default());
+        let doc = Html::parse_document(concat!(
+            r#"<html><body><div class="widget-episodeBody js-episode-body">"#,
+            r#"<p id="p1">　<ruby><rb>こんな奴</rb><rp>（</rp><rt>ルビのサンプル</rt><rp>）</rp></ruby>がいた。</p>"#,
+            r#"<p id="p2" class="blank"><br /></p>"#,
+            r#"<p id="p3">　次の場面。</p>"#,
+            r#"</div></body></html>"#,
+        ));
+
+        assert_eq!(
+            scraper.extract_content(&doc).unwrap(),
+            "｜こんな奴《ルビのサンプル》がいた。\n\n次の場面。"
+        );
+    }
 
     #[test]
     fn test_url_patterns() {

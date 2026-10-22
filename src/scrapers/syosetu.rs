@@ -5,6 +5,7 @@
 use super::{ChapterInfo, ChapterList, NovelInfo, Scraper, create_http_client, rate_limit};
 use crate::config::ScrapingConfig;
 use crate::error::ScraperError;
+use crate::ruby;
 use async_trait::async_trait;
 use regex::Regex;
 use scraper::{Html, Selector};
@@ -227,51 +228,25 @@ impl SyosetuScraper {
         // Get the inner HTML so we can manipulate it
         let inner_html = content_elem.inner_html();
 
-        // Parse the content to remove ruby annotations
+        // Re-parse the content so paragraphs can be selected within it
         let content_doc = Html::parse_fragment(&inner_html);
 
-        // Extract text from paragraphs, or all text if no paragraphs
+        // Extract text from paragraphs, or all text if no paragraphs; ruby is
+        // kept as `｜base《reading》`
         let paragraphs: Vec<String> = content_doc
             .select(&self.selectors.paragraph)
-            .map(|p| {
-                // Get text, excluding ruby readings and their fallback brackets
-                extract_text_without_ruby(p)
-            })
+            .map(ruby::html_text)
             .collect();
 
         let text = if paragraphs.is_empty() {
             // No paragraphs, get all text
-            extract_text_without_ruby(content_elem)
+            ruby::html_text(content_elem)
         } else {
             paragraphs.join("\n")
         };
 
         Ok(text.trim().to_string())
     }
-}
-
-/// Extracts text from an element, excluding ruby annotations.
-///
-/// Both the reading (`<rt>`) and the fallback brackets around it (`<rp>`, `《》` on
-/// Syosetu) are dropped, so `宮城《きゅうじょう》` becomes `宮城`.
-fn extract_text_without_ruby(elem: scraper::ElementRef) -> String {
-    let mut text = String::new();
-
-    for node in elem.descendants() {
-        if let scraper::node::Node::Text(t) = node.value() {
-            let in_annotation = node.ancestors().any(|ancestor| {
-                ancestor
-                    .value()
-                    .as_element()
-                    .is_some_and(|elem| matches!(elem.name(), "rt" | "rp"))
-            });
-            if !in_annotation {
-                text.push_str(t);
-            }
-        }
-    }
-
-    text
 }
 
 /// Resolves a relative URL against a base URL.
@@ -384,13 +359,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ruby_readings_and_brackets_are_dropped() {
+    fn test_ruby_is_kept_in_canonical_form() {
         let html = Html::parse_fragment(
             "<p>先に<ruby>宮城<rp>《</rp><rt>きゅうじょう</rt><rp>》</rp></ruby>へ行った。</p>",
         );
         let paragraph = html.select(&Selector::parse("p").unwrap()).next().unwrap();
 
-        assert_eq!(extract_text_without_ruby(paragraph), "先に宮城へ行った。");
+        let text = ruby::html_text(paragraph);
+        assert_eq!(text, "先に｜宮城《きゅうじょう》へ行った。");
+        assert_eq!(ruby::for_translation(&text), "先に宮城へ行った。");
     }
 
     #[test]

@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 /// Regex for detecting bad characters in original names.
-/// Names shouldn't contain punctuation, whitespace, or separators.
+/// Names shouldn't contain punctuation, whitespace, separators, or ruby markup.
 static BAD_ORIGINAL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[\s・･｡､,，。／/：:;!！?？\-—–‑·（）()［\]{}＜＞<>『』「」〈〉【】]")
+    Regex::new(r"[\s・･｡､,，。／/：:;!！?？\-—–‑·（）()［\]{}＜＞<>『』「」〈〉【】｜《》]")
         .expect("Invalid BAD_ORIGINAL_REGEX")
 });
 
@@ -1072,6 +1072,16 @@ mod tests {
                 english: "TanakaTaro".to_string(),
                 part: NamePart::Unknown,
             },
+            NameEntry {
+                original: "山田《やまだ》".to_string(), // Contains ruby markup
+                english: "Yamada".to_string(),
+                part: NamePart::Family,
+            },
+            NameEntry {
+                original: "｜山田".to_string(), // Contains ruby markup
+                english: "Yamada".to_string(),
+                part: NamePart::Family,
+            },
         ]);
 
         assert!(store.is_empty());
@@ -1155,6 +1165,16 @@ mod tests {
         let text = "田中太郎は学校に行った。";
         let result = store.apply_to_text(text);
         assert_eq!(result, "TanakaTaroは学校に行った。");
+    }
+
+    #[test]
+    fn test_names_apply_after_ruby_rendering() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut store = NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
+        store.record_votes(&[name("山田", "Yamada")]);
+
+        let rendered = crate::ruby::for_translation("｜山田《やまだ》さん");
+        assert_eq!(store.apply_to_text(&rendered), "Yamadaさん");
     }
 
     #[test]

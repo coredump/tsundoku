@@ -17,6 +17,9 @@ use tokio::sync::mpsc::UnboundedSender;
 /// Rule appended to every content translation prompt.
 const ENGLISH_ONLY_RULE: &str = "Write the translation entirely in English. Never output Chinese or Japanese characters; translate every word, including terms you would otherwise gloss in parentheses.";
 
+/// Rule explaining gloss ruby left in the source by [`crate::ruby::for_translation`].
+const RUBY_RULE: &str = "`X《Y》` is ruby: Y is the author's intended word written with X; translate it as Y (聖剣《エクスカリバー》 → Excalibur).";
+
 /// Progress information for display during translation.
 #[derive(Debug, Clone)]
 pub struct ProgressInfo {
@@ -260,19 +263,25 @@ impl Translator {
         }
     }
 
-    /// Build the content translation system prompt: the configured prompt, an
-    /// English-only rule, and canonical glossary entries.
+    /// Build the content translation system prompt: the configured prompt, the
+    /// English-only and ruby rules, and canonical glossary entries.
     fn content_prompt_with_glossary(&self, glossary: &[TermEntry]) -> String {
         let glossary_size: usize = glossary
             .iter()
             .map(|entry| entry.original.len() + entry.english.len() + 5)
             .sum();
         let mut prompt = String::with_capacity(
-            self.content_prompt.len() + ENGLISH_ONLY_RULE.len() + glossary_size + 134,
+            self.content_prompt.len()
+                + ENGLISH_ONLY_RULE.len()
+                + RUBY_RULE.len()
+                + glossary_size
+                + 135,
         );
         prompt.push_str(&self.content_prompt);
         prompt.push_str("\n\n");
         prompt.push_str(ENGLISH_ONLY_RULE);
+        prompt.push('\n');
+        prompt.push_str(RUBY_RULE);
         if glossary.is_empty() {
             return prompt;
         }
@@ -751,6 +760,7 @@ mod tests {
 
         assert!(prompt.contains("Use these canonical terminology renderings exactly"));
         assert!(prompt.contains("- 魔石 → Magic Stone"));
+        assert!(prompt.contains(RUBY_RULE));
     }
 
     #[test]

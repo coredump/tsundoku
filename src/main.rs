@@ -19,6 +19,7 @@ use tsundoku::name_scout::{
     NameScout, NameScoutEvent, NameScoutProgress, NameScoutStatus, ScoutChunk, ScoutProgressInfo,
     build_chapter_payload,
 };
+use tsundoku::ruby;
 use tsundoku::scrapers::{ChapterInfo, ChapterList, ScraperRegistry};
 use tsundoku::translator::{ProgressInfo, TranslationProgress, TranslationStage, Translator};
 use tsundoku::utils::{mark_scene_breaks, strip_chapter_number};
@@ -355,12 +356,17 @@ async fn process_oneshot(params: &mut ProcessParams<'_>) -> Result<()> {
     } else {
         params.console.step("Translating content...");
 
-        // Apply name mapping, mark blank-line scene breaks, and collect canonical
-        // terms for this story.
-        let mapped_content = mark_scene_breaks(params.name_mapping.apply_to_text(&content));
-        let glossary = params
-            .name_mapping
-            .glossary_for_text(&mapped_content, params.config.translation.glossary_max_entries);
+        // Render ruby, apply name mapping, mark blank-line scene breaks, and
+        // collect canonical terms for this story.
+        let mapped_content = mark_scene_breaks(
+            params
+                .name_mapping
+                .apply_to_text(&ruby::for_translation(&content)),
+        );
+        let glossary = params.name_mapping.glossary_for_text(
+            &mapped_content,
+            params.config.translation.glossary_max_entries,
+        );
 
         let progress = ProgressInfo {
             chapter: 1,
@@ -582,13 +588,15 @@ async fn translate_chapters(
             continue;
         }
 
-        let mapped_content = mark_scene_breaks(name_mapping.apply_to_text(&chapter_data.content));
+        let mapped_content = mark_scene_breaks(
+            name_mapping.apply_to_text(&ruby::for_translation(&chapter_data.content)),
+        );
         let glossary = name_mapping.glossary_for_text(&mapped_content, glossary_max_entries);
         jobs.push(TranslationJob {
             number: chapter_data.number,
             title: chapter_data.title.clone(),
             chapter_num_str,
-            mapped_title: name_mapping.apply_to_text(&chapter_data.title),
+            mapped_title: name_mapping.apply_to_text(&ruby::for_translation(&chapter_data.title)),
             mapped_content,
             glossary,
         });
@@ -1075,7 +1083,8 @@ async fn scout_chapter_job(
     worker: usize,
     progress_tx: mpsc::UnboundedSender<NameScoutEvent>,
 ) -> Result<ScoutedChapter> {
-    let payload = build_chapter_payload(number, title, content);
+    // Cached originals are canonicalised here too, so ruby reaches the scout as `｜B《R》`.
+    let payload = build_chapter_payload(number, title, &ruby::for_scout(content));
     let progress = ScoutProgressInfo {
         chapter: number,
         worker,

@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::config::ScrapingConfig;
 use crate::cookies::load_netscape_cookie_jar;
 use crate::error::ScraperError;
+use crate::ruby;
 use async_trait::async_trait;
 use regex::Regex;
 use reqwest::cookie::Jar;
@@ -504,7 +505,8 @@ impl Scraper for PixivScraper {
             .content
             .ok_or_else(|| ScraperError::NotFound("Novel content not found".to_string()))?;
 
-        Ok(unescape_unicode(&content))
+        // Pixiv tags become plain text with canonical `｜base《reading》` ruby.
+        Ok(ruby::canonicalize_markup(&unescape_unicode(&content)).into_owned())
     }
 }
 

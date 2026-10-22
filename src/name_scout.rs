@@ -23,7 +23,8 @@ static CODE_FENCE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 /// Response shape appended to every custom mapping scout prompt.
 const MAPPING_RESPONSE_CONTRACT: &str = r#"Return ONLY JSON with both arrays:
 {"names":[{"original":"<exact name characters>","part":"family|given|unknown","english":"<best English rendering>"}],"terms":[{"original":"<exact Japanese term>","english":"<canonical English rendering>"}]}
-Use empty arrays when no names or terms are found. Do not omit either key or add explanations."#;
+Use empty arrays when no names or terms are found. Do not omit either key or add explanations.
+`｜X《Y》` is ruby meaning X is read Y. Report `original` as X only and romanise from Y."#;
 
 fn format_translation_error(error: &TranslationError) -> String {
     match error {

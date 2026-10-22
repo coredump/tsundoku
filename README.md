@@ -143,6 +143,23 @@ matching file, and sends those cookies to Pixiv requests.
 4. **Translate**: Applies name mappings and translates content using LLM
 5. **Save**: Stores translated chapters as text files
 
+### Ruby (Furigana)
+
+Downloaded originals keep every ruby annotation as `｜base《reading》`, the
+notation Syosetu and Kakuyomu authors write by hand. Pixiv `[[rb:base > reading]]`
+tags are converted to the same form, and other Pixiv tags (`[newpage]`,
+`[chapter:…]`, `[[jumpuri:…]]`, `[jump:…]`, images) become plain text or are
+removed. Kakuyomu blank paragraphs are kept as empty lines so scene breaks survive.
+
+- The name scout sees every reading next to its base, which helps it romanise names.
+- The translator gets phonetic readings (hiragana on kanji) and emphasis dots
+  removed, blank-base ruby replaced by its reading, and gloss ruby such as
+  `聖剣《エクスカリバー》` kept so the intended word (Excalibur) is used.
+
+Kakuyomu originals downloaded by older versions contain readings inlined as
+`base（reading）`, which can't be undone safely. Delete those `Original/*.txt`
+files to re-download them with ruby; already translated chapters are unaffected.
+
 ### Resume Capability
 
 Tsundoku is fully resumable at every stage:
