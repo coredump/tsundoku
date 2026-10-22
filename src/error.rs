@@ -84,15 +84,6 @@ pub enum TranslationError {
     #[error("All retries exhausted after {attempts} attempts")]
     RetriesExhausted { attempts: u32 },
 
-    /// The translation still contains Chinese or Japanese characters.
-    #[error("Translation contains {count} Chinese or Japanese characters")]
-    ForeignScript {
-        /// The translated text as returned by the model.
-        text: String,
-        /// Number of kana and CJK ideographs found.
-        count: usize,
-    },
-
     /// Invalid API configuration
     #[error("Invalid API configuration: {0}")]
     InvalidConfig(String),

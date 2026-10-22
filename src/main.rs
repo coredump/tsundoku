@@ -21,7 +21,9 @@ use tsundoku::name_scout::{
 };
 use tsundoku::ruby;
 use tsundoku::scrapers::{ChapterInfo, ChapterList, ScraperRegistry};
-use tsundoku::translator::{ProgressInfo, TranslationProgress, TranslationStage, Translator};
+use tsundoku::translator::{
+    ChunkResult, ProgressInfo, PromptContext, TranslationProgress, TranslationStage, Translator,
+};
 use tsundoku::utils::{mark_scene_breaks, strip_chapter_number};
 
 const MAX_FILENAME_COMPONENT_BYTES: usize = 255;
@@ -363,10 +365,12 @@ async fn process_oneshot(params: &mut ProcessParams<'_>) -> Result<()> {
                 .name_mapping
                 .apply_to_text(&ruby::for_translation(&content)),
         );
-        let glossary = params.name_mapping.glossary_for_text(
-            &mapped_content,
-            params.config.translation.glossary_max_entries,
-        );
+        let prompt = PromptContext {
+            glossary: params.name_mapping.glossary_for_text(
+                &mapped_content,
+                params.config.translation.glossary_max_entries,
+            ),
+        };
 
         let progress = ProgressInfo {
             chapter: 1,
@@ -376,14 +380,15 @@ async fn process_oneshot(params: &mut ProcessParams<'_>) -> Result<()> {
             reporter: None,
         };
 
-        let translated = params
+        let chunks = params
             .translator
-            .translate(&mapped_content, false, &glossary, Some(progress))
+            .translate_content(&mapped_content, &prompt, Some(progress))
             .await
             .context("Failed to translate content")?;
 
-        std::fs::write(&translated_path, &translated)?;
+        std::fs::write(&translated_path, chapter_text(&chunks))?;
         params.console.success("Translation saved");
+        warn_chunk_issues(params.console, 1, &chunks);
     }
 
     Ok(())
@@ -591,14 +596,16 @@ async fn translate_chapters(
         let mapped_content = mark_scene_breaks(
             name_mapping.apply_to_text(&ruby::for_translation(&chapter_data.content)),
         );
-        let glossary = name_mapping.glossary_for_text(&mapped_content, glossary_max_entries);
+        let prompt = PromptContext {
+            glossary: name_mapping.glossary_for_text(&mapped_content, glossary_max_entries),
+        };
         jobs.push(TranslationJob {
             number: chapter_data.number,
             title: chapter_data.title.clone(),
             chapter_num_str,
             mapped_title: name_mapping.apply_to_text(&ruby::for_translation(&chapter_data.title)),
             mapped_content,
-            glossary,
+            prompt,
         });
     }
 
@@ -657,8 +664,9 @@ async fn translate_chapters(
         futures::pin_mut!(translated);
         while let Some(result) = translated.next().await {
             let chapter = result?;
+            let content = chapter_text(&chapter.chunks);
             let translated_path = story_dir.join(&chapter.filename);
-            std::fs::write(&translated_path, &chapter.content)?;
+            std::fs::write(&translated_path, &content)?;
             book.chapters.insert(
                 chapter.number,
                 ChapterMetadata {
@@ -669,7 +677,8 @@ async fn translate_chapters(
             book.save(story_dir)?;
             console.clear_line();
             console.success(&format!("Saved: {}", chapter.filename));
-            for miss in name_mapping.near_miss_names(&chapter.content) {
+            warn_chunk_issues(console, chapter.number, &chapter.chunks);
+            for miss in name_mapping.near_miss_names(&content) {
                 console.warning(&format!(
                     "Chapter {}: `{}` ({}x) looks like a misspelling of `{}`",
                     chapter.number, miss.found, miss.count, miss.expected
@@ -695,6 +704,30 @@ fn report_chapter_ranges(console: &Console, chapters: &mut Vec<u32>, suffix: &st
         suffix
     ));
     chapters.clear();
+}
+
+/// Join translated chunks into the chapter text written to disk.
+fn chapter_text(chunks: &[ChunkResult]) -> String {
+    chunks
+        .iter()
+        .map(|chunk| chunk.output.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Print one warning per issue a translated chunk was kept with.
+fn warn_chunk_issues(console: &Console, chapter: u32, chunks: &[ChunkResult]) {
+    for (index, chunk) in chunks.iter().enumerate() {
+        for issue in &chunk.issues {
+            console.warning(&format!(
+                "Chapter {} chunk {}: {:?} — {}",
+                chapter,
+                index + 1,
+                issue.kind,
+                issue.detail
+            ));
+        }
+    }
 }
 
 fn format_chapter_ranges(chapters: &[u32]) -> String {
@@ -760,7 +793,7 @@ async fn translate_chapter_job(
         format!("Chapter {}", job.number)
     } else {
         let translated_text = translator
-            .translate(title_text, true, &[], Some(title_progress))
+            .translate_title(title_text, Some(title_progress))
             .await
             .with_context(|| format!("Failed to translate title for chapter {}", job.number))?;
         format!("Chapter {}: {}", job.number, translated_text)
@@ -774,8 +807,8 @@ async fn translate_chapter_job(
         reporter: Some(progress_tx),
     };
 
-    let translated_content = translator
-        .translate(&job.mapped_content, false, &job.glossary, Some(progress))
+    let chunks = translator
+        .translate_content(&job.mapped_content, &job.prompt, Some(progress))
         .await
         .with_context(|| format!("Failed to translate chapter {}", job.number))?;
 
@@ -784,7 +817,7 @@ async fn translate_chapter_job(
         number: job.number,
         title: translated_title,
         original_title: job.title,
-        content: translated_content,
+        chunks,
     })
 }
 
@@ -794,7 +827,7 @@ struct TranslationJob {
     chapter_num_str: String,
     mapped_title: String,
     mapped_content: String,
-    glossary: Vec<tsundoku::name_mapping::TermEntry>,
+    prompt: PromptContext,
 }
 
 struct TranslatedChapter {
@@ -802,7 +835,7 @@ struct TranslatedChapter {
     number: u32,
     title: String,
     original_title: String,
-    content: String,
+    chunks: Vec<ChunkResult>,
 }
 
 #[derive(Debug, Clone)]
@@ -1341,7 +1374,7 @@ async fn find_or_create_folder(
 
     console.step("Translating title for folder name...");
     let translated_title = translator
-        .translate(original_title, true, &[], None)
+        .translate_title(original_title, None)
         .await
         .context("Failed to translate title for folder name")?;
 

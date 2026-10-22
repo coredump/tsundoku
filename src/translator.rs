@@ -7,6 +7,7 @@ use crate::config::{ApiConfig, TranslationConfig};
 use crate::console::Console;
 use crate::error::TranslationError;
 use crate::name_mapping::TermEntry;
+use crate::qa::{Issue, IssueKind};
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,153 @@ const ENGLISH_ONLY_RULE: &str = "Write the translation entirely in English. Neve
 
 /// Rule explaining gloss ruby left in the source by [`crate::ruby::for_translation`].
 const RUBY_RULE: &str = "`X《Y》` is ruby: Y is the author's intended word written with X; translate it as Y (聖剣《エクスカリバー》 → Excalibur).";
+
+/// Marker that precedes the untranslated source of a chunk the model refused.
+const FAILED_MARKER: &str = "[TRANSLATION FAILED]";
+
+/// Smallest `max_tokens` sent with a request, so short titles and chunks are never cut.
+const MIN_MAX_TOKENS: u32 = 512;
+
+/// `finish_reason` of a reply that stopped at the token limit.
+const FINISH_REASON_LENGTH: &str = "length";
+
+/// Sections of the content system prompt, in rendering order.
+#[derive(Debug, Clone, Copy)]
+enum PromptSection {
+    /// The configured content translation prompt.
+    Base,
+    /// The English-only and ruby rules.
+    Rules,
+    /// Canonical terminology renderings.
+    Glossary,
+}
+
+impl PromptSection {
+    /// Rendering order of the system prompt sections.
+    const ORDER: [PromptSection; 3] = [Self::Base, Self::Rules, Self::Glossary];
+}
+
+/// Chapter-level context rendered into the content translation system prompt.
+///
+/// Build it once per chapter: the rendered prompt is then byte-identical for every
+/// chunk, so the server can reuse its prompt cache.
+#[derive(Debug, Clone, Default)]
+pub struct PromptContext {
+    /// Canonical terminology present in the chapter, already capped at
+    /// `translation.glossary_max_entries`.
+    pub glossary: Vec<TermEntry>,
+}
+
+impl PromptContext {
+    /// Render the content system prompt: `base`, the English-only and ruby rules,
+    /// then the glossary. Sections are separated by a blank line; empty ones are
+    /// left out.
+    pub fn system_prompt(&self, base: &str) -> String {
+        let mut prompt = String::new();
+        for section in PromptSection::ORDER {
+            let section_start = prompt.len();
+            if !prompt.is_empty() {
+                prompt.push_str("\n\n");
+            }
+            let body_start = prompt.len();
+            self.render_section(section, base, &mut prompt);
+            if prompt.len() == body_start {
+                prompt.truncate(section_start);
+            }
+        }
+        prompt
+    }
+
+    /// Append one section's text to `out`; nothing when the section is empty.
+    fn render_section(&self, section: PromptSection, base: &str, out: &mut String) {
+        match section {
+            PromptSection::Base => out.push_str(base),
+            PromptSection::Rules => {
+                out.push_str(ENGLISH_ONLY_RULE);
+                out.push('\n');
+                out.push_str(RUBY_RULE);
+            }
+            PromptSection::Glossary => {
+                if self.glossary.is_empty() {
+                    return;
+                }
+                out.push_str(
+                    "Use these canonical terminology renderings exactly when the Japanese term appears:\n",
+                );
+                for entry in &self.glossary {
+                    out.push_str("- ");
+                    out.push_str(&entry.original);
+                    out.push_str(" → ");
+                    out.push_str(&entry.english);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+}
+
+/// One translated chunk of chapter content.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkResult {
+    /// The exact text sent to the model.
+    pub source: String,
+    /// The model's translation, or `[TRANSLATION FAILED]` and a newline followed by
+    /// `source` when every attempt was refused.
+    pub output: String,
+    /// Problems the output was kept with.
+    pub issues: Vec<Issue>,
+}
+
+/// A reply accepted by [`Translator::translate_with_retries`].
+struct AcceptedReply {
+    /// The translated text.
+    text: String,
+    /// Problems the reply was kept with on the last attempt.
+    issues: Vec<Issue>,
+}
+
+/// A streamed reply that passed the empty-reply and refusal checks.
+struct StreamedReply {
+    /// The trimmed reply text.
+    text: String,
+    /// The last non-null `finish_reason` seen in the stream.
+    finish_reason: Option<String>,
+}
+
+impl StreamedReply {
+    /// Problems that make this reply worth another attempt: truncation at the token
+    /// limit and leftover Chinese/Japanese characters.
+    fn issues(&self, max_tokens: Option<u32>) -> Vec<Issue> {
+        let mut issues = Vec::new();
+        if self.finish_reason.as_deref() == Some(FINISH_REASON_LENGTH) {
+            let detail = match max_tokens {
+                Some(limit) => format!("reply stopped at the {limit}-token limit"),
+                None => "reply stopped at the server's token limit".to_string(),
+            };
+            issues.push(Issue {
+                kind: IssueKind::Truncated,
+                detail,
+            });
+        }
+        let count = crate::utils::count_cjk_chars(&self.text);
+        if count > 0 {
+            issues.push(Issue {
+                kind: IssueKind::ForeignScript,
+                detail: format!("{count} Chinese/Japanese characters in the output"),
+            });
+        }
+        issues
+    }
+}
+
+/// Join issue details for a one-line console message.
+fn describe_issues(issues: &[Issue]) -> String {
+    issues
+        .iter()
+        .map(|issue| issue.detail.as_str())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
 
 /// Progress information for display during translation.
 #[derive(Debug, Clone)]
@@ -82,6 +230,9 @@ struct ChatRequest {
     model: String,
     messages: Vec<Message>,
     stream: bool,
+    /// Reply token limit; omitted when `translation.max_tokens_per_char` is 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 /// Response from the chat completions API (non-streaming).
@@ -100,6 +251,8 @@ struct Choice {
     delta: Option<Delta>,
     #[allow(dead_code)]
     index: u32,
+    /// Why generation stopped (`"stop"`, `"length"`); null until the last chunk.
+    finish_reason: Option<String>,
 }
 
 /// Message content in a non-streaming response.
@@ -156,147 +309,146 @@ impl Translator {
         }
     }
 
-    /// Translate text to English.
+    /// Translate a title with the title prompt, as one request without history.
     ///
-    /// # Arguments
-    /// * `text` - The Japanese text to translate.
-    /// * `is_title` - Whether this is a title (uses different prompt, no chunking).
-    /// * `glossary` - Canonical terminology entries to include for content translation.
-    /// * `progress_info` - Optional progress information for display.
-    ///
-    /// # Returns
-    /// The translated English text.
-    pub async fn translate(
+    /// A reply still truncated or containing Chinese/Japanese characters after the
+    /// last attempt is kept with a warning. Returns an empty string for blank input.
+    pub async fn translate_title(
         &self,
-        text: &str,
-        is_title: bool,
-        glossary: &[TermEntry],
+        title: &str,
         progress_info: Option<ProgressInfo>,
     ) -> Result<String, TranslationError> {
-        // Handle empty text
-        if text.trim().is_empty() {
+        if title.trim().is_empty() {
             return Ok(String::new());
         }
 
-        if is_title {
-            // Title translation: single chunk, no history needed
-            let snippet = if text.chars().count() > 30 {
-                let truncated: String = text.chars().take(30).collect();
-                format!("{}...", truncated)
-            } else {
-                text.to_string()
-            };
-            self.report_title_progress(progress_info.as_ref());
-            if progress_info
-                .as_ref()
-                .and_then(|info| info.reporter.as_ref())
-                .is_none()
-            {
-                self.console
-                    .info(&format!("Translating title 「{}」", snippet));
-            }
-
-            let mut history = vec![Message {
-                role: "system".to_string(),
-                content: self.title_prompt.clone(),
-            }];
-
-            let label = format!(
-                "Chapter {} title",
-                progress_info.as_ref().map_or(0, |p| p.chapter)
-            );
-            self.translate_with_retries(text, &mut history, progress_info, &label)
-                .await
+        let snippet = if title.chars().count() > 30 {
+            let truncated: String = title.chars().take(30).collect();
+            format!("{}...", truncated)
         } else {
-            // Content translation: chunk and translate with history
-            let chunks = self.split_text_into_chunks(text);
-            let total_chunks = chunks.len() as u32;
-            let mut results = Vec::new();
-            let mut history = vec![Message {
-                role: "system".to_string(),
-                content: self.content_prompt_with_glossary(glossary),
-            }];
-
-            for (i, chunk) in chunks.iter().enumerate() {
-                let chunk_num = (i + 1) as u32;
-                let progress = progress_info.as_ref().map(|p| ProgressInfo {
-                    chapter: p.chapter,
-                    chunk: chunk_num,
-                    total_chunks,
-                    worker: p.worker,
-                    reporter: p.reporter.clone(),
-                });
-
-                // Show "Preparing..." status before starting chunk (except first)
-                if i > 0 {
-                    self.display_preparing(progress.as_ref());
-                }
-
-                let label = format!(
-                    "Chapter {}, chunk {}",
-                    progress.as_ref().map_or(0, |p| p.chapter),
-                    chunk_num
-                );
-                match self
-                    .translate_with_retries(chunk, &mut history, progress, &label)
-                    .await
-                {
-                    Ok(translated) => results.push(translated),
-                    // Keep the source of a refused chunk so the rest of the chapter survives.
-                    Err(TranslationError::Refused(_)) => {
-                        results.push(format!("[TRANSLATION FAILED]\n{}", chunk));
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-
-            if progress_info
-                .as_ref()
-                .and_then(|info| info.reporter.as_ref())
-                .is_none()
-            {
-                print!("\r\x1b[2K");
-                let _ = io::stdout().flush();
-            }
-
-            Ok(results.join("\n\n"))
+            title.to_string()
+        };
+        self.report_title_progress(progress_info.as_ref());
+        if progress_info
+            .as_ref()
+            .and_then(|info| info.reporter.as_ref())
+            .is_none()
+        {
+            self.console
+                .info(&format!("Translating title 「{}」", snippet));
         }
+
+        let mut history = vec![Message {
+            role: "system".to_string(),
+            content: self.title_prompt.clone(),
+        }];
+
+        let label = format!(
+            "Chapter {} title",
+            progress_info.as_ref().map_or(0, |p| p.chapter)
+        );
+        let reply = self
+            .translate_with_retries(title, &mut history, progress_info, &label)
+            .await?;
+        if !reply.issues.is_empty() {
+            self.console.warning(&format!(
+                "{}: kept translation: {}",
+                label,
+                describe_issues(&reply.issues)
+            ));
+        }
+        Ok(reply.text)
     }
 
-    /// Build the content translation system prompt: the configured prompt, the
-    /// English-only and ruby rules, and canonical glossary entries.
-    fn content_prompt_with_glossary(&self, glossary: &[TermEntry]) -> String {
-        let glossary_size: usize = glossary
-            .iter()
-            .map(|entry| entry.original.len() + entry.english.len() + 5)
-            .sum();
-        let mut prompt = String::with_capacity(
-            self.content_prompt.len()
-                + ENGLISH_ONLY_RULE.len()
-                + RUBY_RULE.len()
-                + glossary_size
-                + 135,
-        );
-        prompt.push_str(&self.content_prompt);
-        prompt.push_str("\n\n");
-        prompt.push_str(ENGLISH_ONLY_RULE);
-        prompt.push('\n');
-        prompt.push_str(RUBY_RULE);
-        if glossary.is_empty() {
-            return prompt;
+    /// Translate chapter content chunk by chunk, keeping the last `history_length`
+    /// exchanges as context.
+    ///
+    /// The system prompt is rendered once from `ctx`, so it is identical for every
+    /// chunk. A chunk refused on every attempt becomes `[TRANSLATION FAILED]` and its
+    /// source, with an [`IssueKind::Failed`] issue, so the rest of the chapter
+    /// survives; other errors fail the whole call. Returns no chunks for blank input.
+    pub async fn translate_content(
+        &self,
+        text: &str,
+        ctx: &PromptContext,
+        progress_info: Option<ProgressInfo>,
+    ) -> Result<Vec<ChunkResult>, TranslationError> {
+        if text.trim().is_empty() {
+            return Ok(Vec::new());
         }
 
-        prompt.push_str(
-            "\n\nUse these canonical terminology renderings exactly when the Japanese term appears:\n",
-        );
-        for entry in glossary {
-            prompt.push_str("- ");
-            prompt.push_str(&entry.original);
-            prompt.push_str(" → ");
-            prompt.push_str(&entry.english);
-            prompt.push('\n');
+        let chunks = self.split_text_into_chunks(text);
+        let total_chunks = chunks.len() as u32;
+        let mut results = Vec::with_capacity(chunks.len());
+        let mut history = vec![Message {
+            role: "system".to_string(),
+            content: ctx.system_prompt(&self.content_prompt),
+        }];
+
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let chunk_num = (i + 1) as u32;
+            let progress = progress_info.as_ref().map(|p| ProgressInfo {
+                chapter: p.chapter,
+                chunk: chunk_num,
+                total_chunks,
+                worker: p.worker,
+                reporter: p.reporter.clone(),
+            });
+
+            // Show "Preparing..." status before starting chunk (except first)
+            if i > 0 {
+                self.display_preparing(progress.as_ref());
+            }
+
+            let label = format!(
+                "Chapter {}, chunk {}",
+                progress.as_ref().map_or(0, |p| p.chapter),
+                chunk_num
+            );
+            let result = match self
+                .translate_with_retries(&chunk, &mut history, progress, &label)
+                .await
+            {
+                Ok(reply) => ChunkResult {
+                    source: chunk,
+                    output: reply.text,
+                    issues: reply.issues,
+                },
+                Err(TranslationError::Refused(reason)) => ChunkResult {
+                    output: format!("{FAILED_MARKER}\n{chunk}"),
+                    source: chunk,
+                    issues: vec![Issue {
+                        kind: IssueKind::Failed,
+                        detail: reason,
+                    }],
+                },
+                Err(e) => return Err(e),
+            };
+            results.push(result);
         }
-        prompt
+
+        if progress_info
+            .as_ref()
+            .and_then(|info| info.reporter.as_ref())
+            .is_none()
+        {
+            print!("\r\x1b[2K");
+            let _ = io::stdout().flush();
+        }
+
+        Ok(results)
+    }
+
+    /// `max_tokens` for a request translating `text`: `max_tokens_per_char` × its
+    /// character count, at least [`MIN_MAX_TOKENS`]; `None` when the factor is 0.
+    fn max_tokens_for(&self, text: &str) -> Option<u32> {
+        let per_char = self.translation_config.max_tokens_per_char;
+        if per_char <= 0.0 {
+            return None;
+        }
+        // `as` saturates, so an absurd factor cannot wrap around.
+        let tokens = (per_char * text.chars().count() as f64).ceil() as u32;
+        Some(tokens.max(MIN_MAX_TOKENS))
     }
 
     /// Split text into chunks of at most `chunk_size_chars` characters, preferring
@@ -307,48 +459,48 @@ impl Translator {
 
     /// Translate one request, retrying up to the configured number of attempts.
     ///
-    /// A reply that still contains Chinese/Japanese characters on the last attempt is
-    /// kept with a warning. A refusal (including an empty reply) clears the conversation
-    /// history before the next attempt and is returned as-is once attempts run out; any
-    /// other failure becomes [`TranslationError::RetriesExhausted`].
+    /// A reply cut at the token limit or containing Chinese/Japanese characters is
+    /// retried at once without entering the history; on the last attempt it is kept
+    /// and its problems are returned as issues. A refusal (including an empty reply)
+    /// clears the conversation history before the next attempt and is returned as-is
+    /// once attempts run out; any other failure becomes
+    /// [`TranslationError::RetriesExhausted`].
     async fn translate_with_retries(
         &self,
         text: &str,
         history: &mut Vec<Message>,
         progress: Option<ProgressInfo>,
         label: &str,
-    ) -> Result<String, TranslationError> {
+    ) -> Result<AcceptedReply, TranslationError> {
         let attempts = self.translation_config.retries.max(1);
+        let max_tokens = self.max_tokens_for(text);
         let mut attempt = 0;
         loop {
             attempt += 1;
             let error = match self
-                .translate_single_chunk(text, history, progress.clone())
+                .translate_single_chunk(text, history, max_tokens, progress.clone())
                 .await
             {
-                Ok(translated) => return Ok(translated),
-                Err(TranslationError::ForeignScript {
-                    text: translated,
-                    count,
-                }) => {
-                    if attempt < attempts {
+                Ok(reply) => {
+                    let issues = reply.issues(max_tokens);
+                    if !issues.is_empty() && attempt < attempts {
                         self.console.warning(&format!(
-                            "{}: translation contains {} Chinese/Japanese characters; retrying (attempt {}/{})",
+                            "{}: {}; retrying (attempt {}/{})",
                             label,
-                            count,
+                            describe_issues(&issues),
                             attempt + 1,
                             attempts
                         ));
                         continue;
                     }
                     // Keep the last attempt rather than abort the chapter over a
-                    // stray word; the warning lets the reader find it.
-                    self.console.warning(&format!(
-                        "{}: kept translation with {} Chinese/Japanese characters after {} attempts",
-                        label, count, attempt
-                    ));
-                    self.record_exchange(history, text, &translated);
-                    return Ok(translated);
+                    // stray word or a cut-off ending; the issues let callers flag it.
+                    self.record_exchange(history, text, &reply.text);
+                    self.delay_between_requests().await;
+                    return Ok(AcceptedReply {
+                        text: reply.text,
+                        issues,
+                    });
                 }
                 Err(e) => e,
             };
@@ -384,15 +536,19 @@ impl Translator {
         }
     }
 
-    /// Translate a single chunk of text.
+    /// Send one request and stream the reply.
+    ///
+    /// Empty replies and refusals become [`TranslationError::Refused`]; the history is
+    /// not modified.
     async fn translate_single_chunk(
         &self,
         chunk: &str,
-        history: &mut Vec<Message>,
+        history: &[Message],
+        max_tokens: Option<u32>,
         progress_info: Option<ProgressInfo>,
-    ) -> Result<String, TranslationError> {
+    ) -> Result<StreamedReply, TranslationError> {
         // Add user message to history for this request
-        let mut messages = history.clone();
+        let mut messages = history.to_vec();
         messages.push(Message {
             role: "user".to_string(),
             content: chunk.to_string(),
@@ -403,6 +559,7 @@ impl Translator {
             model: self.api_config.model.clone(),
             messages,
             stream: true,
+            max_tokens,
         };
 
         // Make streaming request
@@ -426,6 +583,7 @@ impl Translator {
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
         let mut done = false;
+        let mut finish_reason = None;
 
         'streaming: loop {
             let chunk_result = stream.next().await;
@@ -464,6 +622,9 @@ impl Translator {
                 // Try to parse as JSON
                 if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
                     for choice in chunk.choices {
+                        if choice.finish_reason.is_some() {
+                            finish_reason = choice.finish_reason;
+                        }
                         if let Some(delta) = choice.delta
                             && let Some(content) = delta.content
                         {
@@ -509,25 +670,20 @@ impl Translator {
             ));
         }
 
-        let count = crate::utils::count_cjk_chars(&trimmed);
-        if count > 0 {
-            return Err(TranslationError::ForeignScript {
-                text: trimmed,
-                count,
-            });
-        }
+        Ok(StreamedReply {
+            text: trimmed,
+            finish_reason,
+        })
+    }
 
-        self.record_exchange(history, chunk, &trimmed);
-
-        // Delay before next request
+    /// Wait `delay_between_requests_sec` after an accepted reply.
+    async fn delay_between_requests(&self) {
         if self.translation_config.delay_between_requests_sec > 0.0 {
             tokio::time::sleep(Duration::from_secs_f64(
                 self.translation_config.delay_between_requests_sec,
             ))
             .await;
         }
-
-        Ok(trimmed)
     }
 
     /// Append a translated chunk to the history, keeping the system message and
@@ -669,28 +825,6 @@ impl Translator {
     }
 }
 
-/// Translate text without a persistent Translator instance (convenience function).
-pub async fn translate_text(
-    text: &str,
-    is_title: bool,
-    glossary: &[TermEntry],
-    api_config: &ApiConfig,
-    translation_config: &TranslationConfig,
-    title_prompt: &str,
-    content_prompt: &str,
-    progress_info: Option<ProgressInfo>,
-) -> Result<String, TranslationError> {
-    let translator = Translator::new(
-        api_config.clone(),
-        translation_config.clone(),
-        title_prompt.to_string(),
-        content_prompt.to_string(),
-    );
-    translator
-        .translate(text, is_title, glossary, progress_info)
-        .await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,18 +848,31 @@ mod tests {
     }
 
     #[test]
-    fn test_content_prompt_includes_canonical_glossary() {
-        let translator = make_translator();
-        let glossary = [TermEntry {
-            original: "魔石".to_string(),
-            english: "Magic Stone".to_string(),
-        }];
+    fn test_system_prompt_orders_sections_and_includes_glossary() {
+        let ctx = PromptContext {
+            glossary: vec![TermEntry {
+                original: "魔石".to_string(),
+                english: "Magic Stone".to_string(),
+            }],
+        };
 
-        let prompt = translator.content_prompt_with_glossary(&glossary);
+        let prompt = ctx.system_prompt("Translate this content");
 
-        assert!(prompt.contains("Use these canonical terminology renderings exactly"));
-        assert!(prompt.contains("- 魔石 → Magic Stone"));
-        assert!(prompt.contains(RUBY_RULE));
+        let rules = prompt.find(ENGLISH_ONLY_RULE).unwrap();
+        let ruby = prompt.find(RUBY_RULE).unwrap();
+        let glossary = prompt
+            .find("Use these canonical terminology renderings exactly")
+            .unwrap();
+        assert!(prompt.starts_with("Translate this content\n\n"));
+        assert!(rules < ruby && ruby < glossary);
+        assert!(prompt.ends_with("- 魔石 → Magic Stone\n"));
+    }
+
+    #[test]
+    fn test_system_prompt_without_glossary_ends_with_rules() {
+        let prompt = PromptContext::default().system_prompt("Base");
+
+        assert_eq!(prompt, format!("Base\n\n{ENGLISH_ONLY_RULE}\n{RUBY_RULE}"));
     }
 
     #[test]
@@ -826,8 +973,11 @@ mod tests {
     }
 
     /// Serve one streamed completion per connection, returning the request bodies.
-    fn serve_streamed_replies(
-        replies: &'static [&'static str],
+    ///
+    /// Each reply is sent as a content event followed, when given, by a final event
+    /// carrying only its `finish_reason`, as OpenAI-compatible servers stream it.
+    fn serve_replies(
+        replies: Vec<(&'static str, Option<&'static str>)>,
     ) -> (String, std::thread::JoinHandle<Vec<serde_json::Value>>) {
         use std::io::{BufRead, BufReader, Read, Write};
 
@@ -835,7 +985,7 @@ mod tests {
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let mut bodies = Vec::new();
-            for reply in replies {
+            for (reply, finish_reason) in replies {
                 let (mut socket, _) = listener.accept().unwrap();
                 let mut reader = BufReader::new(socket.try_clone().unwrap());
                 let mut content_length = 0;
@@ -853,10 +1003,15 @@ mod tests {
                 reader.read_exact(&mut body).unwrap();
                 bodies.push(serde_json::from_slice(&body).unwrap());
 
-                let event = serde_json::json!({ "choices": [{ "index": 0, "delta": { "content": reply } }] });
+                let content = serde_json::json!({ "choices": [{ "index": 0, "delta": { "content": reply }, "finish_reason": null }] });
+                let mut events = format!("data: {content}\n\n");
+                if let Some(finish_reason) = finish_reason {
+                    let last = serde_json::json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }] });
+                    events.push_str(&format!("data: {last}\n\n"));
+                }
                 write!(
                     socket,
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {event}\n\ndata: [DONE]\n\n"
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{events}data: [DONE]\n\n"
                 )
                 .unwrap();
             }
@@ -865,20 +1020,49 @@ mod tests {
         (base_url, server)
     }
 
-    fn translator_for(base_url: String, retries: u32) -> Translator {
+    /// Serve replies that each finish normally (`"stop"`).
+    fn serve_streamed_replies(
+        replies: &'static [&'static str],
+    ) -> (String, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+        serve_replies(replies.iter().map(|reply| (*reply, Some("stop"))).collect())
+    }
+
+    fn translator_with(base_url: String, translation_config: TranslationConfig) -> Translator {
         Translator::new(
             ApiConfig {
                 base_url,
                 ..ApiConfig::default()
             },
             TranslationConfig {
-                retries,
                 delay_between_requests_sec: 0.0,
-                ..TranslationConfig::default()
+                ..translation_config
             },
             "Translate this title".to_string(),
             "Translate this content".to_string(),
         )
+    }
+
+    fn translator_for(base_url: String, retries: u32) -> Translator {
+        translator_with(
+            base_url,
+            TranslationConfig {
+                retries,
+                ..TranslationConfig::default()
+            },
+        )
+    }
+
+    fn roles(body: &serde_json::Value) -> Vec<&str> {
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect()
+    }
+
+    fn kinds(chunk: &ChunkResult) -> Vec<IssueKind> {
+        chunk.issues.iter().map(|issue| issue.kind).collect()
     }
 
     #[tokio::test]
@@ -887,18 +1071,18 @@ mod tests {
             serve_streamed_replies(&["He was a 杀人狂 (murderer).", "He was a murderer."]);
         let translator = translator_for(base_url, 3);
 
-        let translated = translator.translate("彼は殺人鬼だった。", false, &[], None).await.unwrap();
+        let chunks = translator
+            .translate_content("彼は殺人鬼だった。", &PromptContext::default(), None)
+            .await
+            .unwrap();
         let bodies = server.join().unwrap();
 
-        assert_eq!(translated, "He was a murderer.");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].source, "彼は殺人鬼だった。");
+        assert_eq!(chunks[0].output, "He was a murderer.");
+        assert!(chunks[0].issues.is_empty());
         assert_eq!(bodies.len(), 2);
-        let retry_roles: Vec<_> = bodies[1]["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|message| message["role"].as_str().unwrap())
-            .collect();
-        assert_eq!(retry_roles, ["system", "user"]);
+        assert_eq!(roles(&bodies[1]), ["system", "user"]);
     }
 
     #[tokio::test]
@@ -906,10 +1090,14 @@ mod tests {
         let (base_url, server) = serve_streamed_replies(&["A 杀人狂.", "Another 杀人狂."]);
         let translator = translator_for(base_url, 2);
 
-        let translated = translator.translate("殺人鬼。", false, &[], None).await.unwrap();
+        let chunks = translator
+            .translate_content("殺人鬼。", &PromptContext::default(), None)
+            .await
+            .unwrap();
         server.join().unwrap();
 
-        assert_eq!(translated, "Another 杀人狂.");
+        assert_eq!(chunks[0].output, "Another 杀人狂.");
+        assert_eq!(kinds(&chunks[0]), [IssueKind::ForeignScript]);
     }
 
     #[tokio::test]
@@ -917,10 +1105,133 @@ mod tests {
         let (base_url, server) = serve_streamed_replies(&["", "Starting to Move"]);
         let translator = translator_for(base_url, 3);
 
-        let translated = translator.translate("動き出す", true, &[], None).await.unwrap();
+        let translated = translator.translate_title("動き出す", None).await.unwrap();
         let bodies = server.join().unwrap();
 
         assert_eq!(translated, "Starting to Move");
         assert_eq!(bodies.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_refused_chunk_keeps_source_with_failed_issue() {
+        let (base_url, server) = serve_streamed_replies(&[""]);
+        let translator = translator_for(base_url, 1);
+
+        let chunks = translator
+            .translate_content("原文。", &PromptContext::default(), None)
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(chunks[0].output, "[TRANSLATION FAILED]\n原文。");
+        assert_eq!(kinds(&chunks[0]), [IssueKind::Failed]);
+    }
+
+    #[tokio::test]
+    async fn test_requests_carry_max_tokens_from_source_length() {
+        let (base_url, server) = serve_streamed_replies(&["A title", "Ah."]);
+        let translator = translator_for(base_url, 1);
+        let content = "あ".repeat(300);
+
+        translator.translate_title("題", None).await.unwrap();
+        translator
+            .translate_content(&content, &PromptContext::default(), None)
+            .await
+            .unwrap();
+        let bodies = server.join().unwrap();
+
+        // Titles get the floor; 300 chars × 2.0 = 600 tokens.
+        assert_eq!(bodies[0]["max_tokens"], MIN_MAX_TOKENS);
+        assert_eq!(bodies[1]["max_tokens"], 600);
+    }
+
+    #[tokio::test]
+    async fn test_zero_max_tokens_per_char_omits_max_tokens() {
+        let (base_url, server) = serve_streamed_replies(&["Ah."]);
+        let translator = translator_with(
+            base_url,
+            TranslationConfig {
+                max_tokens_per_char: 0.0,
+                ..TranslationConfig::default()
+            },
+        );
+
+        translator
+            .translate_content("あ", &PromptContext::default(), None)
+            .await
+            .unwrap();
+        let bodies = server.join().unwrap();
+
+        assert!(bodies[0].get("max_tokens").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_truncated_reply_is_retried_without_polluting_history() {
+        let (base_url, server) = serve_replies(vec![
+            ("He was", Some("length")),
+            ("He was a murderer.", Some("stop")),
+        ]);
+        let translator = translator_for(base_url, 3);
+
+        let chunks = translator
+            .translate_content("彼は殺人鬼だった。", &PromptContext::default(), None)
+            .await
+            .unwrap();
+        let bodies = server.join().unwrap();
+
+        assert_eq!(chunks[0].output, "He was a murderer.");
+        assert!(chunks[0].issues.is_empty());
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(roles(&bodies[1]), ["system", "user"]);
+    }
+
+    #[tokio::test]
+    async fn test_persistent_truncation_is_kept_as_truncated_issue() {
+        let (base_url, server) =
+            serve_replies(vec![("He", Some("length")), ("He was", Some("length"))]);
+        let translator = translator_for(base_url, 2);
+
+        let chunks = translator
+            .translate_content("彼は殺人鬼だった。", &PromptContext::default(), None)
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(chunks[0].output, "He was");
+        assert_eq!(kinds(&chunks[0]), [IssueKind::Truncated]);
+    }
+
+    #[tokio::test]
+    async fn test_system_prompt_is_identical_across_chunks() {
+        let text = "一二三四五六七八\n九十一二三四五六";
+        let (base_url, server) = serve_streamed_replies(&["One.", "Two."]);
+        let translator = translator_with(
+            base_url,
+            TranslationConfig {
+                chunk_size_chars: 10,
+                ..TranslationConfig::default()
+            },
+        );
+        assert_eq!(translator.split_text_into_chunks(text).len(), 2);
+        let ctx = PromptContext {
+            glossary: vec![TermEntry {
+                original: "魔石".to_string(),
+                english: "Magic Stone".to_string(),
+            }],
+        };
+
+        let chunks = translator
+            .translate_content(text, &ctx, None)
+            .await
+            .unwrap();
+        let bodies = server.join().unwrap();
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(roles(&bodies[1]), ["system", "user", "assistant", "user"]);
+        assert_eq!(bodies[0]["messages"][0], bodies[1]["messages"][0]);
+        assert_eq!(
+            bodies[0]["messages"][0]["content"],
+            ctx.system_prompt("Translate this content")
+        );
     }
 }

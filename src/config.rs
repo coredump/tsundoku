@@ -115,6 +115,12 @@ pub struct TranslationConfig {
     /// Set to zero to disable glossary injection.
     pub glossary_max_entries: usize,
 
+    /// Reply token limit per source character: each request sends
+    /// `max_tokens = max(512, ceil(max_tokens_per_char × characters))`.
+    ///
+    /// Set to zero to send no `max_tokens`.
+    pub max_tokens_per_char: f64,
+
     /// Number of chapters to translate concurrently.
     pub workers: usize,
 }
@@ -127,6 +133,7 @@ impl Default for TranslationConfig {
             delay_between_requests_sec: 1.0,
             history_length: 5,
             glossary_max_entries: 100,
+            max_tokens_per_char: 2.0,
             workers: 1,
         }
     }
@@ -351,6 +358,15 @@ impl Config {
             });
         }
 
+        let max_tokens_per_char = self.translation.max_tokens_per_char;
+        if !max_tokens_per_char.is_finite() || max_tokens_per_char < 0.0 {
+            return Err(ConfigError::InvalidValue {
+                key: "translation.max_tokens_per_char".to_string(),
+                message: "must be a finite number of at least 0 (0 disables max_tokens)"
+                    .to_string(),
+            });
+        }
+
         if self.name_scout.chunk_size_chars == 0 {
             return Err(ConfigError::InvalidValue {
                 key: "name_scout.chunk_size_chars".to_string(),
@@ -472,6 +488,21 @@ mod tests {
         let mut config = Config::default();
         config.api.key = "real-key".to_string();
         assert!(config.validate_with_options(false).is_ok());
+    }
+
+    #[test]
+    fn test_max_tokens_per_char_validation() {
+        let mut config = Config::default();
+        config.api.key = "real-key".to_string();
+        assert_eq!(config.translation.max_tokens_per_char, 2.0);
+
+        config.translation.max_tokens_per_char = 0.0;
+        assert!(config.validate_with_options(false).is_ok());
+
+        for invalid in [-1.0, f64::NAN, f64::INFINITY] {
+            config.translation.max_tokens_per_char = invalid;
+            assert!(config.validate_with_options(false).is_err(), "{invalid}");
+        }
     }
 
     #[test]

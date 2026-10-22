@@ -89,6 +89,7 @@ Translation behavior configuration:
 - `delay_between_requests_sec`: Delay between API requests (default: "1", float)
 - `history_length`: Number of message pairs to retain in conversation history (default: "5", integer)
 - `glossary_max_entries`: Maximum canonical glossary entries injected into a chapter translation prompt; `0` disables injection (default: "100", integer)
+- `max_tokens_per_char`: Reply token limit per source character; each request sends `max_tokens = max(512, ceil(max_tokens_per_char × characters))` and `0` sends none. Must be finite and at least 0 (default: "2.0", float)
 
 #### [NameScout] Section
 Name and terminology extraction configuration:
@@ -461,30 +462,25 @@ const REFUSAL_PHRASES: &[&str] = &[
 ];
 ```
 
-**Translation Method** (`translate(text: &str, is_title: bool, glossary: &[TermEntry], progress_info: Option<ProgressInfo>) -> Result<String>`):
-
-1. **Empty Text Handling**:
-   - If text is empty → return empty string immediately
-
-2. **Title Translation** (is_title=True):
+**Title Translation** (`translate_title(title: &str, progress_info: Option<ProgressInfo>) -> Result<String>`):
+   - If the title is blank → return an empty string immediately
    - Initialize message history with title_translation_prompt as system message
    - Display: "Translating title 「{snippet}...」"
    - Translate once with the shared retry logic below (no chunking); empty replies and refusals are retried
-   - Return result, or `Err` once retries are exhausted
+   - Return result (a reply kept with issues is logged as a warning), or `Err` once retries are exhausted
 
-3. **Content Translation** (is_title=False):
-   - Add canonical glossary entries present in the name-substituted text to content_translation_prompt, overrides first, then by vote count
-   - Initialize message history with that system message
+**Content Translation** (`translate_content(text: &str, ctx: &PromptContext, progress_info: Option<ProgressInfo>) -> Result<Vec<ChunkResult>>`):
+   - If the text is blank → return no chunks
+   - Render the system prompt once per chapter with `PromptContext::system_prompt(content_translation_prompt)`, so it is byte-identical for every chunk. Sections, in fixed order and separated by a blank line: the configured prompt; the English-only and ruby rules; the canonical glossary entries present in the name-substituted text (overrides first, then by vote count, capped at `glossary_max_entries`), omitted when empty
    - Split text into chunks using `split_text_into_chunks`
    - For each chunk, with the shared retry logic:
      - Display preparing status before API call
-     - Call `_translate_single_chunk` with progress info
-     - On success: append to results
+     - Call `translate_single_chunk` with progress info
+     - On success: append `ChunkResult { source, output, issues }`, where `source` is the exact chunk sent
      - On failure: retry up to `retries` times with exponential backoff; a refusal or empty reply clears history first
-     - Reply still containing Chinese/Japanese characters on the last attempt: keep it with a warning
-     - Refused on every attempt: append "[TRANSLATION FAILED]\n{original_chunk}"; other errors fail the chapter
-   - Join translated chunks with "\n\n"
-   - Return result
+     - Reply cut off at the token limit (`finish_reason == "length"`) or still containing Chinese/Japanese characters: retry at once without adding it to history; on the last attempt keep it with a `truncated` / `foreign_script` issue
+     - Refused on every attempt: output "[TRANSLATION FAILED]\n{original_chunk}" with a `failed` issue; other errors fail the chapter
+   - Callers write the outputs joined with "\n\n" and print one warning per issue (`Chapter N chunk i: kind — detail`)
 
 **Text Chunking Algorithm** (`utils::split_into_scene_chunks`, used by both `split_text_into_chunks` and the name scout):
 
@@ -496,7 +492,7 @@ Sizes are counted in characters (`chars().count()`); a chunk's size includes the
 4. A line longer than `chunk_size_chars` becomes its own chunk(s): it is split into sentences after a run of `。！？!?」』` that is followed by more text (any sentence still too long is cut into equal character pieces) and the sentences are grouped the same balanced way. Splits never fall inside a UTF-8 character.
 5. Joining all chunks with `"\n"` gives back the input lines, blank lines included; only an over-long line is spread over several chunks.
 
-**Single Chunk Translation** (`translate_single_chunk`):
+**Single Chunk Translation** (`translate_single_chunk`), one streaming request with `max_tokens = max(512, ceil(max_tokens_per_char × chunk characters))` (omitted when the factor is 0); the last non-null `finish_reason` in the stream is kept:
 
 1. **Setup**:
    - Accept message_history (with system prompt), start_time, progress_info
@@ -937,7 +933,7 @@ For stories where chapter_list == "ONESHOT":
    - Check if `oneshot.txt` exists
    - If not:
      - Apply name mapping to original content
-     - Call `translator.translate()` with progress info
+     - Call `translator.translate_content()` with progress info and write the chunk outputs joined with "\n\n"
      - Save as UTF-8
    - Display success/failure message
 

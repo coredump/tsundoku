@@ -103,6 +103,15 @@ chunk_size_chars = 1500  # default
 chunk_size_chars = 900   # default
 ```
 
+#### Reply Length Limit
+
+Each translation request sends `max_tokens = max(512, ceil(max_tokens_per_char × source characters))`, so a model stuck in a loop stops instead of running forever. A reply cut off at that limit is retried like any other failure; if it is still cut off on the last attempt, it is kept and reported as truncated. Set the factor to `0` to send no limit.
+
+```toml
+[translation]
+max_tokens_per_char = 2.0  # default
+```
+
 ## Usage
 
 Download and translate a novel:
