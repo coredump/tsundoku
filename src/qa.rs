@@ -461,12 +461,14 @@ fn occurs_outside_longer_terms(source: &str, term: &TermEntry, glossary: &[TermE
                 .map(|(start, matched)| (start, start + matched.len()))
         })
         .collect();
-    source.match_indices(term.original.as_str()).any(|(start, matched)| {
-        let end = start + matched.len();
-        !covering
-            .iter()
-            .any(|&(cover_start, cover_end)| cover_start <= start && end <= cover_end)
-    })
+    source
+        .match_indices(term.original.as_str())
+        .any(|(start, matched)| {
+            let end = start + matched.len();
+            !covering
+                .iter()
+                .any(|&(cover_start, cover_end)| cover_start <= start && end <= cover_end)
+        })
 }
 
 /// Whether `ratio` is outside `[low, high]`.

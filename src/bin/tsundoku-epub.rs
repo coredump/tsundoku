@@ -16,7 +16,7 @@ use tsundoku::epub::{
     BookInfo, ChapterFile, Volume, apply_chapter_titles, collect_chapters, plan_volumes,
     write_volume,
 };
-use tsundoku::name_mapping::{NameMappingStore, novel_file_path};
+use tsundoku::name_mapping::{Gender, NameMappingStore, novel_file_path};
 use tsundoku::output_rules::{OutputRules, postprocess};
 use tsundoku::qa::IssueKind;
 
@@ -59,7 +59,12 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
     if let Some(shell) = args.generate_completions {
-        generate(shell, &mut Args::command(), "tsundoku-epub", &mut io::stdout());
+        generate(
+            shell,
+            &mut Args::command(),
+            "tsundoku-epub",
+            &mut io::stdout(),
+        );
         return Ok(());
     }
 
@@ -105,9 +110,8 @@ fn main() -> Result<()> {
     }
 
     let output_dir = args.output.unwrap_or_else(|| novel_dir.join("EPUB"));
-    std::fs::create_dir_all(&output_dir).with_context(|| {
-        format!("Failed to create output folder: {}", output_dir.display())
-    })?;
+    std::fs::create_dir_all(&output_dir)
+        .with_context(|| format!("Failed to create output folder: {}", output_dir.display()))?;
 
     console.section(&format!("Building EPUB volumes for {}", book.title));
     let modified = SystemTime::now();
@@ -135,9 +139,10 @@ fn main() -> Result<()> {
 }
 
 /// Output rules for `--rewrite-text`: the policy from book.json, else the config's
-/// `[translation] honorifics`; the novel's known English names; the book.json
-/// replacements. Without the novel's names file, every capitalised word counts as
-/// a name, so `names-only` strips honorifics after lowercase words only.
+/// `[translation] honorifics`; the novel's known English names and their genders;
+/// the book.json replacements. Without the novel's names file, every capitalised
+/// word counts as a name, so `names-only` strips honorifics after lowercase words
+/// only.
 fn rewrite_rules(
     console: &Console,
     folder_name: &str,
@@ -163,9 +168,11 @@ fn rewrite_rules(
             None
         }
     };
-    metadata
-        .output_rules(config.translation.honorifics, names.as_deref())
-        .context("Invalid book.json replacements")
+    let (renderings, genders) = names.unzip();
+    let rules = metadata
+        .output_rules(config.translation.honorifics, renderings.as_deref())
+        .context("Invalid book.json replacements")?;
+    Ok(rules.with_genders(genders.unwrap_or_default()))
 }
 
 /// The user's config file, or the defaults when there is none (never creates one).
@@ -192,23 +199,27 @@ fn novel_key(folder_name: &str) -> Option<(&str, &str)> {
     (!module.is_empty() && !novel_id.is_empty()).then_some((module, novel_id))
 }
 
-/// Selected English renderings of the novel's names, from its mapping file in
-/// `names_dir`; `None` when there is no mapping file.
-fn known_names(names_dir: &Path, module: &str, novel_id: &str) -> Result<Option<Vec<String>>> {
+/// Selected English renderings of the novel's names and the genders stated for
+/// them, from its mapping file in `names_dir`; `None` when there is no mapping
+/// file.
+fn known_names(
+    names_dir: &Path,
+    module: &str,
+    novel_id: &str,
+) -> Result<Option<(Vec<String>, Vec<(String, Gender)>)>> {
     let path = novel_file_path(names_dir, module, novel_id, ".json");
     if !path.exists() {
         return Ok(None);
     }
     let store = NameMappingStore::new(names_dir, module, novel_id)
         .with_context(|| format!("Failed to load the name mapping {}", path.display()))?;
-    Ok(Some(
-        store
-            .known_mappings()
-            .names
-            .into_iter()
-            .map(|entry| entry.english)
-            .collect(),
-    ))
+    let renderings = store
+        .known_mappings()
+        .names
+        .into_iter()
+        .map(|entry| entry.english)
+        .collect();
+    Ok(Some((renderings, store.name_genders())))
 }
 
 /// What `--rewrite-text` did.
@@ -488,16 +499,23 @@ mod tests {
         assert_eq!(known_names(dir.path(), "syosetu", "n1").unwrap(), None);
 
         let mut store = NameMappingStore::new(dir.path(), "syosetu", "n1").unwrap();
-        store.record_votes(&[NameEntry {
+        // A gender is selected from two votes.
+        let ruri = NameEntry {
             original: "ルリ".to_string(),
             english: "Ruri".to_string(),
+            gender: Some(Gender::Female),
             ..NameEntry::default()
-        }]);
+        };
+        store.record_votes(&[ruri.clone()]);
+        store.record_votes(&[ruri]);
         store.save().unwrap();
 
         assert_eq!(
             known_names(dir.path(), "syosetu", "n1").unwrap(),
-            Some(vec!["Ruri".to_string()])
+            Some((
+                vec!["Ruri".to_string()],
+                vec![("Ruri".to_string(), Gender::Female)]
+            ))
         );
     }
 

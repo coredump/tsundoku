@@ -6,8 +6,9 @@
 use crate::book::Replacement;
 use crate::error::ReplacementError;
 use crate::honorifics::HonorificPolicy;
+use crate::name_mapping::Gender;
 use regex::{Captures, Regex};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 /// A word followed by a romanized honorific, e.g. `cat-san` or `Chief-san`.
@@ -35,6 +36,12 @@ pub struct OutputRules {
     /// Known English name words (each name and each of its parts); `None` when
     /// the novel's names are unknown, so every capitalised word counts as a name.
     known_names: Option<HashSet<String>>,
+    /// Known multi-word or hyphenated names followed by -sama/-dono, for the
+    /// localizing policies (`Monika Weber-sama` → `Lady Monika Weber`, not
+    /// `Monika Lady Weber`).
+    titled_full_name: Option<Regex>,
+    /// Gender of each known name and name part, for English titles.
+    genders: HashMap<String, Gender>,
     replacements: Vec<CompiledReplacement>,
 }
 
@@ -63,11 +70,67 @@ impl OutputRules {
                     .map(str::to_string),
             );
         }
+        let titled_full_name = if policy.localizes_titles() {
+            let mut full: Vec<&String> = names
+                .iter()
+                .filter(|name| name.contains([' ', '-']))
+                .collect();
+            full.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+            (!full.is_empty()).then(|| {
+                let alternatives: Vec<String> =
+                    full.iter().map(|name| regex::escape(name)).collect();
+                Regex::new(&format!(r"\b({})-(sama|dono)\b", alternatives.join("|")))
+                    .expect("escaped names form a valid regex")
+            })
+        } else {
+            None
+        };
         Ok(Self {
             policy,
             known_names: Some(names),
+            titled_full_name,
+            genders: HashMap::new(),
             replacements: compile_replacements(replacements)?,
         })
+    }
+
+    /// Add the genders of known names (selected English renderings), used by the
+    /// localizing policies to choose `Lord`/`Sir` or `Lady`.
+    ///
+    /// A multi-word name's gender also applies to its parts. A name or part given
+    /// conflicting genders gets none; `unknown` is ignored.
+    pub fn with_genders<I, S>(mut self, genders: I) -> Self
+    where
+        I: IntoIterator<Item = (S, Gender)>,
+        S: AsRef<str>,
+    {
+        let mut seen: HashMap<String, Option<Gender>> = HashMap::new();
+        let mut record = |name: &str, gender: Gender| {
+            seen.entry(name.to_string())
+                .and_modify(|known| {
+                    if *known != Some(gender) {
+                        *known = None;
+                    }
+                })
+                .or_insert(Some(gender));
+        };
+        for (name, gender) in genders {
+            let name = name.as_ref().trim();
+            if name.is_empty() || gender == Gender::Unknown {
+                continue;
+            }
+            record(name, gender);
+            if name.contains([' ', '-']) {
+                for part in name.split([' ', '-']).filter(|part| !part.is_empty()) {
+                    record(part, gender);
+                }
+            }
+        }
+        self.genders = seen
+            .into_iter()
+            .filter_map(|(name, gender)| gender.map(|gender| (name, gender)))
+            .collect();
+        self
     }
 
     /// Build rules for a novel whose names are unknown: every capitalised word
@@ -80,6 +143,8 @@ impl OutputRules {
         Ok(Self {
             policy,
             known_names: None,
+            titled_full_name: None,
+            genders: HashMap::new(),
             replacements: compile_replacements(replacements)?,
         })
     }
@@ -96,6 +161,32 @@ impl OutputRules {
                 .known_names
                 .as_ref()
                 .is_none_or(|names| names.contains(word))
+    }
+
+    /// English title for a character name followed by -sama/-dono, by gender.
+    fn title_for(&self, name: &str, suffix: &str) -> Option<&'static str> {
+        match (suffix, self.genders.get(name)?) {
+            ("sama", Gender::Male) => Some("Lord"),
+            ("dono", Gender::Male) => Some("Sir"),
+            ("sama" | "dono", Gender::Female) => Some("Lady"),
+            _ => None,
+        }
+    }
+
+    /// Render `word` + `suffix` under a localizing policy: -sama/-dono on a name
+    /// with a known gender become a title, other -sama/-dono are dropped; -san,
+    /// -chan and -kun are dropped under `localize` and kept on names under
+    /// `localize-titles`; -senpai/-sensei follow the names-only rule.
+    fn localize(&self, matched: &str, word: &str, suffix: &str) -> String {
+        match suffix {
+            "sama" | "dono" => match self.title_for(word, suffix) {
+                Some(title) if self.is_name(word) => format!("{title} {word}"),
+                _ => word.to_string(),
+            },
+            "san" | "chan" | "kun" if self.policy == HonorificPolicy::Localize => word.to_string(),
+            _ if self.is_name(word) => matched.to_string(),
+            _ => word.to_string(),
+        }
     }
 }
 
@@ -146,7 +237,8 @@ pub(crate) fn compile_replacements(
 ///
 /// Replacements run first so a spelling fix (`Tatyuya` → `Tatsuya`) turns a
 /// misspelled name into a known one before `names-only` decides whether its
-/// honorific stays.
+/// honorific stays, and so a per-name form (`Mei-chan` → `Meimei`,
+/// `Linus-sama` → `Master Linus`) wins over the localizing rules.
 pub fn postprocess(raw: &str, rules: &OutputRules) -> String {
     let mut text = raw.to_string();
     for replacement in &rules.replacements {
@@ -167,6 +259,23 @@ pub fn postprocess(raw: &str, rules: &OutputRules) -> String {
                 }
             })
             .into_owned(),
+        HonorificPolicy::Localize | HonorificPolicy::LocalizeTitles => {
+            if let Some(full) = &rules.titled_full_name {
+                text = full
+                    .replace_all(&text, |caps: &Captures| {
+                        match rules.title_for(&caps[1], &caps[2]) {
+                            Some(title) => format!("{title} {}", &caps[1]),
+                            None => caps[1].to_string(),
+                        }
+                    })
+                    .into_owned();
+            }
+            ENGLISH_HONORIFIC
+                .replace_all(&text, |caps: &Captures| {
+                    rules.localize(&caps[0], &caps[1], &caps[2])
+                })
+                .into_owned()
+        }
     }
 }
 
@@ -307,6 +416,79 @@ mod tests {
             postprocess("Tatyuya-kun fed the cat-san for Village Chief-san.", &rules),
             "Tatsuya-kun fed the cat for Village Chief-san."
         );
+    }
+
+    fn localize_rules(policy: HonorificPolicy, replacements: &[Replacement]) -> OutputRules {
+        OutputRules::new(
+            policy,
+            ["Isamu", "Annemarie", "Eto", "Monika Weber", "Orihime"],
+            replacements,
+        )
+        .unwrap()
+        .with_genders([
+            ("Isamu", Gender::Male),
+            ("Annemarie", Gender::Female),
+            ("Monika Weber", Gender::Female),
+            ("Orihime", Gender::Unknown),
+        ])
+    }
+
+    #[test]
+    fn test_localize_titles_names_by_gender() {
+        let rules = localize_rules(HonorificPolicy::Localize, &[]);
+        assert_eq!(
+            postprocess(
+                "Isamu-sama and Isamu-dono met Annemarie-sama, Annemarie-dono and Monika Weber-sama.",
+                &rules
+            ),
+            "Lord Isamu and Sir Isamu met Lady Annemarie, Lady Annemarie and Lady Monika Weber."
+        );
+        // No usable gender, or not a name: the suffix is dropped.
+        assert_eq!(
+            postprocess("Eto-sama, Orihime-dono and Dragon-sama", &rules),
+            "Eto, Orihime and Dragon"
+        );
+    }
+
+    #[test]
+    fn test_localize_drops_familiar_suffixes_but_keeps_senpai_sensei_on_names() {
+        let rules = localize_rules(HonorificPolicy::Localize, &[]);
+        assert_eq!(
+            postprocess(
+                "Eto-san, Orihime-chan, Isamu-kun, Orihime-sensei and the cat-sensei",
+                &rules
+            ),
+            "Eto, Orihime, Isamu, Orihime-sensei and the cat"
+        );
+    }
+
+    #[test]
+    fn test_localize_titles_keeps_familiar_suffixes_on_names() {
+        let rules = localize_rules(HonorificPolicy::LocalizeTitles, &[]);
+        assert_eq!(
+            postprocess("Eto-san asked Isamu-sama about the cat-chan.", &rules),
+            "Eto-san asked Lord Isamu about the cat."
+        );
+    }
+
+    #[test]
+    fn test_localize_replacements_win_and_rewrites_are_idempotent() {
+        let rules = localize_rules(
+            HonorificPolicy::Localize,
+            &[literal("Orihime-sensei", "Professor Orihime")],
+        );
+        let raw = "Orihime-sensei sat by Isamu-sama.";
+        let first = postprocess(raw, &rules);
+        assert_eq!(first, "Professor Orihime sat by Lord Isamu.");
+        assert_eq!(postprocess(raw, &rules), first);
+    }
+
+    #[test]
+    fn test_conflicting_genders_give_no_title() {
+        let rules = OutputRules::new(HonorificPolicy::Localize, ["Kei"], &[])
+            .unwrap()
+            .with_genders([("Kei", Gender::Male), ("Kei", Gender::Female)]);
+        assert_eq!(postprocess("Kei-sama", &rules), "Kei");
     }
 
     #[test]

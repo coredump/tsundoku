@@ -16,7 +16,7 @@ use tsundoku::config::{Config, TranslationConfig};
 use tsundoku::console::{Console, Style};
 use tsundoku::epub::{BookInfo, ChapterFile, collect_chapters};
 use tsundoku::honorifics::{self, HonorificPolicy};
-use tsundoku::name_mapping::{KnownMappings, NameMappingStore, TermEntry};
+use tsundoku::name_mapping::{Gender, KnownMappings, NameMappingStore, TermEntry};
 use tsundoku::name_scout::{
     NameScout, NameScoutEvent, NameScoutProgress, NameScoutStatus, SUMMARY_CAST_MAX_ENTRIES,
     ScoutChunk, ScoutProgressInfo, SummaryContext, build_chapter_payload,
@@ -451,7 +451,12 @@ async fn process_oneshot(params: &mut ProcessParams<'_>) -> Result<()> {
         // policy and replacements.
         let book = BookMetadata::load(&story_dir)?.unwrap_or_default();
         let known_names = known_name_renderings(params.name_mapping);
-        let rules = novel_output_rules(&book, &params.config.translation, &known_names)?;
+        let rules = novel_output_rules(
+            &book,
+            &params.config.translation,
+            &known_names,
+            params.name_mapping.name_genders(),
+        )?;
         let input = render_translation_input(params.name_mapping, &content, rules.policy());
         let prompt = chapter_prompt_context(
             params.name_mapping,
@@ -685,7 +690,12 @@ async fn translate_chapters(
     ));
 
     let known_names = known_name_renderings(name_mapping);
-    let rules = novel_output_rules(book, translation_config, &known_names)?;
+    let rules = novel_output_rules(
+        book,
+        translation_config,
+        &known_names,
+        name_mapping.name_genders(),
+    )?;
     let policy = rules.policy();
     let translations = translated_chapter_files(story_dir)?;
     let mut summary = RecheckSummary::default();
@@ -917,16 +927,18 @@ fn chapter_prompt_context(
 }
 
 /// The novel's output rules: its honorific policy (`book.json`, else
-/// `[translation] honorifics`), the selected English name renderings and the
-/// `book.json` replacements.
+/// `[translation] honorifics`), the selected English name renderings with their
+/// genders and the `book.json` replacements.
 fn novel_output_rules(
     book: &BookMetadata,
     translation_config: &TranslationConfig,
     known_names: &[String],
+    genders: Vec<(String, Gender)>,
 ) -> Result<Arc<OutputRules>> {
     let rules = book
         .output_rules(translation_config.honorifics, Some(known_names))
-        .context("Invalid book.json replacements")?;
+        .context("Invalid book.json replacements")?
+        .with_genders(genders);
     Ok(Arc::new(rules))
 }
 
@@ -1632,7 +1644,8 @@ async fn run_mapping_scout(
                         .pop()
                         .expect("worker id pool cannot be empty");
 
-                    let snapshot = Arc::clone(&known.read().unwrap_or_else(PoisonError::into_inner));
+                    let snapshot =
+                        Arc::clone(&known.read().unwrap_or_else(PoisonError::into_inner));
                     let result = scout_chapter_job(
                         name_scout,
                         number,
@@ -2982,8 +2995,13 @@ mod tests {
             }],
             ..BookMetadata::default()
         };
-        let rules =
-            novel_output_rules(&book, &TranslationConfig::default(), &["Ruri".into()]).unwrap();
+        let rules = novel_output_rules(
+            &book,
+            &TranslationConfig::default(),
+            &["Ruri".into()],
+            Vec::new(),
+        )
+        .unwrap();
         let path = story_dir.join(&chapter.filename);
 
         // Saving twice re-applies the rules to the raw text, never to the output.

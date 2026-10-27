@@ -20,6 +20,21 @@ pub enum HonorificPolicy {
     Drop,
     /// Keep honorifics on character names only.
     NamesOnly,
+    /// Translate like `names-only`; the output then renders -sama/-dono on a
+    /// character name as an English title by gender (`Lord`/`Lady`, `Sir`/`Lady`)
+    /// and drops every other -san/-chan/-kun/-sama/-dono. -senpai/-sensei stay on
+    /// names.
+    Localize,
+    /// Like `localize` for -sama/-dono, but keep -san/-chan/-kun on names, for
+    /// stories that move between Japan and another world.
+    LocalizeTitles,
+}
+
+impl HonorificPolicy {
+    /// Whether -sama/-dono on names become English titles.
+    pub fn localizes_titles(self) -> bool {
+        matches!(self, Self::Localize | Self::LocalizeTitles)
+    }
 }
 
 /// A Latin token (produced by name substitution) followed by a Japanese honorific.
@@ -44,7 +59,8 @@ fn romanize(suffix: &str) -> &'static str {
 
 /// Rewrite Japanese honorifics that follow Latin text according to `policy`.
 ///
-/// `keep` and `names-only` produce `Ruri-chan`; `drop` produces `Ruri` but keeps
+/// `keep`, `names-only` and the localizing policies produce `Ruri-chan` (the
+/// localizing ones rewrite it after translation); `drop` produces `Ruri` but keeps
 /// `-senpai`/`-sensei`, which carry meaning the model should translate.
 pub fn apply_source(text: &str, policy: HonorificPolicy) -> String {
     SOURCE_HONORIFIC
@@ -69,7 +85,9 @@ pub fn prompt_line(policy: HonorificPolicy) -> &'static str {
         HonorificPolicy::Drop => {
             "Drop the honorifics -san, -chan, -kun, -sama and -dono; render 先輩 and 先生 by meaning (senior, teacher, doctor) where they matter."
         }
-        HonorificPolicy::NamesOnly => {
+        HonorificPolicy::NamesOnly
+        | HonorificPolicy::Localize
+        | HonorificPolicy::LocalizeTitles => {
             "Keep romanized honorifics (-san, -chan, -kun, -sama, -dono, -senpai, -sensei) only on character names. Never attach them to titles, roles, animals or common nouns; translate 村長さん as 'the village chief'."
         }
     }
@@ -95,7 +113,12 @@ mod tests {
     fn test_each_mode_and_suffix() {
         for (jp, en) in SUFFIXES {
             let source = format!("「Ruri{jp}、おはよう」");
-            for policy in [HonorificPolicy::Keep, HonorificPolicy::NamesOnly] {
+            for policy in [
+                HonorificPolicy::Keep,
+                HonorificPolicy::NamesOnly,
+                HonorificPolicy::Localize,
+                HonorificPolicy::LocalizeTitles,
+            ] {
                 assert_eq!(
                     apply_source(&source, policy),
                     format!("「Ruri-{en}、おはよう」")
@@ -116,6 +139,8 @@ mod tests {
             HonorificPolicy::Keep,
             HonorificPolicy::Drop,
             HonorificPolicy::NamesOnly,
+            HonorificPolicy::Localize,
+            HonorificPolicy::LocalizeTitles,
         ] {
             assert_eq!(apply_source("村長さんが来た", policy), "村長さんが来た");
         }
@@ -137,6 +162,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&HonorificPolicy::Drop).unwrap(),
             "\"drop\""
+        );
+        assert_eq!(
+            serde_json::from_str::<HonorificPolicy>("\"localize-titles\"").unwrap(),
+            HonorificPolicy::LocalizeTitles
         );
     }
 }

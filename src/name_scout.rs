@@ -868,7 +868,9 @@ impl NameScout {
                     .as_deref()
                     .and_then(|gender| gender.parse::<Gender>().ok())
                     .filter(|gender| {
-                        *gender != Gender::Unknown && !evidence.is_empty() && chunk.contains(evidence)
+                        *gender != Gender::Unknown
+                            && !evidence.is_empty()
+                            && chunk.contains(evidence)
                     });
                 let note = entry
                     .note
@@ -1103,7 +1105,10 @@ mod tests {
                 ("Tanaka", Some(Gender::Male)),
             ]
         );
-        assert_eq!(result.names[0].note.as_deref(), Some("Ruri's older brother"));
+        assert_eq!(
+            result.names[0].note.as_deref(),
+            Some("Ruri's older brother")
+        );
         assert_eq!(result.names[1].note, None);
     }
 
@@ -1314,7 +1319,8 @@ I hope this helps!"#;
     #[test]
     fn test_parse_json_with_stray_trailing_brace() {
         let scout = make_scout();
-        let json = r#"{"names":[{"original":"ペーリス","part":"given","english":"Peris"}],"terms":[]}}"#;
+        let json =
+            r#"{"names":[{"original":"ペーリス","part":"given","english":"Peris"}],"terms":[]}}"#;
 
         let result = scout.parse_response(json, "").unwrap();
         assert_eq!(result.names.len(), 1);

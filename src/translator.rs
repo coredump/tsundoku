@@ -875,8 +875,10 @@ impl Translator {
         // The next chunk's "Preparing..." message will replace it, or
         // the caller will clear it when all chunks are done.
 
-        // Validate response
-        let trimmed = full_response.trim().to_string();
+        // Validate response; drop any leaked reasoning before the answer.
+        let trimmed = crate::utils::strip_reasoning(&full_response)
+            .trim()
+            .to_string();
 
         if trimmed.is_empty() {
             return Err(TranslationError::Refused("Empty response".to_string()));
@@ -1061,7 +1063,10 @@ mod tests {
             sampling: &unset,
         })
         .unwrap();
-        assert_eq!(body, serde_json::json!({"model": "m", "messages": [], "stream": true}));
+        assert_eq!(
+            body,
+            serde_json::json!({"model": "m", "messages": [], "stream": true})
+        );
 
         let set = SamplingParams {
             temperature: Some(0.5),
@@ -1185,7 +1190,11 @@ mod tests {
         };
         let ctx = PromptContext {
             cast: vec![
-                entry("Kirigaya", Some(Gender::Male), Some("Timer Association liaison")),
+                entry(
+                    "Kirigaya",
+                    Some(Gender::Male),
+                    Some("Timer Association liaison"),
+                ),
                 entry("Ruri", Some(Gender::Female), None),
                 entry("Monika", None, Some("village auditor")),
             ],

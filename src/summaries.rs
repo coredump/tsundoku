@@ -163,8 +163,7 @@ impl SummaryStore {
         }
 
         let content = serde_json::to_string_pretty(&self.data)?;
-        std::fs::write(&self.filepath, content)
-            .map_err(|e| SummaryError::WriteError(e.to_string()))
+        std::fs::write(&self.filepath, content).map_err(|e| SummaryError::WriteError(e.to_string()))
     }
 }
 
@@ -185,21 +184,23 @@ mod tests {
         let content = std::fs::read_to_string(store.filepath()).unwrap();
         let json: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(json["version"], 1);
-        assert_eq!(json["chapters"]["12"], "Tatsuya brings Ruri to the village.");
-        assert!(
-            store
-                .filepath()
-                .ends_with(if cfg!(windows) {
-                    "syosetu - n1234ab.summaries.json"
-                } else {
-                    "syosetu: n1234ab.summaries.json"
-                })
+        assert_eq!(
+            json["chapters"]["12"],
+            "Tatsuya brings Ruri to the village."
         );
+        assert!(store.filepath().ends_with(if cfg!(windows) {
+            "syosetu - n1234ab.summaries.json"
+        } else {
+            "syosetu: n1234ab.summaries.json"
+        }));
 
         let reloaded = SummaryStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
         assert_eq!(reloaded.len(), 2);
         assert!(reloaded.has(12) && reloaded.has(13) && !reloaded.has(14));
-        assert_eq!(reloaded.get(12), Some("Tatsuya brings Ruri to the village."));
+        assert_eq!(
+            reloaded.get(12),
+            Some("Tatsuya brings Ruri to the village.")
+        );
         assert_eq!(reloaded.get(13), None);
     }
 
@@ -227,7 +228,10 @@ mod tests {
         assert!(store.previous(5, 0).is_empty());
         assert_eq!(
             store.previous(5, 2),
-            [(3, "Chapter 3 events.".to_string()), (4, "Chapter 4 events.".to_string())]
+            [
+                (3, "Chapter 3 events.".to_string()),
+                (4, "Chapter 4 events.".to_string())
+            ]
         );
 
         store.set(4, String::new());

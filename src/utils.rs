@@ -5,15 +5,23 @@ use regex::Regex;
 use std::ops::Range;
 use std::sync::LazyLock;
 
-/// Regex for a leading chapter number such as `第三百九十話　　` or `第12章 `.
+/// Regex for a leading chapter number such as `第三百九十話　　`, `第12章 `,
+/// `●第1話●` or `12話　`.
 ///
 /// Katakana `ニ` is accepted alongside kanji `二` because authors mistype it.
+/// Without `第`, the number must be followed by `話` or `章` and a separator, so
+/// `十話目の朝` stays intact.
 static CHAPTER_NUMBER_PREFIX_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^第[0-9０-９〇零一二ニ三四五六七八九十百千]+[話章][\s:：・]*")
-        .expect("Invalid CHAPTER_NUMBER_PREFIX_REGEX")
+    Regex::new(concat!(
+        r"^[\s●○◆◇■□★☆◎【\[［]*",
+        r"(?:第[0-9０-９〇零一二ニ三四五六七八九十百千]+[話章][\s:：・●○◆◇■□★☆◎】\]］]*",
+        r"|[0-9０-９〇零一二ニ三四五六七八九十百千]+[話章](?:[\s:：・●○◆◇■□★☆◎】\]］]+|$))",
+    ))
+    .expect("Invalid CHAPTER_NUMBER_PREFIX_REGEX")
 });
 
-/// Remove a leading `第N話` or `第N章` from a Japanese chapter title.
+/// Remove a leading chapter number such as `第N話`, `第N章` or `●第N話●` from a
+/// Japanese chapter title.
 ///
 /// The caller writes the chapter number itself; models otherwise render `第二話` as
 /// "Chapter Two", "Episode 2", or "Chapter 2" at random, and authors' own numbers
@@ -26,12 +34,20 @@ pub fn strip_chapter_number(title: &str) -> &str {
 }
 
 /// Openers that only a model talking about itself would produce.
-const UNAMBIGUOUS_REFUSAL_OPENERS: [&str; 3] =
-    ["as an ai", "i am not programmed", "i do not have the ability"];
+const UNAMBIGUOUS_REFUSAL_OPENERS: [&str; 3] = [
+    "as an ai",
+    "i am not programmed",
+    "i do not have the ability",
+];
 
 /// Openers that are also ordinary English (a title `ごめんね` → "I'm sorry").
-const AMBIGUOUS_REFUSAL_OPENERS: [&str; 5] =
-    ["i'm sorry", "my apologies", "i cannot", "i can't", "i am unable"];
+const AMBIGUOUS_REFUSAL_OPENERS: [&str; 5] = [
+    "i'm sorry",
+    "my apologies",
+    "i cannot",
+    "i can't",
+    "i am unable",
+];
 
 /// Phrases that make an ambiguous opener a reply about the request itself. They name
 /// the task ("translate", "this request") rather than words a character could say to
@@ -77,6 +93,19 @@ pub fn is_refusal(reply: &str) -> bool {
             && REFUSAL_REQUEST_PHRASES
                 .iter()
                 .any(|phrase| head.contains(phrase)))
+}
+
+/// Closing tag a reasoning model emits after its thinking.
+const THINK_CLOSE_TAG: &str = "</think>";
+
+/// Returns the reply after the last `</think>` tag, or the whole reply if none.
+///
+/// With reasoning disabled, Qwen models occasionally still write a draft and a
+/// closing `</think>` before the real answer; keeping both doubles the chunk.
+pub fn strip_reasoning(reply: &str) -> &str {
+    reply
+        .rfind(THINK_CLOSE_TAG)
+        .map_or(reply, |pos| &reply[pos + THINK_CLOSE_TAG.len()..])
 }
 
 /// Count Japanese kana and CJK ideographs in `text`.
@@ -427,6 +456,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_strip_reasoning_keeps_only_the_answer() {
+        assert_eq!(
+            strip_reasoning("Draft line.\n</think>\n\nFinal line."),
+            "\n\nFinal line."
+        );
+        assert_eq!(strip_reasoning("<think>a</think>b</think>c"), "c");
+        assert_eq!(strip_reasoning("No tags here."), "No tags here.");
+    }
+
+    #[test]
     fn test_refusals_are_detected() {
         for reply in [
             "I'm sorry, but I can't help with translating this content.",
@@ -467,7 +506,11 @@ mod tests {
             ("第１２話 Title", "Title"),
             ("第3章：始まり", "始まり"),
             ("第二話", ""),
+            ("●第6話●無属性のクズ魔石", "無属性のクズ魔石"),
+            ("【第10話】出発", "出発"),
+            ("12話　孤島に追放", "孤島に追放"),
             ("閑話　休日", "閑話　休日"),
+            ("十話目の朝", "十話目の朝"),
             ("第一王子の話", "第一王子の話"),
         ];
         for (title, expected) in cases {

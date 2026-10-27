@@ -65,7 +65,10 @@ pub fn collect_chapters(novel_dir: &Path) -> Result<Vec<ChapterFile>, EpubError>
             continue;
         }
         let file_name = entry.file_name();
-        let Some(stem) = file_name.to_str().and_then(|name| name.strip_suffix(".txt")) else {
+        let Some(stem) = file_name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".txt"))
+        else {
             continue;
         };
         let Some((number, title)) = stem.split_once(" - ") else {
@@ -321,9 +324,10 @@ fn parse_blocks(text: &str) -> Vec<Block<'_>> {
             }
             continue;
         }
-        let bullet_item = line
-            .strip_prefix("- ")
-            .or_else(|| line.strip_prefix('・').filter(|rest| !rest.starts_with('・')));
+        let bullet_item = line.strip_prefix("- ").or_else(|| {
+            line.strip_prefix('・')
+                .filter(|rest| !rest.starts_with('・'))
+        });
         if let Some(item) = bullet_item {
             let item = item.trim_start();
             if let Some(Block::List(items)) = blocks.last_mut() {
@@ -698,7 +702,9 @@ mod tests {
     #[test]
     fn test_japanese_punctuation_becomes_english() {
         assert_eq!(
-            escape("「Hold on・・・」 『Not again』――Ri--Rico？！　Juka・York ～ well-known ・ list Fox・12"),
+            escape(
+                "「Hold on・・・」 『Not again』――Ri--Rico？！　Juka・York ～ well-known ・ list Fox・12"
+            ),
             "“Hold on…” ‘Not again’—Ri—Rico?! Juka York ~ well-known · list Fox·12"
         );
         assert_eq!(
@@ -713,7 +719,10 @@ mod tests {
             escape(r#""Wait," she said. "It's 'fine' since the '90s—'em too." (Rock 'n' roll.)"#),
             "“Wait,” she said. “It’s ‘fine’ since the ’90s—’em too.” (Rock ’n’ roll.)"
         );
-        assert_eq!(escape("“Already” curly’s & <kept>"), "“Already” curly’s &amp; &lt;kept&gt;");
+        assert_eq!(
+            escape("“Already” curly’s & <kept>"),
+            "“Already” curly’s &amp; &lt;kept&gt;"
+        );
         assert_eq!(escape("\"'Nested,' he said.\""), "“‘Nested,’ he said.”");
     }
 
@@ -745,8 +754,14 @@ mod tests {
             .map(|v| (v.number, v.first, v.last, v.chapters.len()))
             .collect();
 
-        assert_eq!(summary, [(1, 1, 100, 4), (2, 101, 200, 2), (3, 201, 300, 1)]);
-        assert_eq!(volumes[0].missing(), [3].into_iter().chain(5..100).collect::<Vec<_>>());
+        assert_eq!(
+            summary,
+            [(1, 1, 100, 4), (2, 101, 200, 2), (3, 201, 300, 1)]
+        );
+        assert_eq!(
+            volumes[0].missing(),
+            [3].into_iter().chain(5..100).collect::<Vec<_>>()
+        );
         assert_eq!(volumes[1].missing(), (102..150).collect::<Vec<_>>());
         assert_eq!(volumes[2].missing(), (201..205).collect::<Vec<_>>());
     }
@@ -770,7 +785,10 @@ mod tests {
         }
 
         let chapters = collect_chapters(dir.path()).unwrap();
-        let found: Vec<_> = chapters.iter().map(|c| (c.number, c.title.as_str())).collect();
+        let found: Vec<_> = chapters
+            .iter()
+            .map(|c| (c.number, c.title.as_str()))
+            .collect();
 
         assert_eq!(found, [(2, "Two"), (999, "Legacy padding"), (1000, "Late")]);
     }
@@ -784,8 +802,13 @@ mod tests {
         let volume = plan_volumes(collect_chapters(dir.path()).unwrap(), 100).remove(0);
         let path = dir.path().join(book.volume_file_name(&volume));
 
-        write_volume(&path, &book, &volume, UNIX_EPOCH + Duration::from_secs(1_700_000_000))
-            .unwrap();
+        write_volume(
+            &path,
+            &book,
+            &volume,
+            UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        )
+        .unwrap();
 
         let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
         let mut mimetype = String::new();
@@ -803,10 +826,16 @@ mod tests {
             .unwrap()
             .read_to_string(&mut opf)
             .unwrap();
-        assert!(opf.contains("<dc:identifier id=\"book-id\">urn:tsundoku:syosetu:n1234ab:vol01</dc:identifier>"));
+        assert!(opf.contains(
+            "<dc:identifier id=\"book-id\">urn:tsundoku:syosetu:n1234ab:vol01</dc:identifier>"
+        ));
         assert!(opf.contains("2023-11-14T22:13:20Z"));
         let spine = &opf[opf.find("<spine").unwrap()..];
         assert!(spine.find("c00001").unwrap() < spine.find("c00002").unwrap());
-        assert!(!dir.path().join("Some Novel - Vol. 01 (0001-0100).epub.part").exists());
+        assert!(
+            !dir.path()
+                .join("Some Novel - Vol. 01 (0001-0100).epub.part")
+                .exists()
+        );
     }
 }

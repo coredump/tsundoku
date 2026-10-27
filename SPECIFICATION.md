@@ -97,7 +97,7 @@ Translation behavior configuration:
 - `cast_max_entries`: Maximum characters (with gender and note) listed in a chapter translation prompt; `0` disables the cast block (default: "30", integer)
 - `summary_chapters`: Number of previous chapters whose scout synopses are added to a chapter translation prompt; `0` disables (default: "2", integer)
 - `max_tokens_per_char`: Reply token limit per source character; each request sends `max_tokens = max(512, ceil(max_tokens_per_char × characters))` and `0` sends none. Must be finite and at least 0 (default: "2.0", float)
-- `honorifics`: Honorific policy, `"keep"`, `"drop"` or `"names-only"`; a novel's `book.json` `honorifics` overrides it (default: `"keep"`). See Honorifics and Output Rules
+- `honorifics`: Honorific policy, `"keep"`, `"drop"`, `"names-only"`, `"localize"` or `"localize-titles"`; a novel's `book.json` `honorifics` overrides it (default: `"keep"`). See Honorifics and Output Rules
 
 #### [QA] Section
 Post-translation checks (`qa::check_chunk`) and QA retries:
@@ -457,12 +457,12 @@ no migration):
 
 ### Honorifics and Output Rules (`honorifics.rs`, `output_rules.rs`)
 
-- Policy `HonorificPolicy` (`keep`, `drop`, `names-only`; serde kebab-case). Effective
+- Policy `HonorificPolicy` (`keep`, `drop`, `names-only`, `localize`, `localize-titles`; serde kebab-case). Effective
   policy per novel: `book.json` `honorifics` if set, else `[translation] honorifics`
   (`BookMetadata::honorific_policy`).
 - Source side, `honorifics::apply_source(text, policy)`, run after name substitution:
   a Latin token followed by さん/ちゃん/くん/君/様/さま/殿/先輩/先生 becomes
-  `Name-san`/`-chan`/`-kun`/`-sama`/`-dono`/`-senpai`/`-sensei` (`keep`, `names-only`)
+  `Name-san`/`-chan`/`-kun`/`-sama`/`-dono`/`-senpai`/`-sensei` (`keep`, `names-only`, `localize`, `localize-titles`)
   or `Name` (`drop`; 先輩/先生 are left untouched). Suffixes after Japanese text are left
   for the model.
 - Prompt: one line per policy, `honorifics::prompt_line(policy)`, rendered between the
@@ -473,7 +473,15 @@ no migration):
   (literal: case-sensitive, whole word at word-character ends, `$` literal;
   `"regex": true`: regex with `$1` groups), then the honorific rule (`names-only` strips
   `-(san|chan|kun|sama|dono|senpai|sensei)` after a word that is lowercase or not a known
-  name or name part; `drop` strips every one; `keep` nothing), so a spelling fix makes a
+  name or name part; `drop` strips every one; `keep` nothing; `localize` and
+  `localize-titles` render -sama/-dono after a known name with a known gender as a
+  title — `Lord X`/`Sir X` (male) or `Lady X` (female), the whole name for known
+  multi-word or hyphenated names — and strip them elsewhere; `localize` also strips
+  -san/-chan/-kun everywhere, while -senpai/-sensei (and, under `localize-titles`,
+  -san/-chan/-kun) follow the names-only rule. Genders come from
+  `NameMappingStore::name_genders` via `OutputRules::with_genders`; a name or part
+  with conflicting genders gets none. The localizing policies use the `names-only`
+  source rewrite and prompt line, so the model input is unchanged), so a spelling fix makes a
   name known before the strip. Regexes are compiled when `book.json` is loaded; an
   invalid one is a load error naming `replacements[i]`.
 - Always applied to the record's raw text, never to an already processed `.txt`, so
@@ -1105,7 +1113,7 @@ For stories with chapter list:
      - Translated, with `--recheck`: plan a recheck (below); skip if nothing matches
    - Every chapter to translate or recheck: render the input with `render_translation_input(.., policy)` (the single translation input pipeline, shared with one-shots and the recheck checks, always with the novel's effective policy so `stale` compares like with like) and build its prompt once with `chapter_prompt_context` (which carries the output rules)
    - Whole chapter:
-     - Translate the title: apply name mapping and `honorifics::apply_source`, strip the author's chapter number, translate, and head it `Chapter N: …` (`Chapter N` for an empty title)
+     - Translate the title: apply name mapping and `honorifics::apply_source`, strip the author's chapter number (`第N話`, `第N章`, decorated forms like `●第N話●` or `【第N話】`, and bare `N話　`), translate, and head it `Chapter N: …` (`Chapter N` for an empty title)
      - Translate content with `translate_content` and build a `ChapterRecord` (one `ChunkRecord { source, raw: output, issues }` per chunk)
    - Save each finished chapter: write the record to `.tsundoku/chunks/{N}.json`, then the `.txt` as `output_rules::postprocess(record.raw_text())` (the raw outputs joined with "\n\n", then the replacements and the honorific rule; the record keeps the raw outputs, so rules never compound), then remove the file it replaces if the file name changed (`tsundoku-epub` keeps only the first file per number); update `book.json`; print one warning per issue of the chunks just translated
    - Display success/failure message

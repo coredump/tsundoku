@@ -26,9 +26,8 @@ static HONORIFIC_SUFFIX_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 /// Regex for detecting household suffixes such as `バーサーム家` or `田中一家`.
 ///
 /// Substituting the whole word with a bare name would drop "family"/"house".
-static HOUSEHOLD_SUFFIX_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r".(家|一家|一族)$").expect("Invalid HOUSEHOLD_SUFFIX_REGEX")
-});
+static HOUSEHOLD_SUFFIX_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r".(家|一家|一族)$").expect("Invalid HOUSEHOLD_SUFFIX_REGEX"));
 
 /// Regex for a katakana name followed by a title or place suffix, e.g. `メインティア王`
 /// or `ミーク姫`.
@@ -193,16 +192,16 @@ fn unify_name_variants(names: &mut HashMap<String, NameInfo>) {
 }
 
 /// Return name substitutions ordered longest original first.
-fn name_replacements(names: &HashMap<String, NameInfo>) -> Vec<(&str, &str)> {
-    let mut replacements: Vec<(&str, &str)> = names
+fn name_replacements(names: &HashMap<String, NameInfo>) -> Vec<(&str, &str, &[String])> {
+    let mut replacements: Vec<(&str, &str, &[String])> = names
         .iter()
         .filter_map(|(original, info)| {
             info.english
                 .as_deref()
-                .map(|english| (original.as_str(), english))
+                .map(|english| (original.as_str(), english, info.exclude.as_slice()))
         })
         .collect();
-    replacements.sort_by_key(|(original, _)| std::cmp::Reverse(original.len()));
+    replacements.sort_by_key(|(original, _, _)| std::cmp::Reverse(original.len()));
     replacements
 }
 
@@ -219,10 +218,19 @@ fn is_katakana_word_char(c: char) -> bool {
 /// rewrite `スローダ` and `ゲン` does not rewrite `クノゲン`. A `ー` before the name only
 /// joins it to a katakana word when katakana precedes the `ー`, so the drawn-out
 /// interjection in `あらーリノスちゃん` still lets `リノス` match. Other names match
-/// anywhere because kanji and kana word boundaries cannot be detected reliably.
-fn name_match_offsets<'a>(text: &'a str, original: &'a str) -> impl Iterator<Item = usize> + 'a {
+/// anywhere because kanji and kana word boundaries cannot be detected reliably;
+/// `exclude` lists words containing the name that must not match, so a one-kanji
+/// name like `勇` can skip `勇気` and `武勇`.
+fn name_match_offsets<'a>(
+    text: &'a str,
+    original: &'a str,
+    exclude: &'a [String],
+) -> impl Iterator<Item = usize> + 'a {
     let katakana_only = original.chars().all(is_katakana_word_char);
     text.match_indices(original).filter_map(move |(start, _)| {
+        if is_inside_excluded_word(text, start, original, exclude) {
+            return None;
+        }
         if katakana_only {
             let mut preceding = text[..start].chars().rev();
             let before = match preceding.next() {
@@ -239,11 +247,23 @@ fn name_match_offsets<'a>(text: &'a str, original: &'a str) -> impl Iterator<Ite
     })
 }
 
+/// Returns whether the name match at `start` lies inside one of the `exclude` words.
+fn is_inside_excluded_word(text: &str, start: usize, original: &str, exclude: &[String]) -> bool {
+    exclude.iter().any(|word| {
+        word.match_indices(original).any(|(offset, _)| {
+            start
+                .checked_sub(offset)
+                .and_then(|word_start| text.get(word_start..))
+                .is_some_and(|rest| rest.starts_with(word.as_str()))
+        })
+    })
+}
+
 /// Replace every substitutable occurrence of one name.
-fn replace_name(text: &str, original: &str, english: &str) -> String {
+fn replace_name(text: &str, original: &str, english: &str, exclude: &[String]) -> String {
     let mut result = String::with_capacity(text.len());
     let mut copied_until = 0;
-    for start in name_match_offsets(text, original) {
+    for start in name_match_offsets(text, original, exclude) {
         result.push_str(&text[copied_until..start]);
         result.push_str(english);
         copied_until = start + original.len();
@@ -258,7 +278,10 @@ fn replace_name(text: &str, original: &str, english: &str) -> String {
 /// mapping already decides its rendering.
 fn is_shadowed_by_name(term: &str, names: &HashMap<String, NameInfo>) -> bool {
     names.iter().any(|(original, info)| {
-        info.english.is_some() && name_match_offsets(term, original).next().is_some()
+        info.english.is_some()
+            && name_match_offsets(term, original, &info.exclude)
+                .next()
+                .is_some()
     })
 }
 
@@ -622,7 +645,11 @@ impl KnownMappings {
             names: self
                 .names
                 .iter()
-                .filter(|entry| name_match_offsets(text, &entry.original).next().is_some())
+                .filter(|entry| {
+                    name_match_offsets(text, &entry.original, &[])
+                        .next()
+                        .is_some()
+                })
                 .cloned()
                 .collect(),
             terms: self
@@ -704,6 +731,11 @@ pub struct NameInfo {
     /// The scout fills it only while it is empty, so hand edits are never overwritten.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Words containing this name that are not the name (e.g. `勇気` for `勇`).
+    ///
+    /// Matches inside these words are never substituted or counted as the name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
 }
 
 impl NameInfo {
@@ -719,6 +751,7 @@ impl NameInfo {
             gender_override: None,
             gender: None,
             note: None,
+            exclude: Vec::new(),
         }
     }
 
@@ -800,8 +833,18 @@ fn novel_file_name(module_name: &str, novel_id: &str, suffix: &str, windows: boo
 ///
 /// `suffix` follows the novel ID, e.g. `".json"` for the name mapping or
 /// `".summaries.json"` for chapter summaries.
-pub fn novel_file_path(names_dir: &Path, module_name: &str, novel_id: &str, suffix: &str) -> PathBuf {
-    names_dir.join(novel_file_name(module_name, novel_id, suffix, cfg!(windows)))
+pub fn novel_file_path(
+    names_dir: &Path,
+    module_name: &str,
+    novel_id: &str,
+    suffix: &str,
+) -> PathBuf {
+    names_dir.join(novel_file_name(
+        module_name,
+        novel_id,
+        suffix,
+        cfg!(windows),
+    ))
 }
 
 /// Name mapping store for a specific novel.
@@ -940,7 +983,11 @@ impl NameMappingStore {
                 .retain(|english, _| is_valid_english_rendering(english));
             info.gender_votes
                 .retain(|gender, count| *gender != Gender::Unknown && *count > 0);
-            if info.note.as_deref().is_some_and(|note| !is_valid_note(note)) {
+            if info
+                .note
+                .as_deref()
+                .is_some_and(|note| !is_valid_note(note))
+            {
                 info.note = None;
             }
 
@@ -1019,8 +1066,8 @@ impl NameMappingStore {
     /// Replaces longest matches first to handle overlapping names.
     pub fn apply_to_text(&self, text: &str) -> String {
         let mut result = text.to_string();
-        for (original, english) in name_replacements(&self.data.names) {
-            result = replace_name(&result, original, english);
+        for (original, english, exclude) in name_replacements(&self.data.names) {
+            result = replace_name(&result, original, english, exclude);
         }
 
         result
@@ -1080,7 +1127,11 @@ impl NameMappingStore {
             .names
             .iter()
             .filter(|(_, info)| info.gender.is_some() || info.note.is_some())
-            .filter(|(original, _)| name_match_offsets(raw_text, original).next().is_some())
+            .filter(|(original, info)| {
+                name_match_offsets(raw_text, original, &info.exclude)
+                    .next()
+                    .is_some()
+            })
             .filter_map(|(_, info)| Some((info.english.as_deref()?, info)))
             .collect();
         present.sort_by(|(left, left_info), (right, right_info)| {
@@ -1236,6 +1287,21 @@ impl NameMappingStore {
                     .map(|(original, info)| (original, info.english.as_ref())),
             ),
         }
+    }
+
+    /// Selected English rendering and gender of every name with a stated gender
+    /// (`male` or `female`), for gendered English titles.
+    pub fn name_genders(&self) -> Vec<(String, Gender)> {
+        self.data
+            .names
+            .values()
+            .filter_map(|info| match (info.english.as_ref(), info.gender) {
+                (Some(english), Some(gender @ (Gender::Male | Gender::Female))) => {
+                    Some((english.clone(), gender))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Find words in translated English that look like misspellings of a known name.
@@ -1447,6 +1513,24 @@ mod tests {
     }
 
     #[test]
+    fn test_excluded_words_keep_name_unsubstituted() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut store = NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
+        let mut info = NameInfo::new(NamePart::Given);
+        info.r#override = Some("Isamu".to_string());
+        info.exclude = vec!["勇気".to_string(), "武勇".to_string()];
+        info.recalculate_best();
+        store.data.names.insert("勇".to_string(), info);
+
+        assert_eq!(
+            store.apply_to_text("勇は勇気を出し、武勇伝を語る勇達"),
+            "Isamuは勇気を出し、武勇伝を語るIsamu達"
+        );
+        assert!(!is_shadowed_by_name("勇気", &store.data.names));
+        assert!(is_shadowed_by_name("勇の魔法", &store.data.names));
+    }
+
+    #[test]
     fn test_longest_match_first() {
         let temp_dir = TempDir::new().unwrap();
         let mut store = NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
@@ -1643,7 +1727,10 @@ mod tests {
         store.save().unwrap();
 
         let reloaded = NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
-        assert_eq!(reloaded.apply_to_text("橘さんと林さん"), "Tachibanaさんと林さん");
+        assert_eq!(
+            reloaded.apply_to_text("橘さんと林さん"),
+            "Tachibanaさんと林さん"
+        );
         assert!(!reloaded.data.names.contains_key("林"));
     }
 
@@ -1850,16 +1937,25 @@ mod tests {
             name("ペーリス", "Peris"),
         ]);
 
-        assert_eq!(store.apply_to_text("ヴィヴアルとヴィヴァル"), "VivalとVival");
+        assert_eq!(
+            store.apply_to_text("ヴィヴアルとヴィヴァル"),
+            "VivalとVival"
+        );
         assert_eq!(store.data.names["ヴィヴアル"].count, Some(3));
         assert_eq!(store.apply_to_text("ヒーラ、ヒーラー"), "Heera、Healer");
-        assert_eq!(store.apply_to_text("ヒ―データとヒーデータ"), "HeedataとHeedata");
+        assert_eq!(
+            store.apply_to_text("ヒ―データとヒーデータ"),
+            "HeedataとHeedata"
+        );
         assert_eq!(store.apply_to_text("ぺーリスとペーリス"), "PerisとPeris");
 
         store.data.names.get_mut("ヴィヴアル").unwrap().r#override = Some("Viviar".to_string());
         store.save().unwrap();
         let reloaded = NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
-        assert_eq!(reloaded.apply_to_text("ヴィヴアルとヴィヴァル"), "ViviarとViviar");
+        assert_eq!(
+            reloaded.apply_to_text("ヴィヴアルとヴィヴァル"),
+            "ViviarとViviar"
+        );
         assert_eq!(reloaded.data.names["ヴィヴァル"].r#override, None);
     }
 
@@ -1922,9 +2018,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let store = near_miss_store(&temp_dir);
 
-        let misses = store.near_miss_names(
-            "Tatyuya-san waved. Darryl laughed. \"Tatyuya!\" Clarisabell sighed.",
-        );
+        let misses = store
+            .near_miss_names("Tatyuya-san waved. Darryl laughed. \"Tatyuya!\" Clarisabell sighed.");
 
         assert_eq!(
             misses,
@@ -1979,7 +2074,10 @@ mod tests {
         store.data.terms.get_mut("昆布").unwrap().recalculate_best();
 
         let glossary = store.glossary_for_text("暗殺、昆布、魔石、結界", 3);
-        let originals: Vec<_> = glossary.iter().map(|entry| entry.original.as_str()).collect();
+        let originals: Vec<_> = glossary
+            .iter()
+            .map(|entry| entry.original.as_str())
+            .collect();
 
         assert_eq!(originals, ["昆布", "結界", "魔石"]);
         assert_eq!(glossary[0].english, "Kelp");
@@ -1989,11 +2087,20 @@ mod tests {
     fn test_katakana_names_only_replace_whole_katakana_words() {
         let temp_dir = TempDir::new().unwrap();
         let mut store = NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
-        store.record_votes(&[name("ロー", "Ro"), name("ジュカ", "Juka"), name("田中", "Tanaka")]);
-        store.record_term_votes(&[term("スローダ", "Sloda"), term("ジュカ王国", "Juka Kingdom")]);
+        store.record_votes(&[
+            name("ロー", "Ro"),
+            name("ジュカ", "Juka"),
+            name("田中", "Tanaka"),
+        ]);
+        store.record_term_votes(&[
+            term("スローダ", "Sloda"),
+            term("ジュカ王国", "Juka Kingdom"),
+        ]);
 
         assert_eq!(
-            store.apply_to_text("ローはスローダへ。ジュカ・ロー、ジュカ王国、ローー。あらーロー、スーロー。田中太郎"),
+            store.apply_to_text(
+                "ローはスローダへ。ジュカ・ロー、ジュカ王国、ローー。あらーロー、スーロー。田中太郎"
+            ),
             "Roはスローダへ。Juka・Ro、Juka王国、ローー。あらーRo、スーロー。Tanaka太郎"
         );
         assert!(store.data.terms.contains_key("スローダ"));
@@ -2031,19 +2138,29 @@ mod tests {
     fn test_known_mappings_use_selection_and_name_boundaries() {
         let temp_dir = TempDir::new().unwrap();
         let mut store = NameMappingStore::new(temp_dir.path(), "syosetu", "n1234ab").unwrap();
-        store.record_votes(&[name("ロー", "Ro"), name("リコ", "Lico"), name("リコ", "Lico")]);
+        store.record_votes(&[
+            name("ロー", "Ro"),
+            name("リコ", "Lico"),
+            name("リコ", "Lico"),
+        ]);
         store.record_votes(&[name("リコ", "Rico")]);
         store.data.names.get_mut("リコ").unwrap().r#override = Some("Rico".to_string());
         store.data.names.get_mut("リコ").unwrap().recalculate_best();
         store.record_term_votes(&[term("結界", "Barrier"), term("魔石", "Magic Stone")]);
 
-        let present = store.known_mappings().present_in("リコはスローダで結界を張った。");
+        let present = store
+            .known_mappings()
+            .present_in("リコはスローダで結界を張った。");
         let names: Vec<_> = present
             .names
             .iter()
             .map(|entry| (entry.original.as_str(), entry.english.as_str()))
             .collect();
-        let terms: Vec<_> = present.terms.iter().map(|entry| entry.original.as_str()).collect();
+        let terms: Vec<_> = present
+            .terms
+            .iter()
+            .map(|entry| entry.original.as_str())
+            .collect();
 
         assert_eq!(names, [("リコ", "Rico")]);
         assert_eq!(terms, ["結界"]);
@@ -2231,9 +2348,12 @@ mod tests {
         )
         .unwrap();
         store.reload_from_disk().unwrap();
-        store.record_votes(&[
-            gendered("ルリ", "Ruri", Gender::Unknown, Some("Scout note")),
-        ]);
+        store.record_votes(&[gendered(
+            "ルリ",
+            "Ruri",
+            Gender::Unknown,
+            Some("Scout note"),
+        )]);
 
         assert_eq!(store.data.names["ルリ"].note.as_deref(), Some("Hand edit"));
         assert_eq!(store.data.names["モニカ"].note, None);
@@ -2317,7 +2437,12 @@ mod tests {
         );
 
         store.data.names.get_mut("タツヤ").unwrap().r#override = Some("Tatuya".to_string());
-        store.data.names.get_mut("タツヤ").unwrap().recalculate_best();
+        store
+            .data
+            .names
+            .get_mut("タツヤ")
+            .unwrap()
+            .recalculate_best();
         assert_eq!(
             store.normalize_renderings("Tatsuya waved."),
             "Tatuya waved."

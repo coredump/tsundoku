@@ -157,16 +157,20 @@ length_ratio = [1.2, 4.0]                                         # default
 
 `translation.honorifics` decides how Japanese honorifics are rendered:
 
-| Value | Names (`ルリちゃん`) | Other words (`村長さん`, `猫さん`) |
+| Value | Names (`ルリちゃん`, `リノス様`) | Other words (`村長さん`, `猫さん`) |
 |---|---|---|
-| `keep` (default) | `Ruri-chan` | as the model writes them |
-| `names-only` | `Ruri-chan` | the suffix is removed (`Village Chief`, `the cat`) |
+| `keep` (default) | `Ruri-chan`, `Linus-sama` | as the model writes them |
+| `names-only` | `Ruri-chan`, `Linus-sama` | the suffix is removed (`Village Chief`, `the cat`) |
+| `localize` | `Ruri`, `Lord Linus` (-sama/-dono become English titles by gender; -san/-chan/-kun are removed; -senpai/-sensei stay) | the suffix is removed |
+| `localize-titles` | `Ruri-chan`, `Lord Linus` (only -sama/-dono become titles) | the suffix is removed |
 | `drop` | `Ruri` (`先輩`/`先生` are left for the model to translate by meaning) | the suffix is removed |
 
 ```toml
 [translation]
-honorifics = "names-only"  # "keep" (default), "drop" or "names-only"
+honorifics = "names-only"  # "keep" (default), "drop", "names-only", "localize" or "localize-titles"
 ```
+
+The localizing policies suit stories set outside Japan; `localize-titles` is for stories that move between Japan and another world, where -san/-kun still fit. Titles follow the character's gender in the name mapping (`gender` or `gender_override`): -sama becomes `Lord X` / `Lady X`, -dono `Sir X` / `Lady X`; without a known gender the suffix is just removed, so set `gender_override` for characters addressed this way. For a different form for one character (`Master Linus`, a nickname for `Mei-chan`), add a `book.json` replacement such as `{ "find": "Mei-chan", "replace": "Meimei" }`: replacements run first. The model is sent the same input and prompt line as `names-only`, so switching between these three needs no re-translation, only `tsundoku-epub --rewrite-text`.
 
 The policy works in three places:
 
@@ -428,6 +432,8 @@ Terms are automatically collected by the scout and vote-consolidated across chap
 Names take precedence over terms. Any term whose Japanese contains a mapped name (for example `ジュカ` or `ジュカ王国` when `ジュカ` is a name) is dropped from the mapping, because name substitution already rewrites it before translation. Single-character terms (`市` would match inside `都市`), terms rendered as themselves (`HP → HP`), and renderings that still contain Japanese or Chinese script are rejected. Orthographic variants of a name keep separate entries but share one rendering, chosen from their pooled votes: small vs. full-size vowels (`ヴィヴァル`/`ヴィヴアル`), hiragana written for katakana (`ぺーリス`/`ペーリス`), and dashes used as long-vowel marks (`ヒ―データ`/`ヒーデータ`). An override on any variant applies to all of them. Long-vowel differences are not merged, since `ヒーラ` and `ヒーラー` ("healer") are different words.
 
 All-katakana names are substituted only as whole katakana words, so a name `ロー` does not rewrite `スローダ`; `・` counts as a separator. Single-character names (`女` would rewrite every `彼女`), titles, ranks, kinship words, archaic pronouns, and interjections (`宰相`, `将軍`, `父上`, `そこもと`, `ひー`, …) are never kept as names, nor are suffixed forms such as `バーサーム家`, `田中一家`, `メインティア王`, `ミーク姫`, or any name ending in a royal title (`…王`, `…王子`, `…殿下`): the bare name inside them is substituted on its own, so the suffix's meaning reaches the translator. All of this cleanup runs whenever a mapping file is loaded, so existing files are fixed in place on the next run.
+
+Kanji names otherwise match anywhere, including inside ordinary words. A name entry can list such words in `exclude`; matches inside them are neither substituted nor count as the character appearing. For example, a hand-added one-kanji protagonist name `{"part": "given", "votes": {}, "override": "Isamu", "exclude": ["勇気", "勇敢", "武勇", "勇者"]}` under `勇` still rewrites `勇は` and `勇達` but leaves `勇気` (courage) for the translator. Single-kanji entries survive the load cleanup only with an `override`.
 
 The scout also sees the renderings already chosen for any names and terms that appear in the chunk it is reading, and is told to reuse them. That keeps it from romanizing the same name differently in every chapter. Changing an `override` therefore also steers later scouting toward that rendering.
 

@@ -157,7 +157,10 @@ impl SamplingParams {
             return Err(invalid("min_p", "must be between 0 and 1"));
         }
         if !finite_in(self.repeat_penalty, 0.5, 2.0) {
-            return Err(invalid("repeat_penalty", "must be between 0.5 and 2 (1 disables)"));
+            return Err(invalid(
+                "repeat_penalty",
+                "must be between 0.5 and 2 (1 disables)",
+            ));
         }
         if !finite_in(self.presence_penalty, -2.0, 2.0) {
             return Err(invalid("presence_penalty", "must be between -2 and 2"));
@@ -379,8 +382,8 @@ impl Config {
         }
 
         let content = std::fs::read_to_string(path)?;
-        let deserializer =
-            toml::Deserializer::parse(&content).map_err(|e| ConfigError::ParseError(e.to_string()))?;
+        let deserializer = toml::Deserializer::parse(&content)
+            .map_err(|e| ConfigError::ParseError(e.to_string()))?;
         let mut ignored_keys = Vec::new();
         let mut config: Config = serde_ignored::deserialize(deserializer, |key| {
             ignored_keys.push(key.to_string());
@@ -581,7 +584,12 @@ mod tests {
         let file = NamedTempFile::new().unwrap();
         Config::default().save_to(file.path()).unwrap();
 
-        assert!(Config::load_from(file.path()).unwrap().ignored_keys.is_empty());
+        assert!(
+            Config::load_from(file.path())
+                .unwrap()
+                .ignored_keys
+                .is_empty()
+        );
     }
 
     #[test]
